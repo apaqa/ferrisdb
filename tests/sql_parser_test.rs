@@ -214,6 +214,26 @@ fn test_parse_select_with_inner_join() {
     );
 }
 
+#[test]
+fn test_parse_explain_select() {
+    let stmt = parse_sql("EXPLAIN SELECT * FROM users WHERE id = 1;");
+    assert_eq!(
+        stmt,
+        Statement::Explain {
+            statement: Box::new(Statement::Select {
+                table_name: "users".to_string(),
+                columns: SelectColumns::All,
+                join: None,
+                where_clause: Some(WhereClause {
+                    column: "id".to_string(),
+                    operator: Operator::Eq,
+                    value: Value::Int(1),
+                }),
+            }),
+        }
+    );
+}
+
 fn parse_sql(sql: &str) -> Statement {
     parse_sql_result(sql).expect("parse sql")
 }

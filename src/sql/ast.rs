@@ -15,6 +15,9 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Statement {
+    Explain {
+        statement: Box<Statement>,
+    },
     CreateTable {
         table_name: String,
         columns: Vec<ColumnDef>,

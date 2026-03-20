@@ -37,6 +37,7 @@ impl Parser {
         }
 
         let stmt = match self.peek() {
+            Some(Token::Keyword(Keyword::Explain)) => self.parse_explain()?,
             Some(Token::Keyword(Keyword::Create)) => self.parse_create_table()?,
             Some(Token::Keyword(Keyword::Insert)) => self.parse_insert()?,
             Some(Token::Keyword(Keyword::Select)) => self.parse_select()?,
@@ -84,6 +85,23 @@ impl Parser {
 
         self.expect_token(Token::RParen)?;
         Ok(Statement::CreateTable { table_name, columns })
+    }
+
+    fn parse_explain(&mut self) -> Result<Statement> {
+        self.expect_keyword(Keyword::Explain)?;
+        let statement = match self.peek() {
+            Some(Token::Keyword(Keyword::Select)) => self.parse_select()?,
+            other => {
+                return Err(FerrisDbError::InvalidCommand(format!(
+                    "EXPLAIN currently only supports SELECT, got {:?}",
+                    other
+                )))
+            }
+        };
+
+        Ok(Statement::Explain {
+            statement: Box::new(statement),
+        })
     }
 
     fn parse_insert(&mut self) -> Result<Statement> {

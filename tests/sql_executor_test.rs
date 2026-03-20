@@ -379,3 +379,31 @@ fn test_join_with_no_matching_rows_returns_empty_result() {
 
     let _ = std::fs::remove_dir_all(dir);
 }
+
+#[test]
+fn test_explain_select_returns_plan() {
+    let (dir, _engine, executor) = open_executor("explain");
+
+    exec(
+        &executor,
+        "CREATE TABLE users (id INT, name TEXT, active BOOL);",
+    );
+    exec(
+        &executor,
+        "INSERT INTO users VALUES (1, 'Alice', true), (2, 'Bob', false), (3, 'Cara', true);",
+    );
+
+    let result = exec(&executor, "EXPLAIN SELECT * FROM users WHERE id = 1;");
+    match result {
+        ExecuteResult::Explain { plan } => {
+            assert!(plan.contains("SeqScan"));
+            assert!(plan.contains("Filter"));
+            assert!(plan.contains("Project"));
+            assert!(plan.contains("rows="));
+            assert!(plan.contains("cost="));
+        }
+        other => panic!("expected explain result, got {:?}", other),
+    }
+
+    let _ = std::fs::remove_dir_all(dir);
+}

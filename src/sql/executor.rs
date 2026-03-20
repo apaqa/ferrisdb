@@ -40,6 +40,7 @@ use super::row::{
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExecuteResult {
+    Explain { plan: String },
     Created { table_name: String },
     Inserted { count: usize },
     Selected { columns: Vec<String>, rows: Vec<Vec<Value>> },
@@ -62,6 +63,7 @@ impl SqlExecutor {
 
     pub fn execute(&self, stmt: Statement) -> Result<ExecuteResult> {
         match stmt {
+            Statement::Explain { statement } => self.execute_explain(*statement),
             Statement::CreateTable {
                 table_name,
                 columns,
@@ -110,6 +112,78 @@ impl SqlExecutor {
 
         txn.commit()?;
         Ok(ExecuteResult::Created { table_name })
+    }
+
+    fn execute_explain(&self, statement: Statement) -> Result<ExecuteResult> {
+        match statement {
+            Statement::Select {
+                table_name,
+                columns,
+                join,
+                where_clause,
+            } => {
+                let txn = self.engine.begin_transaction();
+                let Some(schema) = self.catalog.get_table(&txn, &table_name)? else {
+                    return Ok(ExecuteResult::Error {
+                        message: format!("table '{}' does not exist", table_name),
+                    });
+                };
+
+                if join.is_some() {
+                    return Ok(ExecuteResult::Error {
+                        message: "EXPLAIN for JOIN is not implemented yet".to_string(),
+                    });
+                }
+
+                let total_rows = self.scan_rows(&txn, &schema)?.len();
+                let scan_cost = total_rows as f64;
+                let has_filter = where_clause.is_some();
+                let filtered_rows = estimate_filtered_rows(total_rows, where_clause.as_ref());
+                let filter_cost = if has_filter {
+                    (total_rows as f64) * 0.25
+                } else {
+                    0.0
+                };
+                let project_cost = estimate_project_cost(filtered_rows, &columns);
+
+                let mut lines = Vec::new();
+                lines.push(format!(
+                    "SeqScan(table={}, rows={}, cost={:.2})",
+                    table_name, total_rows, scan_cost
+                ));
+                if let Some(where_clause) = where_clause {
+                    lines.push(format!(
+                        "  -> Filter(predicate=\"{} {} {}\", rows={}, cost={:.2})",
+                        where_clause.column,
+                        operator_to_str(&where_clause.operator),
+                        render_value(&where_clause.value),
+                        filtered_rows,
+                        filter_cost
+                    ));
+                }
+
+                let project_rows = if has_filter {
+                    filtered_rows
+                } else {
+                    total_rows
+                };
+                let project_desc = match columns {
+                    SelectColumns::All => "*".to_string(),
+                    SelectColumns::Named(names) => names.join(", "),
+                };
+                lines.push(format!(
+                    "  -> Project(columns=[{}], rows={}, cost={:.2})",
+                    project_desc, project_rows, project_cost
+                ));
+
+                Ok(ExecuteResult::Explain {
+                    plan: lines.join("\n"),
+                })
+            }
+            other => Ok(ExecuteResult::Error {
+                message: format!("EXPLAIN does not support {:?}", other),
+            }),
+        }
     }
 
     fn execute_insert(&self, table_name: String, values: Vec<Vec<Value>>) -> Result<ExecuteResult> {
@@ -416,6 +490,7 @@ impl SqlExecutor {
 
 pub fn format_execute_result(result: &ExecuteResult) -> String {
     match result {
+        ExecuteResult::Explain { plan } => plan.clone(),
         ExecuteResult::Created { table_name } => format!("Table '{}' created", table_name),
         ExecuteResult::Inserted { count } => format!("Inserted {} row(s)", count),
         ExecuteResult::Selected { columns, rows } => format_selected(columns, rows),
@@ -511,6 +586,37 @@ fn render_value(value: &Value) -> String {
         Value::Text(v) => v.clone(),
         Value::Bool(v) => v.to_string(),
         Value::Null => "NULL".to_string(),
+    }
+}
+
+fn estimate_filtered_rows(total_rows: usize, where_clause: Option<&WhereClause>) -> usize {
+    if where_clause.is_none() {
+        return total_rows;
+    }
+
+    if total_rows == 0 {
+        return 0;
+    }
+
+    total_rows.div_ceil(4)
+}
+
+fn estimate_project_cost(rows: usize, columns: &SelectColumns) -> f64 {
+    let column_factor = match columns {
+        SelectColumns::All => 1.0,
+        SelectColumns::Named(names) => (names.len().max(1)) as f64 / 4.0,
+    };
+    (rows as f64) * 0.1 * column_factor.max(0.25)
+}
+
+fn operator_to_str(operator: &Operator) -> &'static str {
+    match operator {
+        Operator::Eq => "=",
+        Operator::Ne => "!=",
+        Operator::Lt => "<",
+        Operator::Gt => ">",
+        Operator::Le => "<=",
+        Operator::Ge => ">=",
     }
 }
 
