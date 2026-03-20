@@ -8,3 +8,5 @@ description = "A database engine built from scratch in Rust — portfolio projec
 # thiserror: 讓我們可以用 derive macro 快速定義自己的錯誤型別
 # 這比手動實作 std::fmt::Display 和 std::error::Error 方便很多
 thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

@@ -41,6 +41,9 @@ pub enum FerrisDbError {
     /// 這樣你在程式裡用 ? 運算子時，io 錯誤會自動變成我們的錯誤型別
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
+
+    #[error("JSON error: {0}")]
+    Json(#[from] serde_json::Error),
 }
 
 /// 自定義 Result 型別
