@@ -19,7 +19,7 @@ use std::sync::Arc;
 
 use ferrisdb::cli::repl;
 use ferrisdb::config::FerrisDbConfig;
-use ferrisdb::server::tcp;
+use ferrisdb::server::{http, tcp};
 use ferrisdb::storage::lsm::LsmEngine;
 use ferrisdb::transaction::mvcc::MvccEngine;
 
@@ -29,6 +29,7 @@ const CONFIG_PATH: &str = "ferrisdb.toml";
 enum Mode {
     Repl,
     Server,
+    Http { port: u16 },
 }
 
 fn main() {
@@ -52,6 +53,7 @@ fn main() {
     match mode {
         Mode::Repl => run_repl_mode(&config),
         Mode::Server => run_server_mode(&config),
+        Mode::Http { port } => run_http_mode(&config, port),
     }
 }
 
@@ -107,13 +109,30 @@ fn run_server_mode(config: &FerrisDbConfig) {
     }
 }
 
+fn run_http_mode(config: &FerrisDbConfig, port: u16) {
+    let engine = build_engine(config);
+    if let Err(err) = http::run_http_at(&config.server_host, port, engine) {
+        eprintln!("Fatal HTTP server error: {}", err);
+        std::process::exit(1);
+    }
+}
+
 fn parse_mode(args: &[String]) -> Result<Mode, String> {
+    if let Some(port) = parse_http_port(args)? {
+        return Ok(Mode::Http { port });
+    }
+
     if args.iter().any(|arg| arg == "--server") {
         return Ok(Mode::Server);
     }
 
     for arg in args {
-        if arg.starts_with("--") && arg != "--data-dir" && arg != "--port" && arg != "--memtable-threshold" {
+        if arg.starts_with("--")
+            && arg != "--data-dir"
+            && arg != "--port"
+            && arg != "--memtable-threshold"
+            && arg != "--http-port"
+        {
             return Err(format!("unknown arg '{}'", arg));
         }
     }
@@ -121,11 +140,26 @@ fn parse_mode(args: &[String]) -> Result<Mode, String> {
     Ok(Mode::Repl)
 }
 
+fn parse_http_port(args: &[String]) -> Result<Option<u16>, String> {
+    let Some(idx) = args.iter().position(|arg| arg == "--http-port") else {
+        return Ok(None);
+    };
+
+    let value = args
+        .get(idx + 1)
+        .ok_or_else(|| "missing value for --http-port".to_string())?;
+    let port = value
+        .parse::<u16>()
+        .map_err(|_| format!("invalid http port '{}'", value))?;
+    Ok(Some(port))
+}
+
 fn print_usage() {
     eprintln!("Usage:");
     eprintln!("  cargo run");
     eprintln!("  cargo run -- --server");
     eprintln!("  cargo run -- --server --port <port>");
+    eprintln!("  cargo run -- --http-port <port>");
     eprintln!("  cargo run -- --data-dir <path>");
     eprintln!("  cargo run -- --memtable-threshold <bytes>");
 }

@@ -28,6 +28,8 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use serde::Serialize;
+
 use crate::error::Result;
 use crate::storage::compaction;
 use crate::storage::manifest::{Manifest, ManifestRecord, ManifestState, MANIFEST_FILENAME};
@@ -41,7 +43,7 @@ pub const DEFAULT_MEMTABLE_SIZE_THRESHOLD: usize = 4096;
 const WAL_FILENAME: &str = "wal.log";
 const AUTO_COMPACTION_SSTABLE_LIMIT: usize = 4;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SstableInfo {
     pub filename: String,
     pub size_bytes: u64,

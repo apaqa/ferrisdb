@@ -5,3 +5,4 @@
 // 這裡只負責匯出子模組，讓外部可以用 `ferrisdb::server::tcp::...`。
 
 pub mod tcp;
+pub mod http;
