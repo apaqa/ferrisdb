@@ -91,3 +91,22 @@ fn test_invalid_toml_returns_error() {
 
     let _ = fs::remove_file(path);
 }
+
+#[test]
+fn test_merge_cli_args_overrides_config_values() {
+    let mut config = FerrisDbConfig::default();
+    let args = vec![
+        "--data-dir".to_string(),
+        "./bench-data".to_string(),
+        "--port".to_string(),
+        "7777".to_string(),
+        "--memtable-threshold".to_string(),
+        "8192".to_string(),
+    ];
+
+    config.merge_cli_args(&args).expect("merge cli args");
+
+    assert_eq!(config.data_dir, "./bench-data");
+    assert_eq!(config.server_port, 7777);
+    assert_eq!(config.memtable_size_threshold, 8192);
+}
