@@ -11,5 +11,15 @@
 // pub mod traits; 表示「把 traits.rs 這個檔案當成一個公開的子模組」。
 // 外面的程式碼就可以用 use ferrisdb::storage::traits::StorageEngine 來使用它。
 
+// =============================================================================
+// storage/mod.rs — 儲存層模組入口
+// =============================================================================
+//
+// ferrisdb 的儲存層目前包含：
+// 1. memory：in-memory 的 MemTable
+// 2. sstable：落盤的 Sorted String Table（LSM Tree 核心元件）
+// 3. traits：抽象介面 StorageEngine
+
 pub mod traits;
 pub mod memory;
+pub mod sstable;
