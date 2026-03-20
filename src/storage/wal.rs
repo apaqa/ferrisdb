@@ -120,10 +120,11 @@ impl WalReader {
     /// 而是把 tombstone 值放回 MemTable，確保它能遮蔽更舊層的資料。
     pub fn recover_to_memtable(&self) -> Result<MemTable> {
         let mut memtable = MemTable::new();
-        let iter = self.iter()?;
+        let file = File::open(&self.path)?;
+        let mut reader = BufReader::new(file);
 
-        for item in iter {
-            match item? {
+        while let Some(record) = read_record_tolerant(&mut reader)? {
+            match record {
                 WalRecord::Put { key, value } => memtable.put(key, value)?,
                 WalRecord::Delete { key } => memtable.put(key, TOMBSTONE.to_vec())?,
             }
@@ -171,6 +172,31 @@ impl Iterator for WalIterator {
 
         Some(decode_record(&body))
     }
+}
+
+fn read_record_tolerant<R: Read>(reader: &mut R) -> Result<Option<WalRecord>> {
+    let mut len_buf = [0_u8; 4];
+    match reader.read_exact(&mut len_buf) {
+        Ok(()) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+        Err(err) => return Err(err.into()),
+    }
+
+    let record_len = u32::from_le_bytes(len_buf) as usize;
+    if record_len < 4 + 1 + 4 + 4 {
+        return Err(FerrisDbError::InvalidCommand(
+            "wal record length too small".to_string(),
+        ));
+    }
+
+    let mut body = vec![0_u8; record_len];
+    match reader.read_exact(&mut body) {
+        Ok(()) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+        Err(err) => return Err(err.into()),
+    }
+
+    Ok(Some(decode_record(&body)?))
 }
 
 fn encode_record(record: &WalRecord) -> Result<Vec<u8>> {

@@ -87,10 +87,20 @@ impl LsmEngine {
     ) -> Result<Self> {
         let data_dir = data_dir.as_ref().to_path_buf();
         fs::create_dir_all(&data_dir)?;
+        cleanup_temporary_files(&data_dir)?;
 
         let manifest_path = data_dir.join(MANIFEST_FILENAME);
         let mut manifest = if manifest_path.exists() {
-            Manifest::open(&manifest_path)?
+            match Manifest::open(&manifest_path) {
+                Ok(manifest) => manifest,
+                Err(_) => {
+                    let state = scan_sstable_state(&data_dir)?;
+                    let mut manifest = Manifest::create(&manifest_path)?;
+                    manifest.set_state(state);
+                    manifest.snapshot()?;
+                    manifest
+                }
+            }
         } else {
             let state = scan_sstable_state(&data_dir)?;
             let mut manifest = Manifest::create(&manifest_path)?;
@@ -482,4 +492,16 @@ fn scan_sstable_state(data_dir: &Path) -> Result<ManifestState> {
         next_sstable_id,
         last_compaction_ts: 0,
     })
+}
+
+fn cleanup_temporary_files(data_dir: &Path) -> Result<()> {
+    for entry in fs::read_dir(data_dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        let extension = path.extension().and_then(|ext| ext.to_str());
+        if matches!(extension, Some("tmp") | Some("compacting")) {
+            let _ = fs::remove_file(path);
+        }
+    }
+    Ok(())
 }
