@@ -211,6 +211,24 @@ impl LsmEngine {
         &self,
         range: Option<(&[u8], &[u8])>,
     ) -> Result<BTreeMap<Vec<u8>, Vec<u8>>> {
+        self.merged_view_with_range_internal(range, false)
+    }
+
+    pub fn raw_scan(&self, start: &[u8], end: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        let merged = self.merged_view_with_range_internal(Some((start, end)), true)?;
+        Ok(merged.into_iter().collect())
+    }
+
+    pub fn raw_list_all(&self) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        let merged = self.merged_view_with_range_internal(None, true)?;
+        Ok(merged.into_iter().collect())
+    }
+
+    fn merged_view_with_range_internal(
+        &self,
+        range: Option<(&[u8], &[u8])>,
+        include_tombstones: bool,
+    ) -> Result<BTreeMap<Vec<u8>, Vec<u8>>> {
         let mut merged = BTreeMap::<Vec<u8>, Vec<u8>>::new();
 
         for reader in self.sstables.iter().rev() {
@@ -223,7 +241,7 @@ impl LsmEngine {
                     }
                 }
 
-                if Self::is_tombstone(&value) {
+                if Self::is_tombstone(&value) && !include_tombstones {
                     merged.remove(&key);
                 } else {
                     merged.insert(key, value);
@@ -236,7 +254,7 @@ impl LsmEngine {
             None => self.active_memtable.list_all()?,
         };
         for (key, value) in mem_entries {
-            if Self::is_tombstone(&value) {
+            if Self::is_tombstone(&value) && !include_tombstones {
                 merged.remove(&key);
             } else {
                 merged.insert(key, value);

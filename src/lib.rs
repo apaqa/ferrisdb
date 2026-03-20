@@ -2,17 +2,16 @@
 // lib.rs — ferrisdb 對外公開 API
 // =============================================================================
 //
-// 這個檔案負責宣告 crate 對外可用的模組。
-// main.rs 主要是執行入口；lib.rs 讓其他程式可以 `use ferrisdb::...`。
+// 這個檔案負責宣告 crate 對外可見的模組。
+// 目前包含：
+// - error：錯誤型別
+// - storage：MemTable / WAL / SSTable / LSM-Tree
+// - transaction：MVCC transaction 層
+// - cli：REPL
+// - server：TCP server
 
-/// 錯誤型別模組
 pub mod error;
-
-/// 儲存引擎模組（目前是 in-memory 的 MemTable）
 pub mod storage;
-
-/// CLI REPL 模組
+pub mod transaction;
 pub mod cli;
-
-/// TCP server 模組
 pub mod server;

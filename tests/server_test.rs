@@ -2,30 +2,41 @@
 // tests/server_test.rs — TCP server 整合測試
 // =============================================================================
 //
-// 測試流程：
-// 1. 啟動一個綁在隨機 port 的 TCP server（背景 thread）
-// 2. 建立 client 連線
-// 3. 送出多個指令並驗證回應內容
+// server 現在跑在 MvccEngine 上，但對外仍然是 auto-commit 指令模式。
+// 這個測試驗證：
+// - client 可透過 TCP 做基本 CRUD
+// - list / scan / stats 回應正確
 
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::thread;
-use std::time::Duration;
+use std::time::{SystemTime, UNIX_EPOCH, Duration};
 
 use ferrisdb::server::tcp;
-use ferrisdb::storage::memory::MemTable;
+use ferrisdb::storage::lsm::LsmEngine;
+use ferrisdb::transaction::mvcc::MvccEngine;
+
+fn temp_dir(name: &str) -> std::path::PathBuf {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time")
+        .as_nanos();
+    std::env::temp_dir().join(format!("ferrisdb-server-{}-{}", name, nanos))
+}
 
 #[test]
 fn test_tcp_server_end_to_end() {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind test listener");
     let port = listener.local_addr().expect("read local addr").port();
-    let shared = Arc::new(Mutex::new(MemTable::new()));
 
-    let server_store = Arc::clone(&shared);
+    let dir = temp_dir("mvcc");
+    let lsm = LsmEngine::open(&dir, 4096).expect("open lsm");
+    let engine = Arc::new(MvccEngine::new(lsm));
+
+    let server_engine = Arc::clone(&engine);
     thread::spawn(move || {
-        // server 會在測試程序生命週期內持續運行，這裡不 join
-        let _ = tcp::run_on_listener(listener, server_store);
+        let _ = tcp::run_on_listener(listener, server_engine);
     });
 
     let mut stream = connect_with_retry(port, 20, Duration::from_millis(50));
