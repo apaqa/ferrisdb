@@ -25,14 +25,15 @@
 //
 // 之後若要繼續演進，可以把 WHERE 下推、索引查找、型別檢查等能力逐步補上。
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use crate::error::Result;
 use crate::transaction::mvcc::{MvccEngine, Transaction};
 
 use super::ast::{
-    Assignment, JoinClause, Operator, OrderByClause, OrderDirection, SelectColumns, Statement,
-    Value, WhereClause,
+    AggregateFunc, Assignment, GroupByClause, JoinClause, Operator, OrderByClause,
+    OrderDirection, SelectColumns, SelectItem, Statement, Value, WhereClause,
 };
 use super::catalog::{Catalog, TableSchema};
 use super::row::{
@@ -75,9 +76,18 @@ impl SqlExecutor {
                 columns,
                 join,
                 where_clause,
+                group_by,
                 order_by,
                 limit,
-            } => self.execute_select(table_name, columns, join, where_clause, order_by, limit),
+            } => self.execute_select(
+                table_name,
+                columns,
+                join,
+                where_clause,
+                group_by,
+                order_by,
+                limit,
+            ),
             Statement::Update {
                 table_name,
                 assignments,
@@ -124,6 +134,7 @@ impl SqlExecutor {
                 columns,
                 join,
                 where_clause,
+                group_by,
                 order_by,
                 limit,
             } => {
@@ -166,6 +177,14 @@ impl SqlExecutor {
                         filter_cost
                     ));
                 }
+                if let Some(group_by) = group_by {
+                    lines.push(format!(
+                        "  -> GroupBy(column={}, rows={}, cost={:.2})",
+                        group_by.column,
+                        filtered_rows.max(1),
+                        (filtered_rows.max(1)) as f64 * 0.35
+                    ));
+                }
                 if let Some(order_by) = order_by {
                     lines.push(format!(
                         "  -> OrderBy(column={}, direction={}, rows={}, cost={:.2})",
@@ -193,6 +212,11 @@ impl SqlExecutor {
                 let project_desc = match columns {
                     SelectColumns::All => "*".to_string(),
                     SelectColumns::Named(names) => names.join(", "),
+                    SelectColumns::Aggregate(items) => items
+                        .iter()
+                        .map(render_select_item)
+                        .collect::<Vec<_>>()
+                        .join(", "),
                 };
                 lines.push(format!(
                     "  -> Project(columns=[{}], rows={}, cost={:.2})",
@@ -265,6 +289,7 @@ impl SqlExecutor {
         columns: SelectColumns,
         join: Option<JoinClause>,
         where_clause: Option<WhereClause>,
+        group_by: Option<GroupByClause>,
         order_by: Option<OrderByClause>,
         limit: Option<usize>,
     ) -> Result<ExecuteResult> {
@@ -276,12 +301,29 @@ impl SqlExecutor {
         };
 
         if let Some(join_clause) = join {
+            if matches!(columns, SelectColumns::Aggregate(_)) || group_by.is_some() {
+                return Ok(ExecuteResult::Error {
+                    message: "JOIN with aggregate queries is not implemented yet".to_string(),
+                });
+            }
             return self.execute_join_select(
                 &txn,
                 &schema,
                 columns,
                 join_clause,
                 where_clause,
+                order_by,
+                limit,
+            );
+        }
+
+        if matches!(columns, SelectColumns::Aggregate(_)) || group_by.is_some() {
+            return self.execute_aggregate_select(
+                &txn,
+                &schema,
+                columns,
+                where_clause,
+                group_by,
                 order_by,
                 limit,
             );
@@ -318,6 +360,62 @@ impl SqlExecutor {
 
         Ok(ExecuteResult::Selected {
             columns: projection,
+            rows: selected,
+        })
+    }
+
+    fn execute_aggregate_select(
+        &self,
+        txn: &Transaction,
+        schema: &TableSchema,
+        columns: SelectColumns,
+        where_clause: Option<WhereClause>,
+        group_by: Option<GroupByClause>,
+        order_by: Option<OrderByClause>,
+        limit: Option<usize>,
+    ) -> Result<ExecuteResult> {
+        let SelectColumns::Aggregate(items) = columns else {
+            return Ok(ExecuteResult::Error {
+                message: "GROUP BY requires aggregate expressions in SELECT".to_string(),
+            });
+        };
+
+        let output_columns = match self.resolve_aggregate_projection(schema, &items, group_by.as_ref()) {
+            Ok(columns) => columns,
+            Err(message) => return Ok(ExecuteResult::Error { message }),
+        };
+
+        let rows: Vec<Row> = self
+            .scan_rows(txn, schema)?
+            .into_iter()
+            .filter(|(_, row)| matches_where(row, where_clause.as_ref()))
+            .map(|(_, row)| row)
+            .collect();
+
+        let grouped_rows = group_rows(rows, group_by.as_ref());
+        let mut selected = Vec::new();
+        for (_group_key, group_rows) in grouped_rows {
+            let mut output_row = Vec::with_capacity(items.len());
+            for item in &items {
+                match evaluate_select_item(item, &group_rows) {
+                    Ok(value) => output_row.push(value),
+                    Err(message) => return Ok(ExecuteResult::Error { message }),
+                }
+            }
+            selected.push(output_row);
+        }
+
+        if let Some(order_by) = order_by.as_ref() {
+            if let Err(message) = sort_result_rows_by_order(&mut selected, &output_columns, order_by) {
+                return Ok(ExecuteResult::Error { message });
+            }
+        }
+        if let Some(limit) = limit {
+            selected.truncate(limit);
+        }
+
+        Ok(ExecuteResult::Selected {
+            columns: output_columns,
             rows: selected,
         })
     }
@@ -491,7 +589,45 @@ impl SqlExecutor {
                 }
                 Ok(names.clone())
             }
+            SelectColumns::Aggregate(_) => Err("aggregate columns require aggregate execution path".to_string()),
         }
+    }
+
+    fn resolve_aggregate_projection(
+        &self,
+        schema: &TableSchema,
+        items: &[SelectItem],
+        group_by: Option<&GroupByClause>,
+    ) -> std::result::Result<Vec<String>, String> {
+        let mut columns = Vec::with_capacity(items.len());
+        for item in items {
+            match item {
+                SelectItem::Column(name) => {
+                    if !schema.columns.iter().any(|column| &column.name == name) {
+                        return Err(format!("unknown column '{}'", name));
+                    }
+                    if group_by.as_ref().map(|group| &group.column) != Some(name) {
+                        return Err(format!(
+                            "column '{}' must appear in GROUP BY when aggregate functions are used",
+                            name
+                        ));
+                    }
+                    columns.push(name.clone());
+                }
+                SelectItem::Aggregate { func, column } => {
+                    if let Some(column_name) = column {
+                        if !schema.columns.iter().any(|col| &col.name == column_name) {
+                            return Err(format!("unknown column '{}'", column_name));
+                        }
+                    }
+                    columns.push(render_select_item(item));
+                    if matches!(func, AggregateFunc::Count) {
+                        continue;
+                    }
+                }
+            }
+        }
+        Ok(columns)
     }
 
     fn scan_rows(&self, txn: &Transaction, schema: &TableSchema) -> Result<Vec<(Vec<u8>, Row)>> {
@@ -541,6 +677,9 @@ impl SqlExecutor {
                     }
                 }
                 Ok(names.clone())
+            }
+            SelectColumns::Aggregate(_) => {
+                Err("aggregate projection is not supported for JOIN queries".to_string())
             }
         }
     }
@@ -663,6 +802,7 @@ fn estimate_project_cost(rows: usize, columns: &SelectColumns) -> f64 {
     let column_factor = match columns {
         SelectColumns::All => 1.0,
         SelectColumns::Named(names) => (names.len().max(1)) as f64 / 4.0,
+        SelectColumns::Aggregate(items) => (items.len().max(1)) as f64 / 3.0,
     };
     (rows as f64) * 0.1 * column_factor.max(0.25)
 }
@@ -685,6 +825,20 @@ fn order_direction_to_str(direction: &OrderDirection) -> &'static str {
     }
 }
 
+fn render_select_item(item: &SelectItem) -> String {
+    match item {
+        SelectItem::Column(name) => name.clone(),
+        SelectItem::Aggregate { func, column } => match (func, column.as_deref()) {
+            (AggregateFunc::Count, None) => "COUNT(*)".to_string(),
+            (AggregateFunc::Count, Some(column)) => format!("COUNT({})", column),
+            (AggregateFunc::Sum, Some(column)) => format!("SUM({})", column),
+            (AggregateFunc::Min, Some(column)) => format!("MIN({})", column),
+            (AggregateFunc::Max, Some(column)) => format!("MAX({})", column),
+            (_, None) => "INVALID_AGGREGATE".to_string(),
+        },
+    }
+}
+
 fn sort_rows_by_order(rows: &mut [Row], order_by: &OrderByClause) -> std::result::Result<(), String> {
     if !rows.is_empty() && rows[0].get(&order_by.column).is_none() {
         return Err(format!("unknown column '{}'", order_by.column));
@@ -693,6 +847,27 @@ fn sort_rows_by_order(rows: &mut [Row], order_by: &OrderByClause) -> std::result
     rows.sort_by(|left, right| {
         let left_value = left.get(&order_by.column).unwrap_or(&Value::Null);
         let right_value = right.get(&order_by.column).unwrap_or(&Value::Null);
+        let order = compare_order(left_value, right_value).unwrap_or(std::cmp::Ordering::Equal);
+        match order_by.direction {
+            OrderDirection::Asc => order,
+            OrderDirection::Desc => order.reverse(),
+        }
+    });
+    Ok(())
+}
+
+fn sort_result_rows_by_order(
+    rows: &mut [Vec<Value>],
+    columns: &[String],
+    order_by: &OrderByClause,
+) -> std::result::Result<(), String> {
+    let Some(index) = columns.iter().position(|column| column == &order_by.column) else {
+        return Err(format!("unknown column '{}'", order_by.column));
+    };
+
+    rows.sort_by(|left, right| {
+        let left_value = left.get(index).unwrap_or(&Value::Null);
+        let right_value = right.get(index).unwrap_or(&Value::Null);
         let order = compare_order(left_value, right_value).unwrap_or(std::cmp::Ordering::Equal);
         match order_by.direction {
             OrderDirection::Asc => order,
@@ -754,6 +929,106 @@ fn matches_join_where(joined: &JoinedRow, where_clause: Option<&WhereClause>) ->
     };
 
     compare_values(left, &where_clause.value, where_clause.operator.clone())
+}
+
+fn group_rows(
+    rows: Vec<Row>,
+    group_by: Option<&GroupByClause>,
+) -> Vec<(Option<Value>, Vec<Row>)> {
+    if let Some(group_by) = group_by {
+        let mut groups: BTreeMap<String, (Option<Value>, Vec<Row>)> = BTreeMap::new();
+        for row in rows {
+            let group_value = row.get(&group_by.column).cloned().unwrap_or(Value::Null);
+            let group_key = value_group_key(&group_value);
+            groups
+                .entry(group_key)
+                .or_insert_with(|| (Some(group_value.clone()), Vec::new()))
+                .1
+                .push(row);
+        }
+        groups.into_values().collect()
+    } else {
+        vec![(None, rows)]
+    }
+}
+
+fn value_group_key(value: &Value) -> String {
+    match value {
+        Value::Int(value) => format!("i:{}", value),
+        Value::Text(value) => format!("t:{}", value),
+        Value::Bool(value) => format!("b:{}", value),
+        Value::Null => "n:null".to_string(),
+    }
+}
+
+fn evaluate_select_item(item: &SelectItem, rows: &[Row]) -> std::result::Result<Value, String> {
+    match item {
+        SelectItem::Column(name) => Ok(rows
+            .first()
+            .and_then(|row| row.get(name))
+            .cloned()
+            .unwrap_or(Value::Null)),
+        SelectItem::Aggregate { func, column } => evaluate_aggregate(func, column.as_deref(), rows),
+    }
+}
+
+fn evaluate_aggregate(
+    func: &AggregateFunc,
+    column: Option<&str>,
+    rows: &[Row],
+) -> std::result::Result<Value, String> {
+    match func {
+        AggregateFunc::Count => Ok(Value::Int(rows.len() as i64)),
+        AggregateFunc::Sum => {
+            let Some(column) = column else {
+                return Err("SUM requires a column".to_string());
+            };
+            let mut sum = 0_i64;
+            for row in rows {
+                match row.get(column).unwrap_or(&Value::Null) {
+                    Value::Int(value) => sum += value,
+                    Value::Null => {}
+                    _ => return Err(format!("SUM only supports INT column '{}'", column)),
+                }
+            }
+            Ok(Value::Int(sum))
+        }
+        AggregateFunc::Min => evaluate_min_max(column, rows, true),
+        AggregateFunc::Max => evaluate_min_max(column, rows, false),
+    }
+}
+
+fn evaluate_min_max(
+    column: Option<&str>,
+    rows: &[Row],
+    find_min: bool,
+) -> std::result::Result<Value, String> {
+    let Some(column) = column else {
+        return Err("MIN/MAX requires a column".to_string());
+    };
+
+    let mut best: Option<Value> = None;
+    for row in rows {
+        let value = row.get(column).cloned().unwrap_or(Value::Null);
+        if matches!(value, Value::Null) {
+            continue;
+        }
+
+        best = match best {
+            None => Some(value),
+            Some(current) => {
+                let ord = compare_order(&value, &current)
+                    .ok_or_else(|| format!("MIN/MAX cannot compare column '{}'", column))?;
+                if (find_min && ord.is_lt()) || (!find_min && ord.is_gt()) {
+                    Some(value)
+                } else {
+                    Some(current)
+                }
+            }
+        };
+    }
+
+    Ok(best.unwrap_or(Value::Null))
 }
 
 #[derive(Debug, Clone)]

@@ -14,8 +14,8 @@
 use crate::error::{FerrisDbError, Result};
 
 use super::ast::{
-    Assignment, ColumnDef, DataType, JoinClause, Operator, OrderByClause, OrderDirection,
-    SelectColumns, Statement, Value, WhereClause,
+    AggregateFunc, Assignment, ColumnDef, DataType, GroupByClause, JoinClause, Operator,
+    OrderByClause, OrderDirection, SelectColumns, SelectItem, Statement, Value, WhereClause,
 };
 use super::lexer::{Keyword, Token};
 
@@ -144,22 +144,37 @@ impl Parser {
             self.bump();
             SelectColumns::All
         } else {
-            let mut names = Vec::new();
+            let mut items = Vec::new();
+            let mut has_aggregate = false;
             loop {
-                names.push(self.parse_identifier_path()?);
+                let item = self.parse_select_item()?;
+                has_aggregate |= matches!(item, SelectItem::Aggregate { .. });
+                items.push(item);
                 if matches!(self.peek(), Some(Token::Comma)) {
                     self.bump();
                     continue;
                 }
                 break;
             }
-            SelectColumns::Named(names)
+            if has_aggregate {
+                SelectColumns::Aggregate(items)
+            } else {
+                SelectColumns::Named(
+                    items.into_iter()
+                        .map(|item| match item {
+                            SelectItem::Column(name) => name,
+                            SelectItem::Aggregate { .. } => unreachable!("aggregate filtered"),
+                        })
+                        .collect(),
+                )
+            }
         };
 
         self.expect_keyword(Keyword::From)?;
         let table_name = self.parse_identifier_path()?;
         let join = self.parse_optional_join()?;
         let where_clause = self.parse_optional_where()?;
+        let group_by = self.parse_optional_group_by()?;
         let order_by = self.parse_optional_order_by()?;
         let limit = self.parse_optional_limit()?;
 
@@ -168,6 +183,7 @@ impl Parser {
             columns,
             join,
             where_clause,
+            group_by,
             order_by,
             limit,
         })
@@ -276,6 +292,18 @@ impl Parser {
         Ok(Some(OrderByClause { column, direction }))
     }
 
+    fn parse_optional_group_by(&mut self) -> Result<Option<GroupByClause>> {
+        if !matches!(self.peek(), Some(Token::Keyword(Keyword::Group))) {
+            return Ok(None);
+        }
+
+        self.expect_keyword(Keyword::Group)?;
+        self.expect_keyword(Keyword::By)?;
+        Ok(Some(GroupByClause {
+            column: self.parse_identifier_path()?,
+        }))
+    }
+
     fn parse_optional_limit(&mut self) -> Result<Option<usize>> {
         if !matches!(self.peek(), Some(Token::Keyword(Keyword::Limit))) {
             return Ok(None);
@@ -330,6 +358,48 @@ impl Parser {
                 other
             ))),
         }
+    }
+
+    fn parse_select_item(&mut self) -> Result<SelectItem> {
+        match self.peek() {
+            Some(Token::Keyword(Keyword::Count))
+            | Some(Token::Keyword(Keyword::Sum))
+            | Some(Token::Keyword(Keyword::Min))
+            | Some(Token::Keyword(Keyword::Max)) => self.parse_aggregate_item(),
+            _ => Ok(SelectItem::Column(self.parse_identifier_path()?)),
+        }
+    }
+
+    fn parse_aggregate_item(&mut self) -> Result<SelectItem> {
+        let func = match self.bump() {
+            Some(Token::Keyword(Keyword::Count)) => AggregateFunc::Count,
+            Some(Token::Keyword(Keyword::Sum)) => AggregateFunc::Sum,
+            Some(Token::Keyword(Keyword::Min)) => AggregateFunc::Min,
+            Some(Token::Keyword(Keyword::Max)) => AggregateFunc::Max,
+            other => {
+                return Err(FerrisDbError::InvalidCommand(format!(
+                    "expected aggregate function, got {:?}",
+                    other
+                )))
+            }
+        };
+
+        self.expect_token(Token::LParen)?;
+        let column = if matches!(self.peek(), Some(Token::Star)) {
+            self.bump();
+            None
+        } else {
+            Some(self.parse_identifier_path()?)
+        };
+        self.expect_token(Token::RParen)?;
+
+        if !matches!(func, AggregateFunc::Count) && column.is_none() {
+            return Err(FerrisDbError::InvalidCommand(
+                "only COUNT supports '*'".to_string(),
+            ));
+        }
+
+        Ok(SelectItem::Aggregate { func, column })
     }
 
     fn expect_ident(&mut self) -> Result<String> {

@@ -31,6 +31,7 @@ pub enum Statement {
         columns: SelectColumns,
         join: Option<JoinClause>,
         where_clause: Option<WhereClause>,
+        group_by: Option<GroupByClause>,
         order_by: Option<OrderByClause>,
         limit: Option<usize>,
     },
@@ -70,6 +71,24 @@ pub enum Value {
 pub enum SelectColumns {
     All,
     Named(Vec<String>),
+    Aggregate(Vec<SelectItem>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SelectItem {
+    Column(String),
+    Aggregate {
+        func: AggregateFunc,
+        column: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AggregateFunc {
+    Count,
+    Sum,
+    Min,
+    Max,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -84,6 +103,11 @@ pub struct JoinClause {
     pub right_table: String,
     pub left_column: String,
     pub right_column: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GroupByClause {
+    pub column: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

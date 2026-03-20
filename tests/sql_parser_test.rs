@@ -9,8 +9,8 @@
 // - 大小寫不敏感與多餘空白情況
 
 use ferrisdb::sql::ast::{
-    Assignment, ColumnDef, DataType, JoinClause, Operator, OrderByClause, OrderDirection,
-    SelectColumns, Statement, Value, WhereClause,
+    AggregateFunc, Assignment, ColumnDef, DataType, GroupByClause, JoinClause, Operator,
+    OrderByClause, OrderDirection, SelectColumns, SelectItem, Statement, Value, WhereClause,
 };
 use ferrisdb::sql::lexer::{Keyword, Lexer, Token};
 use ferrisdb::sql::parser::Parser;
@@ -100,6 +100,7 @@ fn test_parse_select() {
                 operator: Operator::Eq,
                 value: Value::Int(1),
             }),
+            group_by: None,
             order_by: None,
             limit: None,
         }
@@ -120,6 +121,7 @@ fn test_parse_select_all_and_comparison_operator() {
                 operator: Operator::Gt,
                 value: Value::Int(25),
             }),
+            group_by: None,
             order_by: None,
             limit: None,
         }
@@ -190,6 +192,7 @@ fn test_case_insensitive_and_extra_whitespace() {
             columns: SelectColumns::All,
             join: None,
             where_clause: None,
+            group_by: None,
             order_by: None,
             limit: None,
         }
@@ -216,6 +219,7 @@ fn test_parse_select_with_inner_join() {
                 operator: Operator::Eq,
                 value: Value::Int(1),
             }),
+            group_by: None,
             order_by: None,
             limit: None,
         }
@@ -237,6 +241,7 @@ fn test_parse_explain_select() {
                     operator: Operator::Eq,
                     value: Value::Int(1),
                 }),
+                group_by: None,
                 order_by: None,
                 limit: None,
             }),
@@ -260,11 +265,46 @@ fn test_parse_select_with_order_by_and_limit() {
                 operator: Operator::Gt,
                 value: Value::Int(20),
             }),
+            group_by: None,
             order_by: Some(OrderByClause {
                 column: "age".to_string(),
                 direction: OrderDirection::Desc,
             }),
             limit: Some(5),
+        }
+    );
+}
+
+#[test]
+fn test_parse_select_with_count_and_group_by() {
+    let stmt = parse_sql(
+        "SELECT age, COUNT(*) FROM users WHERE age > 25 GROUP BY age ORDER BY age DESC LIMIT 3;",
+    );
+    assert_eq!(
+        stmt,
+        Statement::Select {
+            table_name: "users".to_string(),
+            columns: SelectColumns::Aggregate(vec![
+                SelectItem::Column("age".to_string()),
+                SelectItem::Aggregate {
+                    func: AggregateFunc::Count,
+                    column: None,
+                },
+            ]),
+            join: None,
+            where_clause: Some(WhereClause {
+                column: "age".to_string(),
+                operator: Operator::Gt,
+                value: Value::Int(25),
+            }),
+            group_by: Some(GroupByClause {
+                column: "age".to_string(),
+            }),
+            order_by: Some(OrderByClause {
+                column: "age".to_string(),
+                direction: OrderDirection::Desc,
+            }),
+            limit: Some(3),
         }
     );
 }

@@ -520,3 +520,153 @@ fn test_order_by_with_where_combination() {
 
     let _ = std::fs::remove_dir_all(dir);
 }
+
+#[test]
+fn test_count_without_group_by_and_empty_table() {
+    let (dir, _engine, executor) = open_executor("agg-count-empty");
+
+    exec(
+        &executor,
+        "CREATE TABLE users (id INT, name TEXT, age INT, active BOOL);",
+    );
+
+    let (columns_empty, rows_empty) = rows_only(exec(&executor, "SELECT COUNT(*) FROM users;"));
+    assert_eq!(columns_empty, vec!["COUNT(*)"]);
+    assert_eq!(rows_empty, vec![vec![Value::Int(0)]]);
+
+    exec(
+        &executor,
+        "INSERT INTO users VALUES (1, 'Alice', 30, true), (2, 'Bob', 25, false), (3, 'Cara', 35, true);",
+    );
+
+    let (_, rows_count) = rows_only(exec(&executor, "SELECT COUNT(*) FROM users;"));
+    assert_eq!(rows_count, vec![vec![Value::Int(3)]]);
+
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn test_count_with_where_clause() {
+    let (dir, _engine, executor) = open_executor("agg-count-where");
+
+    exec(
+        &executor,
+        "CREATE TABLE users (id INT, name TEXT, age INT, active BOOL);",
+    );
+    exec(
+        &executor,
+        "INSERT INTO users VALUES (1, 'Alice', 30, true), (2, 'Bob', 25, false), (3, 'Cara', 35, true);",
+    );
+
+    let (_, rows) = rows_only(exec(
+        &executor,
+        "SELECT COUNT(*) FROM users WHERE age > 25;",
+    ));
+    assert_eq!(rows, vec![vec![Value::Int(2)]]);
+
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn test_group_by_with_count() {
+    let (dir, _engine, executor) = open_executor("agg-group-count");
+
+    exec(
+        &executor,
+        "CREATE TABLE users (id INT, name TEXT, age INT, active BOOL);",
+    );
+    exec(
+        &executor,
+        "INSERT INTO users VALUES (1, 'Alice', 30, true), (2, 'Bob', 25, false), (3, 'Cara', 30, true), (4, 'Dora', 25, true);",
+    );
+
+    let (columns, rows) = rows_only(exec(
+        &executor,
+        "SELECT age, COUNT(*) FROM users GROUP BY age ORDER BY age ASC;",
+    ));
+    assert_eq!(columns, vec!["age", "COUNT(*)"]);
+    assert_eq!(
+        rows,
+        vec![
+            vec![Value::Int(25), Value::Int(2)],
+            vec![Value::Int(30), Value::Int(2)],
+        ]
+    );
+
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn test_group_by_with_sum_min_and_max() {
+    let (dir, _engine, executor) = open_executor("agg-group-sum");
+
+    exec(
+        &executor,
+        "CREATE TABLE employees (id INT, department TEXT, salary INT, active BOOL);",
+    );
+    exec(
+        &executor,
+        "INSERT INTO employees VALUES (1, 'Eng', 100, true), (2, 'Eng', 150, true), (3, 'HR', 80, true), (4, 'HR', 120, false);",
+    );
+
+    let (columns, rows) = rows_only(exec(
+        &executor,
+        "SELECT department, SUM(salary), MIN(salary), MAX(salary) FROM employees GROUP BY department ORDER BY department ASC;",
+    ));
+    assert_eq!(
+        columns,
+        vec![
+            "department",
+            "SUM(salary)",
+            "MIN(salary)",
+            "MAX(salary)",
+        ]
+    );
+    assert_eq!(
+        rows,
+        vec![
+            vec![
+                Value::Text("Eng".to_string()),
+                Value::Int(250),
+                Value::Int(100),
+                Value::Int(150),
+            ],
+            vec![
+                Value::Text("HR".to_string()),
+                Value::Int(200),
+                Value::Int(80),
+                Value::Int(120),
+            ],
+        ]
+    );
+
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn test_group_by_with_order_by_and_limit() {
+    let (dir, _engine, executor) = open_executor("agg-group-order-limit");
+
+    exec(
+        &executor,
+        "CREATE TABLE employees (id INT, department TEXT, salary INT, active BOOL);",
+    );
+    exec(
+        &executor,
+        "INSERT INTO employees VALUES (1, 'Eng', 100, true), (2, 'Eng', 150, true), (3, 'HR', 80, true), (4, 'Sales', 200, true), (5, 'Sales', 50, false);",
+    );
+
+    let (_, rows) = rows_only(exec(
+        &executor,
+        "SELECT department, SUM(salary) FROM employees WHERE salary > 60 GROUP BY department ORDER BY department DESC LIMIT 2;",
+    ));
+    assert_eq!(
+        rows,
+        vec![
+            vec![Value::Text("Sales".to_string()), Value::Int(200)],
+            vec![Value::Text("HR".to_string()), Value::Int(80)],
+        ]
+    );
+
+    let _ = std::fs::remove_dir_all(dir);
+}
