@@ -17,6 +17,8 @@
 use std::fs::File;
 use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::error::{FerrisDbError, Result};
 use crate::storage::bloom::BloomFilter;
@@ -29,6 +31,13 @@ pub struct SSTableReader {
     bloom_filter: BloomFilter,
     index: Vec<(Vec<u8>, u64)>,
     data_end_offset: u64,
+    stats: Arc<BloomFilterStats>,
+}
+
+#[derive(Debug, Default)]
+struct BloomFilterStats {
+    checks: AtomicU64,
+    negatives: AtomicU64,
 }
 
 impl SSTableReader {
@@ -55,11 +64,14 @@ impl SSTableReader {
             bloom_filter,
             index,
             data_end_offset: footer.bloom_offset,
+            stats: Arc::new(BloomFilterStats::default()),
         })
     }
 
     pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        self.stats.checks.fetch_add(1, Ordering::Relaxed);
         if !self.bloom_filter.may_contain(key) {
+            self.stats.negatives.fetch_add(1, Ordering::Relaxed);
             return Ok(None);
         }
 
@@ -94,6 +106,24 @@ impl SSTableReader {
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    pub fn entry_count(&self) -> usize {
+        self.index.len()
+    }
+
+    pub fn file_size(&self) -> Result<u64> {
+        Ok(std::fs::metadata(&self.path)?.len())
+    }
+
+    pub fn bloom_filter_hit_rate(&self) -> f64 {
+        let checks = self.stats.checks.load(Ordering::Relaxed);
+        if checks == 0 {
+            return 0.0;
+        }
+
+        let negatives = self.stats.negatives.load(Ordering::Relaxed);
+        negatives as f64 / checks as f64
     }
 
     fn read_footer(file: &mut File) -> Result<Footer> {

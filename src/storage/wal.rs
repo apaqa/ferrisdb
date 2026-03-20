@@ -120,6 +120,15 @@ impl WalReader {
 
         Ok(memtable)
     }
+
+    pub fn record_count(&self) -> Result<usize> {
+        let mut count = 0;
+        for item in self.iter()? {
+            item?;
+            count += 1;
+        }
+        Ok(count)
+    }
 }
 
 pub struct WalIterator {

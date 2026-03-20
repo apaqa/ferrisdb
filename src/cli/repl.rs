@@ -25,10 +25,12 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 
 use crate::error::Result;
+use crate::storage::lsm::TOMBSTONE;
 use crate::storage::traits::StorageEngine;
 use crate::sql::executor::{format_execute_result, SqlExecutor};
 use crate::sql::lexer::Lexer;
 use crate::sql::parser::Parser;
+use crate::transaction::keyutil::decode_key;
 use crate::transaction::mvcc::{MvccEngine, Transaction};
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -99,6 +101,9 @@ pub fn run(engine: Arc<MvccEngine>) -> Result<()> {
             "dump" => handle_dump(&engine, &mut active_txn, &parts),
             "load" => handle_load(&engine, &mut active_txn, &parts),
             "compact" => handle_compact(&engine, &active_txn),
+            "flush" => handle_flush(&engine, &active_txn),
+            "show" => handle_show(&engine, &active_txn, &parts),
+            "debug" => handle_debug(&engine, &active_txn, &parts),
             "list" | "ls" => handle_list(&engine, &mut active_txn),
             "scan" => handle_scan(&engine, &mut active_txn, &parts),
             "stats" => handle_stats(&engine, &mut active_txn),
@@ -287,6 +292,43 @@ fn handle_compact(engine: &Arc<MvccEngine>, active_txn: &Option<Transaction>) {
     }
 }
 
+fn handle_flush(engine: &Arc<MvccEngine>, active_txn: &Option<Transaction>) {
+    if active_txn.is_some() {
+        println!("Error: cannot flush while a transaction is active");
+        return;
+    }
+
+    let mut inner = engine.inner.lock().expect("mvcc engine mutex poisoned");
+    match inner.flush() {
+        Ok(()) => println!("OK"),
+        Err(err) => println!("Error: {}", err),
+    }
+}
+
+fn handle_show(engine: &Arc<MvccEngine>, _active_txn: &Option<Transaction>, parts: &[&str]) {
+    if parts.len() != 2 {
+        println!("Usage: show <sstables|manifest|wal|stats>");
+        return;
+    }
+
+    match parts[1].to_lowercase().as_str() {
+        "sstables" => show_sstables(engine),
+        "manifest" => show_manifest(engine),
+        "wal" => show_wal(engine),
+        "stats" => show_full_stats(engine),
+        _ => println!("Unknown show target: '{}'", parts[1]),
+    }
+}
+
+fn handle_debug(engine: &Arc<MvccEngine>, _active_txn: &Option<Transaction>, parts: &[&str]) {
+    if parts.len() != 3 || parts[1].to_lowercase() != "key" {
+        println!("Usage: debug key <key>");
+        return;
+    }
+
+    debug_key(engine, parts[2].as_bytes());
+}
+
 fn handle_list(engine: &Arc<MvccEngine>, active_txn: &mut Option<Transaction>) {
     let result = if let Some(txn) = active_txn.as_ref() {
         txn.scan(&[], &[0xFF])
@@ -377,6 +419,12 @@ fn handle_help() {
     println!("  dump <filename>         Dump visible key-value pairs to a JSON file");
     println!("  load <filename>         Load key-value pairs from a JSON file");
     println!("  compact                 Compact SSTables");
+    println!("  flush                   Force flush the active MemTable");
+    println!("  show sstables           Show active SSTables");
+    println!("  show manifest           Show MANIFEST state");
+    println!("  show wal                Show WAL size and record count");
+    println!("  show stats              Show storage statistics");
+    println!("  debug key <key>         Show where a key exists in memtable / sstables");
     println!("  list                    List visible key-value pairs (alias: ls)");
     println!("  scan <start> <end>      Range scan");
     println!("  stats                   Show visible statistics");
@@ -437,4 +485,180 @@ fn read_pairs_from_file(filename: &str) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
         .into_iter()
         .map(|(key, value)| (key.into_bytes(), value.into_bytes()))
         .collect())
+}
+
+fn show_sstables(engine: &Arc<MvccEngine>) {
+    let inner = engine.inner.lock().expect("mvcc engine mutex poisoned");
+    match inner.sstable_infos() {
+        Ok(infos) => {
+            if infos.is_empty() {
+                println!("(no sstables)");
+                return;
+            }
+
+            for info in infos {
+                println!(
+                    "{}  size={} bytes  keys={}",
+                    info.filename, info.size_bytes, info.key_count
+                );
+            }
+        }
+        Err(err) => println!("Error: {}", err),
+    }
+}
+
+fn show_manifest(engine: &Arc<MvccEngine>) {
+    let inner = engine.inner.lock().expect("mvcc engine mutex poisoned");
+    let state = inner.manifest_state();
+
+    println!("MANIFEST:");
+    println!("  next_sstable_id: {}", state.next_sstable_id);
+    println!("  last_compaction_ts: {}", state.last_compaction_ts);
+    if state.sstable_files.is_empty() {
+        println!("  sstable_files: (empty)");
+    } else {
+        println!("  sstable_files:");
+        for filename in state.sstable_files {
+            println!("    {}", filename);
+        }
+    }
+}
+
+fn show_wal(engine: &Arc<MvccEngine>) {
+    let inner = engine.inner.lock().expect("mvcc engine mutex poisoned");
+    match inner.wal_info() {
+        Ok((size, records)) => {
+            println!("WAL path: {}", inner.wal_path().display());
+            println!("WAL size: {} bytes", size);
+            println!("WAL records: {}", records);
+        }
+        Err(err) => println!("Error: {}", err),
+    }
+}
+
+fn show_full_stats(engine: &Arc<MvccEngine>) {
+    let entries = {
+        let txn = engine.begin_transaction();
+        match txn.scan(&[], &[0xFF]) {
+            Ok(pairs) => pairs.len(),
+            Err(err) => {
+                println!("Error: {}", err);
+                return;
+            }
+        }
+    };
+
+    let inner = engine.inner.lock().expect("mvcc engine mutex poisoned");
+    match inner.disk_usage_bytes() {
+        Ok(disk_usage) => {
+            println!("Entries: {}", entries);
+            println!("SSTables: {}", inner.manifest_state().sstable_files.len());
+            println!("Disk usage: {} bytes", disk_usage);
+            println!(
+                "Bloom filter hit rate: {:.2}%",
+                inner.bloom_filter_hit_rate() * 100.0
+            );
+        }
+        Err(err) => println!("Error: {}", err),
+    }
+}
+
+fn debug_key(engine: &Arc<MvccEngine>, key: &[u8]) {
+    let visible = {
+        let txn = engine.begin_transaction();
+        txn.get(key)
+    };
+
+    match visible {
+        Ok(Some(value)) => println!("Visible value: {}", String::from_utf8_lossy(&value)),
+        Ok(None) => println!("Visible value: (not found)"),
+        Err(err) => {
+            println!("Error: {}", err);
+            return;
+        }
+    }
+
+    let inner = engine.inner.lock().expect("mvcc engine mutex poisoned");
+    match inner.active_memtable.list_all() {
+        Ok(entries) => {
+            let mem_matches: Vec<_> = entries
+                .into_iter()
+                .filter_map(|(encoded_key, value)| match decode_mvcc_entry(&encoded_key, &value, key)
+                {
+                    Some(line) => Some(line),
+                    None => None,
+                })
+                .collect();
+
+            if mem_matches.is_empty() {
+                println!("MemTable: (no versions)");
+            } else {
+                println!("MemTable:");
+                for line in mem_matches {
+                    println!("  {}", line);
+                }
+            }
+        }
+        Err(err) => {
+            println!("Error: {}", err);
+            return;
+        }
+    }
+
+    for reader in &inner.sstables {
+        let mut matched = Vec::new();
+        match reader.iter() {
+            Ok(iter) => {
+                for item in iter {
+                    match item {
+                        Ok((encoded_key, value)) => {
+                            if let Some(line) = decode_mvcc_entry(&encoded_key, &value, key) {
+                                matched.push(line);
+                            }
+                        }
+                        Err(err) => {
+                            println!("Error: {}", err);
+                            return;
+                        }
+                    }
+                }
+            }
+            Err(err) => {
+                println!("Error: {}", err);
+                return;
+            }
+        }
+
+        let name = reader
+            .path()
+            .file_name()
+            .and_then(|file| file.to_str())
+            .unwrap_or("<invalid>");
+        if matched.is_empty() {
+            println!("{}: (no versions)", name);
+        } else {
+            println!("{}:", name);
+            for line in matched {
+                println!("  {}", line);
+            }
+        }
+    }
+}
+
+fn decode_mvcc_entry(encoded_key: &[u8], value: &[u8], user_key: &[u8]) -> Option<String> {
+    if encoded_key.len() < 8 {
+        return None;
+    }
+
+    let (decoded_user_key, ts) = decode_key(encoded_key);
+    if decoded_user_key != user_key {
+        return None;
+    }
+
+    let value_repr = if value == TOMBSTONE {
+        "__TOMBSTONE__".to_string()
+    } else {
+        String::from_utf8_lossy(value).into_owned()
+    };
+    Some(format!("ts={} value={}", ts, value_repr))
 }
