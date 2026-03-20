@@ -2,7 +2,10 @@
 // main.rs — ferrisdb 執行入口（REPL / TCP server）
 // =============================================================================
 //
-// 這版改為使用 LsmEngine，資料會落在 ./ferrisdb-data，不再是純記憶體。
+// 這版 main 使用 LsmEngine 作為底層儲存引擎。
+// 因此：
+// - REPL 模式的資料不再只留在記憶體
+// - TCP server 模式也會把資料持久化到磁碟
 //
 // 使用方式：
 // - cargo run
@@ -43,7 +46,6 @@ fn main() {
 }
 
 fn run_repl_mode() {
-    // REPL 與 server 共用同一份落盤資料目錄。
     let mut engine = match LsmEngine::open(DEFAULT_DATA_DIR, DEFAULT_MEMTABLE_SIZE_THRESHOLD) {
         Ok(engine) => engine,
         Err(err) => {
@@ -54,6 +56,12 @@ fn run_repl_mode() {
 
     if let Err(err) = repl::run(&mut engine) {
         eprintln!("Fatal error: {}", err);
+        std::process::exit(1);
+    }
+
+    // REPL 結束時主動 shutdown，確保就算資料量沒超過閾值也會被 flush。
+    if let Err(err) = engine.shutdown() {
+        eprintln!("Failed to shutdown LSM engine cleanly: {}", err);
         std::process::exit(1);
     }
 }
@@ -74,8 +82,8 @@ fn run_server_mode(port: u16) {
     }
 }
 
-/// 解析是否為 server 模式，成功回傳 `Some(port)`。
-/// 若不是 server 模式，回傳 `None`。
+/// 解析是否為 server 模式。
+/// 成功時回傳 `Some(port)`；若不是 server 模式則回傳 `None`。
 fn parse_server_args(args: &[String]) -> Result<Option<u16>, String> {
     if args.is_empty() || args[0] != "--server" {
         return Ok(None);

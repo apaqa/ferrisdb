@@ -176,3 +176,33 @@ fn test_scan_merges_memtable_and_sstable() {
 
     let _ = fs::remove_dir_all(dir);
 }
+
+#[test]
+fn test_manual_shutdown_persists_small_memtable() {
+    let dir = temp_dir("manual-shutdown");
+
+    {
+        let mut engine = LsmEngine::open(&dir, DEFAULT_MEMTABLE_SIZE_THRESHOLD).expect("open lsm");
+        engine
+            .put(b"small:key".to_vec(), b"small:value".to_vec())
+            .expect("put small entry");
+        engine
+            .put(b"small:key:2".to_vec(), b"another".to_vec())
+            .expect("put second small entry");
+
+        // 這裡資料量故意不超過閾值，必須靠手動 shutdown 才能持久化。
+        engine.shutdown().expect("manual shutdown");
+    }
+
+    let reopened = LsmEngine::open(&dir, DEFAULT_MEMTABLE_SIZE_THRESHOLD).expect("reopen lsm");
+    assert_eq!(
+        reopened.get(b"small:key").expect("get small:key"),
+        Some(b"small:value".to_vec())
+    );
+    assert_eq!(
+        reopened.get(b"small:key:2").expect("get small:key:2"),
+        Some(b"another".to_vec())
+    );
+
+    let _ = fs::remove_dir_all(dir);
+}
