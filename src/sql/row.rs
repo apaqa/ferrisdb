@@ -45,6 +45,15 @@ impl Row {
             false
         }
     }
+
+    pub fn push(&mut self, column: String, value: Value) {
+        self.columns.push((column, value));
+    }
+
+    pub fn remove(&mut self, column: &str) -> Option<Value> {
+        let index = self.columns.iter().position(|(name, _)| name == column)?;
+        Some(self.columns.remove(index).1)
+    }
 }
 
 pub fn encode_row_key(table_name: &str, pk_value: &Value) -> Vec<u8> {

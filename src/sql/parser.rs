@@ -15,7 +15,8 @@ use crate::error::{FerrisDbError, Result};
 
 use super::ast::{
     AggregateFunc, Assignment, ColumnDef, DataType, GroupByClause, JoinClause, Operator,
-    OrderByClause, OrderDirection, SelectColumns, SelectItem, Statement, Value, WhereClause,
+    OrderByClause, OrderDirection, SelectColumns, SelectItem, Statement, SubqueryCondition, Value,
+    WhereClause,
 };
 use super::lexer::{Keyword, Token};
 
@@ -38,6 +39,7 @@ impl Parser {
 
         let stmt = match self.peek() {
             Some(Token::Keyword(Keyword::Explain)) => self.parse_explain()?,
+            Some(Token::Keyword(Keyword::Alter)) => self.parse_alter_table()?,
             Some(Token::Keyword(Keyword::Create)) => self.parse_create_statement()?,
             Some(Token::Keyword(Keyword::Drop)) => self.parse_drop_statement()?,
             Some(Token::Keyword(Keyword::Insert)) => self.parse_insert()?,
@@ -79,6 +81,7 @@ impl Parser {
 
     fn parse_create_table_after_create(&mut self) -> Result<Statement> {
         self.expect_keyword(Keyword::Table)?;
+        let if_not_exists = self.parse_optional_if_not_exists()?;
         let table_name = self.expect_ident()?;
         self.expect_token(Token::LParen)?;
 
@@ -96,7 +99,11 @@ impl Parser {
         }
 
         self.expect_token(Token::RParen)?;
-        Ok(Statement::CreateTable { table_name, columns })
+        Ok(Statement::CreateTable {
+            table_name,
+            if_not_exists,
+            columns,
+        })
     }
 
     fn parse_create_index_after_create(&mut self) -> Result<Statement> {
@@ -114,16 +121,64 @@ impl Parser {
 
     fn parse_drop_statement(&mut self) -> Result<Statement> {
         self.expect_keyword(Keyword::Drop)?;
-        self.expect_keyword(Keyword::Index)?;
-        self.expect_keyword(Keyword::On)?;
+        match self.peek() {
+            Some(Token::Keyword(Keyword::Index)) => {
+                self.expect_keyword(Keyword::Index)?;
+                self.expect_keyword(Keyword::On)?;
+                let table_name = self.expect_ident()?;
+                self.expect_token(Token::LParen)?;
+                let column_name = self.expect_ident()?;
+                self.expect_token(Token::RParen)?;
+                Ok(Statement::DropIndex {
+                    table_name,
+                    column_name,
+                })
+            }
+            Some(Token::Keyword(Keyword::Table)) => {
+                self.expect_keyword(Keyword::Table)?;
+                let if_exists = self.parse_optional_if_exists()?;
+                let table_name = self.expect_ident()?;
+                Ok(Statement::DropTable {
+                    table_name,
+                    if_exists,
+                })
+            }
+            other => Err(FerrisDbError::InvalidCommand(format!(
+                "expected INDEX or TABLE after DROP, got {:?}",
+                other
+            ))),
+        }
+    }
+
+    fn parse_alter_table(&mut self) -> Result<Statement> {
+        self.expect_keyword(Keyword::Alter)?;
+        self.expect_keyword(Keyword::Table)?;
         let table_name = self.expect_ident()?;
-        self.expect_token(Token::LParen)?;
-        let column_name = self.expect_ident()?;
-        self.expect_token(Token::RParen)?;
-        Ok(Statement::DropIndex {
-            table_name,
-            column_name,
-        })
+        match self.peek() {
+            Some(Token::Keyword(Keyword::Add)) => {
+                self.expect_keyword(Keyword::Add)?;
+                self.expect_keyword(Keyword::Column)?;
+                let name = self.expect_ident()?;
+                let data_type = self.parse_data_type()?;
+                Ok(Statement::AlterTableAdd {
+                    table_name,
+                    column: ColumnDef { name, data_type },
+                })
+            }
+            Some(Token::Keyword(Keyword::Drop)) => {
+                self.expect_keyword(Keyword::Drop)?;
+                self.expect_keyword(Keyword::Column)?;
+                let column_name = self.expect_ident()?;
+                Ok(Statement::AlterTableDropColumn {
+                    table_name,
+                    column_name,
+                })
+            }
+            other => Err(FerrisDbError::InvalidCommand(format!(
+                "expected ADD or DROP after ALTER TABLE, got {:?}",
+                other
+            ))),
+        }
     }
 
     fn parse_explain(&mut self) -> Result<Statement> {
@@ -273,10 +328,20 @@ impl Parser {
 
         self.bump();
         let column = self.parse_identifier_path()?;
+        if matches!(self.peek(), Some(Token::Keyword(Keyword::In))) {
+            self.bump();
+            self.expect_token(Token::LParen)?;
+            let subquery = self.parse_select()?;
+            self.expect_token(Token::RParen)?;
+            return Ok(Some(WhereClause::Subquery(SubqueryCondition {
+                column,
+                subquery: Box::new(subquery),
+            })));
+        }
         let operator = self.parse_operator()?;
         let value = self.parse_value()?;
 
-        Ok(Some(WhereClause {
+        Ok(Some(WhereClause::Comparison {
             column,
             operator,
             value,
@@ -439,6 +504,25 @@ impl Parser {
         }
 
         Ok(SelectItem::Aggregate { func, column })
+    }
+
+    fn parse_optional_if_exists(&mut self) -> Result<bool> {
+        if !matches!(self.peek(), Some(Token::Keyword(Keyword::If))) {
+            return Ok(false);
+        }
+        self.expect_keyword(Keyword::If)?;
+        self.expect_keyword(Keyword::Exists)?;
+        Ok(true)
+    }
+
+    fn parse_optional_if_not_exists(&mut self) -> Result<bool> {
+        if !matches!(self.peek(), Some(Token::Keyword(Keyword::If))) {
+            return Ok(false);
+        }
+        self.expect_keyword(Keyword::If)?;
+        self.expect_keyword(Keyword::Not)?;
+        self.expect_keyword(Keyword::Exists)?;
+        Ok(true)
     }
 
     fn expect_ident(&mut self) -> Result<String> {

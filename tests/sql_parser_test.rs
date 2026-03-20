@@ -10,7 +10,8 @@
 
 use ferrisdb::sql::ast::{
     AggregateFunc, Assignment, ColumnDef, DataType, GroupByClause, JoinClause, Operator,
-    OrderByClause, OrderDirection, SelectColumns, SelectItem, Statement, Value, WhereClause,
+    OrderByClause, OrderDirection, SelectColumns, SelectItem, Statement, SubqueryCondition, Value,
+    WhereClause,
 };
 use ferrisdb::sql::lexer::{Keyword, Lexer, Token};
 use ferrisdb::sql::parser::Parser;
@@ -45,6 +46,7 @@ fn test_parse_create_table() {
         stmt,
         Statement::CreateTable {
             table_name: "users".to_string(),
+            if_not_exists: false,
             columns: vec![
                 ColumnDef {
                     name: "id".to_string(),
@@ -114,7 +116,7 @@ fn test_parse_select() {
             table_name: "users".to_string(),
             columns: SelectColumns::Named(vec!["name".to_string(), "age".to_string()]),
             join: None,
-            where_clause: Some(WhereClause {
+            where_clause: Some(WhereClause::Comparison {
                 column: "id".to_string(),
                 operator: Operator::Eq,
                 value: Value::Int(1),
@@ -135,7 +137,7 @@ fn test_parse_select_all_and_comparison_operator() {
             table_name: "users".to_string(),
             columns: SelectColumns::All,
             join: None,
-            where_clause: Some(WhereClause {
+            where_clause: Some(WhereClause::Comparison {
                 column: "age".to_string(),
                 operator: Operator::Gt,
                 value: Value::Int(25),
@@ -158,7 +160,7 @@ fn test_parse_update() {
                 column: "name".to_string(),
                 value: Value::Text("Bob".to_string()),
             }],
-            where_clause: Some(WhereClause {
+            where_clause: Some(WhereClause::Comparison {
                 column: "id".to_string(),
                 operator: Operator::Eq,
                 value: Value::Int(1),
@@ -174,7 +176,7 @@ fn test_parse_delete() {
         stmt,
         Statement::Delete {
             table_name: "users".to_string(),
-            where_clause: Some(WhereClause {
+            where_clause: Some(WhereClause::Comparison {
                 column: "id".to_string(),
                 operator: Operator::Eq,
                 value: Value::Int(1),
@@ -233,7 +235,7 @@ fn test_parse_select_with_inner_join() {
                 left_column: "users.id".to_string(),
                 right_column: "orders.user_id".to_string(),
             }),
-            where_clause: Some(WhereClause {
+            where_clause: Some(WhereClause::Comparison {
                 column: "users.id".to_string(),
                 operator: Operator::Eq,
                 value: Value::Int(1),
@@ -255,7 +257,7 @@ fn test_parse_explain_select() {
                 table_name: "users".to_string(),
                 columns: SelectColumns::All,
                 join: None,
-                where_clause: Some(WhereClause {
+                where_clause: Some(WhereClause::Comparison {
                     column: "id".to_string(),
                     operator: Operator::Eq,
                     value: Value::Int(1),
@@ -279,7 +281,7 @@ fn test_parse_select_with_order_by_and_limit() {
             table_name: "users".to_string(),
             columns: SelectColumns::All,
             join: None,
-            where_clause: Some(WhereClause {
+            where_clause: Some(WhereClause::Comparison {
                 column: "age".to_string(),
                 operator: Operator::Gt,
                 value: Value::Int(20),
@@ -311,7 +313,7 @@ fn test_parse_select_with_count_and_group_by() {
                 },
             ]),
             join: None,
-            where_clause: Some(WhereClause {
+            where_clause: Some(WhereClause::Comparison {
                 column: "age".to_string(),
                 operator: Operator::Gt,
                 value: Value::Int(25),
@@ -324,6 +326,78 @@ fn test_parse_select_with_count_and_group_by() {
                 direction: OrderDirection::Desc,
             }),
             limit: Some(3),
+        }
+    );
+}
+
+#[test]
+fn test_parse_create_if_not_exists_alter_drop_table_and_subquery() {
+    assert_eq!(
+        parse_sql("CREATE TABLE IF NOT EXISTS users (id INT, name TEXT);"),
+        Statement::CreateTable {
+            table_name: "users".to_string(),
+            if_not_exists: true,
+            columns: vec![
+                ColumnDef {
+                    name: "id".to_string(),
+                    data_type: DataType::Int,
+                },
+                ColumnDef {
+                    name: "name".to_string(),
+                    data_type: DataType::Text,
+                },
+            ],
+        }
+    );
+
+    assert_eq!(
+        parse_sql("ALTER TABLE users ADD COLUMN email TEXT;"),
+        Statement::AlterTableAdd {
+            table_name: "users".to_string(),
+            column: ColumnDef {
+                name: "email".to_string(),
+                data_type: DataType::Text,
+            },
+        }
+    );
+
+    assert_eq!(
+        parse_sql("ALTER TABLE users DROP COLUMN age;"),
+        Statement::AlterTableDropColumn {
+            table_name: "users".to_string(),
+            column_name: "age".to_string(),
+        }
+    );
+
+    assert_eq!(
+        parse_sql("DROP TABLE IF EXISTS users;"),
+        Statement::DropTable {
+            table_name: "users".to_string(),
+            if_exists: true,
+        }
+    );
+
+    assert_eq!(
+        parse_sql("SELECT * FROM users WHERE id IN (SELECT user_id FROM orders);"),
+        Statement::Select {
+            table_name: "users".to_string(),
+            columns: SelectColumns::All,
+            join: None,
+            where_clause: Some(WhereClause::Subquery(SubqueryCondition {
+                column: "id".to_string(),
+                subquery: Box::new(Statement::Select {
+                    table_name: "orders".to_string(),
+                    columns: SelectColumns::Named(vec!["user_id".to_string()]),
+                    join: None,
+                    where_clause: None,
+                    group_by: None,
+                    order_by: None,
+                    limit: None,
+                }),
+            })),
+            group_by: None,
+            order_by: None,
+            limit: None,
         }
     );
 }

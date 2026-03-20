@@ -32,8 +32,8 @@ use crate::error::Result;
 use crate::transaction::mvcc::{MvccEngine, Transaction};
 
 use super::ast::{
-    AggregateFunc, Assignment, GroupByClause, JoinClause, Operator, OrderByClause,
-    OrderDirection, SelectColumns, SelectItem, Statement, Value, WhereClause,
+    AggregateFunc, Assignment, ColumnDef, GroupByClause, JoinClause, Operator, OrderByClause,
+    OrderDirection, SelectColumns, SelectItem, Statement, SubqueryCondition, Value, WhereClause,
 };
 use super::catalog::{Catalog, TableSchema};
 use super::index::IndexManager;
@@ -45,6 +45,8 @@ use super::row::{
 pub enum ExecuteResult {
     Explain { plan: String },
     Created { table_name: String },
+    Altered { table_name: String },
+    Dropped { table_name: String },
     IndexCreated { table_name: String, column_name: String },
     IndexDropped { table_name: String, column_name: String },
     Inserted { count: usize },
@@ -77,8 +79,20 @@ impl SqlExecutor {
             Statement::Explain { statement } => self.execute_explain(*statement),
             Statement::CreateTable {
                 table_name,
+                if_not_exists,
                 columns,
-            } => self.execute_create_table(table_name, columns),
+            } => self.execute_create_table(table_name, if_not_exists, columns),
+            Statement::AlterTableAdd { table_name, column } => {
+                self.execute_alter_table_add(table_name, column)
+            }
+            Statement::AlterTableDropColumn {
+                table_name,
+                column_name,
+            } => self.execute_alter_table_drop_column(table_name, column_name),
+            Statement::DropTable {
+                table_name,
+                if_exists,
+            } => self.execute_drop_table(table_name, if_exists),
             Statement::CreateIndex {
                 table_name,
                 column_name,
@@ -120,6 +134,7 @@ impl SqlExecutor {
     fn execute_create_table(
         &self,
         table_name: String,
+        if_not_exists: bool,
         columns: Vec<super::ast::ColumnDef>,
     ) -> Result<ExecuteResult> {
         if columns.is_empty() {
@@ -135,6 +150,9 @@ impl SqlExecutor {
         };
 
         if !self.catalog.create_table(&mut txn, &schema)? {
+            if if_not_exists {
+                return Ok(ExecuteResult::Created { table_name });
+            }
             return Ok(ExecuteResult::Error {
                 message: format!("table '{}' already exists", table_name),
             });
@@ -142,6 +160,110 @@ impl SqlExecutor {
 
         txn.commit()?;
         Ok(ExecuteResult::Created { table_name })
+    }
+
+    fn execute_alter_table_add(
+        &self,
+        table_name: String,
+        column: ColumnDef,
+    ) -> Result<ExecuteResult> {
+        let mut txn = self.engine.begin_transaction();
+        let Some(mut schema) = self.catalog.get_table(&txn, &table_name)? else {
+            return Ok(ExecuteResult::Error {
+                message: format!("table '{}' does not exist", table_name),
+            });
+        };
+        if schema.columns.iter().any(|existing| existing.name == column.name) {
+            return Ok(ExecuteResult::Error {
+                message: format!("column '{}' already exists", column.name),
+            });
+        }
+
+        schema.columns.push(column.clone());
+        txn.put(
+            crate::sql::catalog::encode_schema_key(&table_name),
+            serde_json::to_vec(&schema)?,
+        )?;
+
+        let rows = self.scan_rows(&txn, &schema_with_removed_column(&schema, &column.name))?;
+        for (row_key, mut row) in rows {
+            row.push(column.name.clone(), Value::Null);
+            txn.put(row_key, serde_json::to_vec(&row)?)?;
+        }
+
+        txn.commit()?;
+        Ok(ExecuteResult::Altered { table_name })
+    }
+
+    fn execute_alter_table_drop_column(
+        &self,
+        table_name: String,
+        column_name: String,
+    ) -> Result<ExecuteResult> {
+        let mut txn = self.engine.begin_transaction();
+        let Some(mut schema) = self.catalog.get_table(&txn, &table_name)? else {
+            return Ok(ExecuteResult::Error {
+                message: format!("table '{}' does not exist", table_name),
+            });
+        };
+        if schema.columns.first().is_some_and(|column| column.name == column_name) {
+            return Ok(ExecuteResult::Error {
+                message: "dropping the primary key column is not supported".to_string(),
+            });
+        }
+        if !schema.columns.iter().any(|column| column.name == column_name) {
+            return Ok(ExecuteResult::Error {
+                message: format!("unknown column '{}'", column_name),
+            });
+        }
+
+        let rows = self.scan_rows(&txn, &schema)?;
+        for (row_key, mut row) in rows {
+            row.remove(&column_name);
+            txn.put(row_key, serde_json::to_vec(&row)?)?;
+        }
+
+        if self
+            .index_manager
+            .has_index(&txn, &table_name, &column_name)?
+        {
+            self.index_manager
+                .drop_index_in_txn(&mut txn, &table_name, &column_name)?;
+        }
+
+        schema.columns.retain(|column| column.name != column_name);
+        txn.put(
+            crate::sql::catalog::encode_schema_key(&table_name),
+            serde_json::to_vec(&schema)?,
+        )?;
+
+        txn.commit()?;
+        Ok(ExecuteResult::Altered { table_name })
+    }
+
+    fn execute_drop_table(&self, table_name: String, if_exists: bool) -> Result<ExecuteResult> {
+        let mut txn = self.engine.begin_transaction();
+        let Some(schema) = self.catalog.get_table(&txn, &table_name)? else {
+            if if_exists {
+                return Ok(ExecuteResult::Dropped { table_name });
+            }
+            return Ok(ExecuteResult::Error {
+                message: format!("table '{}' does not exist", table_name),
+            });
+        };
+
+        for index_column in self.index_manager.list_indexes(&txn, &table_name)? {
+            self.index_manager
+                .drop_index_in_txn(&mut txn, &table_name, &index_column)?;
+        }
+
+        for (row_key, _) in self.scan_rows(&txn, &schema)? {
+            txn.delete(&row_key)?;
+        }
+        self.catalog.drop_table(&mut txn, &table_name)?;
+
+        txn.commit()?;
+        Ok(ExecuteResult::Dropped { table_name })
     }
 
     fn execute_create_index(
@@ -245,10 +367,13 @@ impl SqlExecutor {
 
                 let mut lines = Vec::new();
                 if use_index {
-                    let where_clause = where_clause.as_ref().expect("index scan requires where");
+                    let (column, _, _) = where_comparison_parts(
+                        where_clause.as_ref().expect("index scan requires where"),
+                    )
+                    .expect("index scan requires comparison");
                     lines.push(format!(
                         "IndexScan(table={}, column={}, rows={}, cost={:.2})",
-                        table_name, where_clause.column, scan_rows, scan_cost
+                        table_name, column, scan_rows, scan_cost
                     ));
                 } else {
                     lines.push(format!(
@@ -257,23 +382,23 @@ impl SqlExecutor {
                     ));
                 }
                 if let Some(where_clause) = where_clause {
-                    if use_index && matches!(where_clause.operator, Operator::Eq) {
+                    if use_index && where_comparison_parts(&where_clause).is_some() {
+                        let (column, _, value) =
+                            where_comparison_parts(&where_clause).expect("comparison");
                         lines.push(format!(
                             "  -> IndexFilter(predicate=\"{} = {}\", rows={}, cost={:.2})",
-                            where_clause.column,
-                            render_value(&where_clause.value),
+                            column,
+                            render_value(value),
                             filtered_rows,
                             filter_cost * 0.25
                         ));
                     } else {
-                    lines.push(format!(
-                        "  -> Filter(predicate=\"{} {} {}\", rows={}, cost={:.2})",
-                        where_clause.column,
-                        operator_to_str(&where_clause.operator),
-                        render_value(&where_clause.value),
-                        filtered_rows,
-                        filter_cost
-                    ));
+                        lines.push(format!(
+                            "  -> Filter(predicate=\"{}\", rows={}, cost={:.2})",
+                            render_where_clause(&where_clause),
+                            filtered_rows,
+                            filter_cost
+                        ));
                     }
                 }
                 if let Some(group_by) = group_by {
@@ -546,6 +671,7 @@ impl SqlExecutor {
 
         let left_rows = self.scan_rows(txn, left_schema)?;
         let right_rows = self.scan_rows(txn, &right_schema)?;
+        let resolved_where = self.resolve_where_clause(where_clause.as_ref())?;
         let projection = match self.resolve_join_projection(left_schema, &right_schema, &columns) {
             Ok(columns) => columns,
             Err(message) => return Ok(ExecuteResult::Error { message }),
@@ -573,7 +699,7 @@ impl SqlExecutor {
                 }
 
                 let joined = JoinedRow::new(left_schema, left_row, &right_schema, right_row);
-                if !matches_join_where(&joined, where_clause.as_ref()) {
+                if !matches_joined_row(&joined, resolved_where.as_ref()) {
                     continue;
                 }
                 matched_rows.push(joined);
@@ -638,9 +764,10 @@ impl SqlExecutor {
         }
 
         let rows = self.scan_rows(&txn, &schema)?;
+        let resolved_where = self.resolve_where_clause(where_clause.as_ref())?;
         let mut updated = 0;
         for (row_key, mut row) in rows {
-            if !matches_where(&row, where_clause.as_ref()) {
+            if !matches_row(&row, resolved_where.as_ref()) {
                 continue;
             }
 
@@ -695,9 +822,10 @@ impl SqlExecutor {
         };
 
         let rows = self.scan_rows(&txn, &schema)?;
+        let resolved_where = self.resolve_where_clause(where_clause.as_ref())?;
         let mut deleted = 0;
         for (row_key, row) in rows {
-            if !matches_where(&row, where_clause.as_ref()) {
+            if !matches_row(&row, resolved_where.as_ref()) {
                 continue;
             }
             let pk_value = row
@@ -804,34 +932,36 @@ impl SqlExecutor {
         schema: &TableSchema,
         where_clause: Option<&WhereClause>,
     ) -> Result<Vec<(Vec<u8>, Row)>> {
+        let resolved_where = self.resolve_where_clause(where_clause)?;
         if let Some(where_clause) = where_clause {
-            if matches!(where_clause.operator, Operator::Eq)
-                && self
+            if let Some((column, Operator::Eq, value)) = where_comparison_parts(where_clause) {
+                if self
                     .index_manager
-                    .has_index(txn, &schema.table_name, &where_clause.column)?
-            {
+                    .has_index(txn, &schema.table_name, column)?
+                {
                 let pks = self.index_manager.lookup(
                     txn,
                     &schema.table_name,
-                    &where_clause.column,
-                    &where_clause.value,
+                    column,
+                    value,
                 )?;
                 let mut rows = Vec::new();
                 for pk in pks {
                     let row_key = encode_row_key(&schema.table_name, &pk);
                     if let Some(raw) = txn.get(&row_key)? {
                         let row: Row = serde_json::from_slice(&raw)?;
-                        if matches_where(&row, Some(where_clause)) {
+                        if matches_row(&row, resolved_where.as_ref()) {
                             rows.push((row_key, row));
                         }
                     }
                 }
                 return Ok(rows);
             }
+            }
         }
 
         let mut rows = self.scan_rows(txn, schema)?;
-        rows.retain(|(_, row)| matches_where(row, where_clause));
+        rows.retain(|(_, row)| matches_row(row, resolved_where.as_ref()));
         Ok(rows)
     }
 
@@ -844,11 +974,52 @@ impl SqlExecutor {
         let Some(where_clause) = where_clause else {
             return Ok(false);
         };
-        if !matches!(where_clause.operator, Operator::Eq) {
+        let Some((column, Operator::Eq, _)) = where_comparison_parts(where_clause) else {
             return Ok(false);
-        }
+        };
         self.index_manager
-            .has_index(txn, table_name, &where_clause.column)
+            .has_index(txn, table_name, column)
+    }
+
+    fn resolve_where_clause(
+        &self,
+        where_clause: Option<&WhereClause>,
+    ) -> Result<Option<ResolvedWhereClause>> {
+        let Some(where_clause) = where_clause else {
+            return Ok(None);
+        };
+
+        match where_clause {
+            WhereClause::Comparison {
+                column,
+                operator,
+                value,
+            } => Ok(Some(ResolvedWhereClause::Comparison {
+                column: column.clone(),
+                operator: operator.clone(),
+                value: value.clone(),
+            })),
+            WhereClause::Subquery(SubqueryCondition { column, subquery }) => {
+                let result = self.execute((**subquery).clone())?;
+                let ExecuteResult::Selected { rows, .. } = result else {
+                    return Ok(Some(ResolvedWhereClause::InValues {
+                        column: column.clone(),
+                        values: Vec::new(),
+                    }));
+                };
+
+                let mut values = Vec::new();
+                for row in rows {
+                    if let Some(value) = row.first() {
+                        values.push(value.clone());
+                    }
+                }
+                Ok(Some(ResolvedWhereClause::InValues {
+                    column: column.clone(),
+                    values,
+                }))
+            }
+        }
     }
 
     fn resolve_join_projection(
@@ -891,6 +1062,8 @@ pub fn format_execute_result(result: &ExecuteResult) -> String {
     match result {
         ExecuteResult::Explain { plan } => plan.clone(),
         ExecuteResult::Created { table_name } => format!("Table '{}' created", table_name),
+        ExecuteResult::Altered { table_name } => format!("Table '{}' altered", table_name),
+        ExecuteResult::Dropped { table_name } => format!("Table '{}' dropped", table_name),
         ExecuteResult::IndexCreated {
             table_name,
             column_name,
@@ -955,16 +1128,86 @@ fn format_selected(columns: &[String], rows: &[Vec<Value>]) -> String {
     format!("{}\n{}\n{}\n({} rows)", header, separator, body, rows.len())
 }
 
-fn matches_where(row: &Row, where_clause: Option<&WhereClause>) -> bool {
+#[derive(Debug, Clone)]
+enum ResolvedWhereClause {
+    Comparison {
+        column: String,
+        operator: Operator,
+        value: Value,
+    },
+    InValues {
+        column: String,
+        values: Vec<Value>,
+    },
+}
+
+fn where_comparison_parts(
+    where_clause: &WhereClause,
+) -> Option<(&str, Operator, &Value)> {
+    match where_clause {
+        WhereClause::Comparison {
+            column,
+            operator,
+            value,
+        } => Some((column, operator.clone(), value)),
+        WhereClause::Subquery(_) => None,
+    }
+}
+
+fn render_where_clause(where_clause: &WhereClause) -> String {
+    match where_clause {
+        WhereClause::Comparison {
+            column,
+            operator,
+            value,
+        } => format!(
+            "{} {} {}",
+            column,
+            operator_to_str(operator),
+            render_value(value)
+        ),
+        WhereClause::Subquery(SubqueryCondition { column, .. }) => {
+            format!("{} IN (subquery)", column)
+        }
+    }
+}
+
+fn matches_row(row: &Row, where_clause: Option<&ResolvedWhereClause>) -> bool {
     let Some(where_clause) = where_clause else {
         return true;
     };
 
-    let Some(left) = row.get(&where_clause.column) else {
-        return false;
+    match where_clause {
+        ResolvedWhereClause::Comparison {
+            column,
+            operator,
+            value,
+        } => row
+            .get(column)
+            .is_some_and(|left| compare_values(left, value, operator.clone())),
+        ResolvedWhereClause::InValues { column, values } => {
+            row.get(column).is_some_and(|left| values.contains(left))
+        }
+    }
+}
+
+fn matches_joined_row(row: &JoinedRow, where_clause: Option<&ResolvedWhereClause>) -> bool {
+    let Some(where_clause) = where_clause else {
+        return true;
     };
 
-    compare_values(left, &where_clause.value, where_clause.operator.clone())
+    match where_clause {
+        ResolvedWhereClause::Comparison {
+            column,
+            operator,
+            value,
+        } => row
+            .get(column)
+            .is_some_and(|left| compare_values(left, value, operator.clone())),
+        ResolvedWhereClause::InValues { column, values } => {
+            row.get(column).is_some_and(|left| values.contains(left))
+        }
+    }
 }
 
 fn compare_values(left: &Value, right: &Value, operator: Operator) -> bool {
@@ -1129,18 +1372,6 @@ fn join_output_columns(left_schema: &TableSchema, right_schema: &TableSchema) ->
     columns
 }
 
-fn matches_join_where(joined: &JoinedRow, where_clause: Option<&WhereClause>) -> bool {
-    let Some(where_clause) = where_clause else {
-        return true;
-    };
-
-    let Some(left) = joined.get(&where_clause.column) else {
-        return false;
-    };
-
-    compare_values(left, &where_clause.value, where_clause.operator.clone())
-}
-
 fn group_rows(
     rows: Vec<Row>,
     group_by: Option<&GroupByClause>,
@@ -1169,6 +1400,14 @@ fn value_group_key(value: &Value) -> String {
         Value::Bool(value) => format!("b:{}", value),
         Value::Null => "n:null".to_string(),
     }
+}
+
+fn schema_with_removed_column(schema: &TableSchema, removed_column: &str) -> TableSchema {
+    let mut old_schema = schema.clone();
+    old_schema
+        .columns
+        .retain(|column| column.name != removed_column);
+    old_schema
 }
 
 fn evaluate_select_item(item: &SelectItem, rows: &[Row]) -> std::result::Result<Value, String> {

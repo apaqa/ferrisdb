@@ -20,7 +20,20 @@ pub enum Statement {
     },
     CreateTable {
         table_name: String,
+        if_not_exists: bool,
         columns: Vec<ColumnDef>,
+    },
+    AlterTableAdd {
+        table_name: String,
+        column: ColumnDef,
+    },
+    AlterTableDropColumn {
+        table_name: String,
+        column_name: String,
+    },
+    DropTable {
+        table_name: String,
+        if_exists: bool,
     },
     CreateIndex {
         table_name: String,
@@ -100,10 +113,19 @@ pub enum AggregateFunc {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct WhereClause {
+pub enum WhereClause {
+    Comparison {
+        column: String,
+        operator: Operator,
+        value: Value,
+    },
+    Subquery(SubqueryCondition),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SubqueryCondition {
     pub column: String,
-    pub operator: Operator,
-    pub value: Value,
+    pub subquery: Box<Statement>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
