@@ -14,8 +14,8 @@
 use crate::error::{FerrisDbError, Result};
 
 use super::ast::{
-    Assignment, ColumnDef, DataType, JoinClause, Operator, SelectColumns, Statement, Value,
-    WhereClause,
+    Assignment, ColumnDef, DataType, JoinClause, Operator, OrderByClause, OrderDirection,
+    SelectColumns, Statement, Value, WhereClause,
 };
 use super::lexer::{Keyword, Token};
 
@@ -160,12 +160,16 @@ impl Parser {
         let table_name = self.parse_identifier_path()?;
         let join = self.parse_optional_join()?;
         let where_clause = self.parse_optional_where()?;
+        let order_by = self.parse_optional_order_by()?;
+        let limit = self.parse_optional_limit()?;
 
         Ok(Statement::Select {
             table_name,
             columns,
             join,
             where_clause,
+            order_by,
+            limit,
         })
     }
 
@@ -247,6 +251,44 @@ impl Parser {
             left_column,
             right_column,
         }))
+    }
+
+    fn parse_optional_order_by(&mut self) -> Result<Option<OrderByClause>> {
+        if !matches!(self.peek(), Some(Token::Keyword(Keyword::Order))) {
+            return Ok(None);
+        }
+
+        self.expect_keyword(Keyword::Order)?;
+        self.expect_keyword(Keyword::By)?;
+        let column = self.parse_identifier_path()?;
+        let direction = match self.peek() {
+            Some(Token::Keyword(Keyword::Asc)) => {
+                self.bump();
+                OrderDirection::Asc
+            }
+            Some(Token::Keyword(Keyword::Desc)) => {
+                self.bump();
+                OrderDirection::Desc
+            }
+            _ => OrderDirection::Asc,
+        };
+
+        Ok(Some(OrderByClause { column, direction }))
+    }
+
+    fn parse_optional_limit(&mut self) -> Result<Option<usize>> {
+        if !matches!(self.peek(), Some(Token::Keyword(Keyword::Limit))) {
+            return Ok(None);
+        }
+
+        self.expect_keyword(Keyword::Limit)?;
+        match self.bump() {
+            Some(Token::IntLit(value)) if value >= 0 => Ok(Some(value as usize)),
+            other => Err(FerrisDbError::InvalidCommand(format!(
+                "expected non-negative LIMIT value, got {:?}",
+                other
+            ))),
+        }
     }
 
     fn parse_operator(&mut self) -> Result<Operator> {

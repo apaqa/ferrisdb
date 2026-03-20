@@ -407,3 +407,116 @@ fn test_explain_select_returns_plan() {
 
     let _ = std::fs::remove_dir_all(dir);
 }
+
+#[test]
+fn test_order_by_asc_and_desc_on_int_and_text() {
+    let (dir, _engine, executor) = open_executor("order-basic");
+
+    exec(
+        &executor,
+        "CREATE TABLE users (id INT, name TEXT, age INT, active BOOL);",
+    );
+    exec(
+        &executor,
+        "INSERT INTO users VALUES (1, 'Cara', 35, true), (2, 'Alice', 30, true), (3, 'Bob', 25, false);",
+    );
+
+    let (_, rows_age_asc) = rows_only(exec(&executor, "SELECT name, age FROM users ORDER BY age ASC;"));
+    assert_eq!(
+        rows_age_asc,
+        vec![
+            vec![Value::Text("Bob".to_string()), Value::Int(25)],
+            vec![Value::Text("Alice".to_string()), Value::Int(30)],
+            vec![Value::Text("Cara".to_string()), Value::Int(35)],
+        ]
+    );
+
+    let (_, rows_name_desc) =
+        rows_only(exec(&executor, "SELECT name FROM users ORDER BY name DESC;"));
+    assert_eq!(
+        rows_name_desc,
+        vec![
+            vec![Value::Text("Cara".to_string())],
+            vec![Value::Text("Bob".to_string())],
+            vec![Value::Text("Alice".to_string())],
+        ]
+    );
+
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn test_limit_only_returns_first_n_rows() {
+    let (dir, _engine, executor) = open_executor("limit");
+
+    exec(
+        &executor,
+        "CREATE TABLE users (id INT, name TEXT, age INT, active BOOL);",
+    );
+    exec(
+        &executor,
+        "INSERT INTO users VALUES (1, 'Alice', 30, true), (2, 'Bob', 25, false), (3, 'Cara', 35, true);",
+    );
+
+    let (_, rows) = rows_only(exec(&executor, "SELECT * FROM users LIMIT 2;"));
+    assert_eq!(rows.len(), 2);
+
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn test_order_by_and_limit_combination() {
+    let (dir, _engine, executor) = open_executor("order-limit");
+
+    exec(
+        &executor,
+        "CREATE TABLE users (id INT, name TEXT, age INT, active BOOL);",
+    );
+    exec(
+        &executor,
+        "INSERT INTO users VALUES (1, 'Alice', 30, true), (2, 'Bob', 25, false), (3, 'Cara', 35, true), (4, 'Dora', 40, true);",
+    );
+
+    let (_, rows) = rows_only(exec(
+        &executor,
+        "SELECT name, age FROM users ORDER BY age DESC LIMIT 2;",
+    ));
+    assert_eq!(
+        rows,
+        vec![
+            vec![Value::Text("Dora".to_string()), Value::Int(40)],
+            vec![Value::Text("Cara".to_string()), Value::Int(35)],
+        ]
+    );
+
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn test_order_by_with_where_combination() {
+    let (dir, _engine, executor) = open_executor("order-where");
+
+    exec(
+        &executor,
+        "CREATE TABLE users (id INT, name TEXT, age INT, active BOOL);",
+    );
+    exec(
+        &executor,
+        "INSERT INTO users VALUES (1, 'Alice', 30, true), (2, 'Bob', 25, false), (3, 'Cara', 35, true), (4, 'Dora', 20, true);",
+    );
+
+    let (_, rows) = rows_only(exec(
+        &executor,
+        "SELECT name, age FROM users WHERE age > 20 ORDER BY age DESC;",
+    ));
+    assert_eq!(
+        rows,
+        vec![
+            vec![Value::Text("Cara".to_string()), Value::Int(35)],
+            vec![Value::Text("Alice".to_string()), Value::Int(30)],
+            vec![Value::Text("Bob".to_string()), Value::Int(25)],
+        ]
+    );
+
+    let _ = std::fs::remove_dir_all(dir);
+}

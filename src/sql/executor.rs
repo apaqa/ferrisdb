@@ -31,7 +31,8 @@ use crate::error::Result;
 use crate::transaction::mvcc::{MvccEngine, Transaction};
 
 use super::ast::{
-    Assignment, JoinClause, Operator, SelectColumns, Statement, Value, WhereClause,
+    Assignment, JoinClause, Operator, OrderByClause, OrderDirection, SelectColumns, Statement,
+    Value, WhereClause,
 };
 use super::catalog::{Catalog, TableSchema};
 use super::row::{
@@ -74,7 +75,9 @@ impl SqlExecutor {
                 columns,
                 join,
                 where_clause,
-            } => self.execute_select(table_name, columns, join, where_clause),
+                order_by,
+                limit,
+            } => self.execute_select(table_name, columns, join, where_clause, order_by, limit),
             Statement::Update {
                 table_name,
                 assignments,
@@ -121,6 +124,8 @@ impl SqlExecutor {
                 columns,
                 join,
                 where_clause,
+                order_by,
+                limit,
             } => {
                 let txn = self.engine.begin_transaction();
                 let Some(schema) = self.catalog.get_table(&txn, &table_name)? else {
@@ -161,12 +166,30 @@ impl SqlExecutor {
                         filter_cost
                     ));
                 }
+                if let Some(order_by) = order_by {
+                    lines.push(format!(
+                        "  -> OrderBy(column={}, direction={}, rows={}, cost={:.2})",
+                        order_by.column,
+                        order_direction_to_str(&order_by.direction),
+                        if has_filter { filtered_rows } else { total_rows },
+                        (if has_filter { filtered_rows } else { total_rows }) as f64 * 0.2
+                    ));
+                }
+                if let Some(limit) = limit {
+                    lines.push(format!(
+                        "  -> Limit(limit={}, rows={}, cost={:.2})",
+                        limit,
+                        limit.min(if has_filter { filtered_rows } else { total_rows }),
+                        0.05
+                    ));
+                }
 
                 let project_rows = if has_filter {
                     filtered_rows
                 } else {
                     total_rows
                 };
+                let project_rows = limit.map(|value| value.min(project_rows)).unwrap_or(project_rows);
                 let project_desc = match columns {
                     SelectColumns::All => "*".to_string(),
                     SelectColumns::Named(names) => names.join(", "),
@@ -242,6 +265,8 @@ impl SqlExecutor {
         columns: SelectColumns,
         join: Option<JoinClause>,
         where_clause: Option<WhereClause>,
+        order_by: Option<OrderByClause>,
+        limit: Option<usize>,
     ) -> Result<ExecuteResult> {
         let txn = self.engine.begin_transaction();
         let Some(schema) = self.catalog.get_table(&txn, &table_name)? else {
@@ -251,7 +276,15 @@ impl SqlExecutor {
         };
 
         if let Some(join_clause) = join {
-            return self.execute_join_select(&txn, &schema, columns, join_clause, where_clause);
+            return self.execute_join_select(
+                &txn,
+                &schema,
+                columns,
+                join_clause,
+                where_clause,
+                order_by,
+                limit,
+            );
         }
 
         let projection = match self.resolve_projection(&schema, &columns) {
@@ -259,11 +292,23 @@ impl SqlExecutor {
             Err(message) => return Ok(ExecuteResult::Error { message }),
         };
 
-        let rows = self.scan_rows(&txn, &schema)?;
-        let selected = rows
+        let mut rows: Vec<Row> = self
+            .scan_rows(&txn, &schema)?
             .into_iter()
             .filter(|(_, row)| matches_where(row, where_clause.as_ref()))
-            .map(|(_, row)| {
+            .map(|(_, row)| row)
+            .collect();
+        if let Some(order_by) = order_by.as_ref() {
+            if let Err(message) = sort_rows_by_order(&mut rows, order_by) {
+                return Ok(ExecuteResult::Error { message });
+            }
+        }
+        if let Some(limit) = limit {
+            rows.truncate(limit);
+        }
+        let selected = rows
+            .into_iter()
+            .map(|row| {
                 projection
                     .iter()
                     .map(|column| row.get(column).cloned().unwrap_or(Value::Null))
@@ -284,6 +329,8 @@ impl SqlExecutor {
         columns: SelectColumns,
         join: JoinClause,
         where_clause: Option<WhereClause>,
+        order_by: Option<OrderByClause>,
+        limit: Option<usize>,
     ) -> Result<ExecuteResult> {
         let Some(right_schema) = self.catalog.get_table(txn, &join.right_table)? else {
             return Ok(ExecuteResult::Error {
@@ -298,7 +345,7 @@ impl SqlExecutor {
             Err(message) => return Ok(ExecuteResult::Error { message }),
         };
 
-        let mut selected = Vec::new();
+        let mut matched_rows = Vec::new();
         for (_, left_row) in &left_rows {
             let Some(left_value) = resolve_join_value(left_row, &left_schema.table_name, &join.left_column) else {
                 return Ok(ExecuteResult::Error {
@@ -323,18 +370,29 @@ impl SqlExecutor {
                 if !matches_join_where(&joined, where_clause.as_ref()) {
                     continue;
                 }
-
-                let mut row = Vec::with_capacity(projection.len());
-                for column in &projection {
-                    let Some(value) = joined.get(column) else {
-                        return Ok(ExecuteResult::Error {
-                            message: format!("unknown column '{}'", column),
-                        });
-                    };
-                    row.push(value.clone());
-                }
-                selected.push(row);
+                matched_rows.push(joined);
             }
+        }
+        if let Some(order_by) = order_by.as_ref() {
+            if let Err(message) = sort_joined_rows_by_order(&mut matched_rows, order_by) {
+                return Ok(ExecuteResult::Error { message });
+            }
+        }
+        if let Some(limit) = limit {
+            matched_rows.truncate(limit);
+        }
+        let mut selected = Vec::with_capacity(matched_rows.len());
+        for joined in matched_rows {
+            let mut row = Vec::with_capacity(projection.len());
+            for column in &projection {
+                let Some(value) = joined.get(column) else {
+                    return Ok(ExecuteResult::Error {
+                        message: format!("unknown column '{}'", column),
+                    });
+                };
+                row.push(value.clone());
+            }
+            selected.push(row);
         }
 
         Ok(ExecuteResult::Selected {
@@ -618,6 +676,50 @@ fn operator_to_str(operator: &Operator) -> &'static str {
         Operator::Le => "<=",
         Operator::Ge => ">=",
     }
+}
+
+fn order_direction_to_str(direction: &OrderDirection) -> &'static str {
+    match direction {
+        OrderDirection::Asc => "ASC",
+        OrderDirection::Desc => "DESC",
+    }
+}
+
+fn sort_rows_by_order(rows: &mut [Row], order_by: &OrderByClause) -> std::result::Result<(), String> {
+    if !rows.is_empty() && rows[0].get(&order_by.column).is_none() {
+        return Err(format!("unknown column '{}'", order_by.column));
+    }
+
+    rows.sort_by(|left, right| {
+        let left_value = left.get(&order_by.column).unwrap_or(&Value::Null);
+        let right_value = right.get(&order_by.column).unwrap_or(&Value::Null);
+        let order = compare_order(left_value, right_value).unwrap_or(std::cmp::Ordering::Equal);
+        match order_by.direction {
+            OrderDirection::Asc => order,
+            OrderDirection::Desc => order.reverse(),
+        }
+    });
+    Ok(())
+}
+
+fn sort_joined_rows_by_order(
+    rows: &mut [JoinedRow],
+    order_by: &OrderByClause,
+) -> std::result::Result<(), String> {
+    if !rows.is_empty() && rows[0].get(&order_by.column).is_none() {
+        return Err(format!("unknown or ambiguous column '{}'", order_by.column));
+    }
+
+    rows.sort_by(|left, right| {
+        let left_value = left.get(&order_by.column).unwrap_or(&Value::Null);
+        let right_value = right.get(&order_by.column).unwrap_or(&Value::Null);
+        let order = compare_order(left_value, right_value).unwrap_or(std::cmp::Ordering::Equal);
+        match order_by.direction {
+            OrderDirection::Asc => order,
+            OrderDirection::Desc => order.reverse(),
+        }
+    });
+    Ok(())
 }
 
 fn resolve_join_value<'a>(row: &'a Row, table_name: &str, column: &str) -> Option<&'a Value> {

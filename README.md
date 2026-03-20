@@ -9,8 +9,10 @@ FerrisDB is a database engine implemented from scratch in Rust, featuring LSM-Tr
 - Bloom Filter for read optimization
 - MVCC with snapshot isolation and transactions
 - SQL support (`CREATE TABLE`, `INSERT`, `SELECT`, `UPDATE`, `DELETE`)
+- SQL `WHERE`, `ORDER BY`, `LIMIT`, `INNER JOIN`, and `EXPLAIN`
 - SQL `WHERE` with comparison operators (`=`, `!=`, `<`, `>`, `<=`, `>=`)
 - TCP server with multi-threaded connections
+- HTTP Admin API (`/health`, `/stats`, `/sstables`, `/compact`, `/flush`)
 - Interactive REPL with KV and SQL modes
 - MANIFEST metadata management
 - Configurable via `ferrisdb.toml`

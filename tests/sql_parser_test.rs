@@ -9,8 +9,8 @@
 // - 大小寫不敏感與多餘空白情況
 
 use ferrisdb::sql::ast::{
-    Assignment, ColumnDef, DataType, JoinClause, Operator, SelectColumns, Statement, Value,
-    WhereClause,
+    Assignment, ColumnDef, DataType, JoinClause, Operator, OrderByClause, OrderDirection,
+    SelectColumns, Statement, Value, WhereClause,
 };
 use ferrisdb::sql::lexer::{Keyword, Lexer, Token};
 use ferrisdb::sql::parser::Parser;
@@ -100,6 +100,8 @@ fn test_parse_select() {
                 operator: Operator::Eq,
                 value: Value::Int(1),
             }),
+            order_by: None,
+            limit: None,
         }
     );
 }
@@ -118,6 +120,8 @@ fn test_parse_select_all_and_comparison_operator() {
                 operator: Operator::Gt,
                 value: Value::Int(25),
             }),
+            order_by: None,
+            limit: None,
         }
     );
 }
@@ -186,6 +190,8 @@ fn test_case_insensitive_and_extra_whitespace() {
             columns: SelectColumns::All,
             join: None,
             where_clause: None,
+            order_by: None,
+            limit: None,
         }
     );
 }
@@ -210,6 +216,8 @@ fn test_parse_select_with_inner_join() {
                 operator: Operator::Eq,
                 value: Value::Int(1),
             }),
+            order_by: None,
+            limit: None,
         }
     );
 }
@@ -229,7 +237,34 @@ fn test_parse_explain_select() {
                     operator: Operator::Eq,
                     value: Value::Int(1),
                 }),
+                order_by: None,
+                limit: None,
             }),
+        }
+    );
+}
+
+#[test]
+fn test_parse_select_with_order_by_and_limit() {
+    let stmt = parse_sql(
+        "SELECT * FROM users WHERE age > 20 ORDER BY age DESC LIMIT 5;",
+    );
+    assert_eq!(
+        stmt,
+        Statement::Select {
+            table_name: "users".to_string(),
+            columns: SelectColumns::All,
+            join: None,
+            where_clause: Some(WhereClause {
+                column: "age".to_string(),
+                operator: Operator::Gt,
+                value: Value::Int(20),
+            }),
+            order_by: Some(OrderByClause {
+                column: "age".to_string(),
+                direction: OrderDirection::Desc,
+            }),
+            limit: Some(5),
         }
     );
 }

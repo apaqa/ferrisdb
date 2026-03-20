@@ -31,6 +31,8 @@ pub enum Statement {
         columns: SelectColumns,
         join: Option<JoinClause>,
         where_clause: Option<WhereClause>,
+        order_by: Option<OrderByClause>,
+        limit: Option<usize>,
     },
     Update {
         table_name: String,
@@ -82,6 +84,18 @@ pub struct JoinClause {
     pub right_table: String,
     pub left_column: String,
     pub right_column: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OrderByClause {
+    pub column: String,
+    pub direction: OrderDirection,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum OrderDirection {
+    Asc,
+    Desc,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
