@@ -38,7 +38,8 @@ impl Parser {
 
         let stmt = match self.peek() {
             Some(Token::Keyword(Keyword::Explain)) => self.parse_explain()?,
-            Some(Token::Keyword(Keyword::Create)) => self.parse_create_table()?,
+            Some(Token::Keyword(Keyword::Create)) => self.parse_create_statement()?,
+            Some(Token::Keyword(Keyword::Drop)) => self.parse_drop_statement()?,
             Some(Token::Keyword(Keyword::Insert)) => self.parse_insert()?,
             Some(Token::Keyword(Keyword::Select)) => self.parse_select()?,
             Some(Token::Keyword(Keyword::Update)) => self.parse_update()?,
@@ -64,8 +65,19 @@ impl Parser {
         Ok(stmt)
     }
 
-    fn parse_create_table(&mut self) -> Result<Statement> {
+    fn parse_create_statement(&mut self) -> Result<Statement> {
         self.expect_keyword(Keyword::Create)?;
+        match self.peek() {
+            Some(Token::Keyword(Keyword::Table)) => self.parse_create_table_after_create(),
+            Some(Token::Keyword(Keyword::Index)) => self.parse_create_index_after_create(),
+            other => Err(FerrisDbError::InvalidCommand(format!(
+                "expected TABLE or INDEX after CREATE, got {:?}",
+                other
+            ))),
+        }
+    }
+
+    fn parse_create_table_after_create(&mut self) -> Result<Statement> {
         self.expect_keyword(Keyword::Table)?;
         let table_name = self.expect_ident()?;
         self.expect_token(Token::LParen)?;
@@ -85,6 +97,33 @@ impl Parser {
 
         self.expect_token(Token::RParen)?;
         Ok(Statement::CreateTable { table_name, columns })
+    }
+
+    fn parse_create_index_after_create(&mut self) -> Result<Statement> {
+        self.expect_keyword(Keyword::Index)?;
+        self.expect_keyword(Keyword::On)?;
+        let table_name = self.expect_ident()?;
+        self.expect_token(Token::LParen)?;
+        let column_name = self.expect_ident()?;
+        self.expect_token(Token::RParen)?;
+        Ok(Statement::CreateIndex {
+            table_name,
+            column_name,
+        })
+    }
+
+    fn parse_drop_statement(&mut self) -> Result<Statement> {
+        self.expect_keyword(Keyword::Drop)?;
+        self.expect_keyword(Keyword::Index)?;
+        self.expect_keyword(Keyword::On)?;
+        let table_name = self.expect_ident()?;
+        self.expect_token(Token::LParen)?;
+        let column_name = self.expect_ident()?;
+        self.expect_token(Token::RParen)?;
+        Ok(Statement::DropIndex {
+            table_name,
+            column_name,
+        })
     }
 
     fn parse_explain(&mut self) -> Result<Statement> {

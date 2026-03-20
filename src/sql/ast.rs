@@ -22,6 +22,14 @@ pub enum Statement {
         table_name: String,
         columns: Vec<ColumnDef>,
     },
+    CreateIndex {
+        table_name: String,
+        column_name: String,
+    },
+    DropIndex {
+        table_name: String,
+        column_name: String,
+    },
     Insert {
         table_name: String,
         values: Vec<Vec<Value>>,

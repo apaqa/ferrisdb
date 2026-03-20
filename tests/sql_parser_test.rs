@@ -64,6 +64,25 @@ fn test_parse_create_table() {
 }
 
 #[test]
+fn test_parse_create_and_drop_index() {
+    assert_eq!(
+        parse_sql("CREATE INDEX ON users(age);"),
+        Statement::CreateIndex {
+            table_name: "users".to_string(),
+            column_name: "age".to_string(),
+        }
+    );
+
+    assert_eq!(
+        parse_sql("DROP INDEX ON users(age);"),
+        Statement::DropIndex {
+            table_name: "users".to_string(),
+            column_name: "age".to_string(),
+        }
+    );
+}
+
+#[test]
 fn test_parse_insert_single_and_multi_rows() {
     let stmt = parse_sql("INSERT INTO users VALUES (1, 'Alice', true), (2, 'Bob', false);");
     assert_eq!(
