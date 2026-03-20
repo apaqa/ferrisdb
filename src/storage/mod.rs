@@ -23,3 +23,4 @@
 pub mod traits;
 pub mod memory;
 pub mod sstable;
+pub mod lsm;

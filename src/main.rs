@@ -1,15 +1,21 @@
 // =============================================================================
-// main.rs — ferrisdb 執行入口
+// main.rs — ferrisdb 執行入口（REPL / TCP server）
 // =============================================================================
 //
-// 模式說明：
-// - `cargo run`：啟動 REPL
-// - `cargo run -- --server`：啟動 TCP server（127.0.0.1:6379）
-// - `cargo run -- --server --port 7777`：啟動 TCP server（自訂 port）
+// 這版改為使用 LsmEngine，資料會落在 ./ferrisdb-data，不再是純記憶體。
+//
+// 使用方式：
+// - cargo run
+// - cargo run -- --server
+// - cargo run -- --server --port 7777
+
+use std::sync::{Arc, Mutex};
 
 use ferrisdb::cli::repl;
 use ferrisdb::server::tcp::{self, DEFAULT_PORT};
-use ferrisdb::storage::memory::MemTable;
+use ferrisdb::storage::lsm::{LsmEngine, DEFAULT_MEMTABLE_SIZE_THRESHOLD};
+
+const DEFAULT_DATA_DIR: &str = "./ferrisdb-data";
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -37,7 +43,15 @@ fn main() {
 }
 
 fn run_repl_mode() {
-    let mut engine = MemTable::new();
+    // REPL 與 server 共用同一份落盤資料目錄。
+    let mut engine = match LsmEngine::open(DEFAULT_DATA_DIR, DEFAULT_MEMTABLE_SIZE_THRESHOLD) {
+        Ok(engine) => engine,
+        Err(err) => {
+            eprintln!("Failed to open LSM engine: {}", err);
+            std::process::exit(1);
+        }
+    };
+
     if let Err(err) = repl::run(&mut engine) {
         eprintln!("Fatal error: {}", err);
         std::process::exit(1);
@@ -45,7 +59,16 @@ fn run_repl_mode() {
 }
 
 fn run_server_mode(port: u16) {
-    if let Err(err) = tcp::run_server(port) {
+    let engine = match LsmEngine::open(DEFAULT_DATA_DIR, DEFAULT_MEMTABLE_SIZE_THRESHOLD) {
+        Ok(engine) => engine,
+        Err(err) => {
+            eprintln!("Failed to open LSM engine: {}", err);
+            std::process::exit(1);
+        }
+    };
+
+    let shared_engine = Arc::new(Mutex::new(engine));
+    if let Err(err) = tcp::run_server_with_engine(port, shared_engine) {
         eprintln!("Fatal server error: {}", err);
         std::process::exit(1);
     }
@@ -58,12 +81,10 @@ fn parse_server_args(args: &[String]) -> Result<Option<u16>, String> {
         return Ok(None);
     }
 
-    // 僅 `--server`
     if args.len() == 1 {
         return Ok(Some(DEFAULT_PORT));
     }
 
-    // `--server --port <port>`
     if args.len() == 3 && args[1] == "--port" {
         let port: u16 = args[2]
             .parse()
