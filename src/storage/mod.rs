@@ -11,6 +11,8 @@
 
 pub mod traits;
 pub mod memory;
+pub mod bloom;
 pub mod wal;
 pub mod sstable;
+pub mod compaction;
 pub mod lsm;

@@ -2,29 +2,30 @@
 // storage/lsm.rs — LSM-Tree 儲存引擎
 // =============================================================================
 //
-// LSM-Tree 的讀寫流程：
-// 1. 寫入時：
-//    - 先 append 到 WAL，確保崩潰時有恢復依據
-//    - 再寫入 active MemTable
-//    - MemTable 超過閾值後 flush 成 SSTable
+// LSM-Tree 的完整讀寫流程：
+// 1. put/delete：
+//    - 先寫 WAL，確保崩潰時可恢復
+//    - 再更新 active MemTable
+//    - 若 MemTable 太大，flush 成 SSTable
 //
-// 2. 讀取時：
-//    - 先查 active MemTable（最新）
-//    - 再由新到舊查所有 SSTable
+// 2. get：
+//    - 先查 active MemTable
+//    - 若沒有，再由新到舊查 SSTable
+//    - 其中 SSTable 可先用 Bloom Filter 快速判斷「一定不存在」
 //
-// 3. 崩潰恢復：
-//    - 如果程式在 flush 前崩潰，未落盤資料仍保留在 wal.log
-//    - 下次 open 時先重放 WAL，重建出 active MemTable
+// 3. compaction：
+//    - 當 SSTable 太多時，合併成較少的檔案
+//    - 把舊版本與 tombstone 清理掉
 //
-// 4. 刪除時：
-//    - 不直接把舊資料抹掉，而是寫入 tombstone
-//    - tombstone 會遮蔽更舊層的同名 key
+// 4. crash recovery：
+//    - open() 時若發現 wal.log 殘留，就重放回 active MemTable
 
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::error::Result;
+use crate::storage::compaction;
 use crate::storage::memory::MemTable;
 use crate::storage::sstable::{SSTableReader, SSTableWriter};
 use crate::storage::traits::StorageEngine;
@@ -33,6 +34,7 @@ use crate::storage::wal::{WalReader, WalWriter};
 pub const TOMBSTONE: &[u8] = b"__TOMBSTONE__";
 pub const DEFAULT_MEMTABLE_SIZE_THRESHOLD: usize = 4096;
 const WAL_FILENAME: &str = "wal.log";
+const AUTO_COMPACTION_SSTABLE_LIMIT: usize = 4;
 
 #[derive(Debug)]
 pub struct LsmEngine {
@@ -79,7 +81,6 @@ impl LsmEngine {
             threshold
         };
 
-        // 若 wal.log 殘留，代表上次可能在 flush 前崩潰，需先重放。
         let wal_path = data_dir.join(WAL_FILENAME);
         let active_memtable = if wal_path.exists() && wal_path.metadata()?.len() > 0 {
             WalReader::open(&wal_path)?.recover_to_memtable()?
@@ -103,13 +104,47 @@ impl LsmEngine {
         if self.active_memtable.count() > 0 {
             self.flush_active_memtable(false)?;
         }
-
         self.active_wal = None;
         Ok(())
     }
 
     pub fn wal_path(&self) -> PathBuf {
         self.data_dir.join(WAL_FILENAME)
+    }
+
+    pub fn compact(&mut self) -> Result<()> {
+        // 手動 compact 前，先把記憶體資料 flush，確保新資料也被納入合併。
+        if self.active_memtable.count() > 0 {
+            self.flush_active_memtable(true)?;
+        }
+
+        if self.sstables.len() <= 1 {
+            return Ok(());
+        }
+
+        let source_paths: Vec<PathBuf> = self
+            .sstables
+            .iter()
+            .map(|reader| reader.path().to_path_buf())
+            .collect();
+
+        let output_path = self
+            .data_dir
+            .join(format!("{:06}.sst", self.next_sstable_id));
+        compaction::compact(&source_paths, &output_path)?;
+        let new_reader = SSTableReader::open(&output_path)?;
+
+        let old_readers = std::mem::take(&mut self.sstables);
+        drop(old_readers);
+        for path in &source_paths {
+            if path.exists() {
+                fs::remove_file(path)?;
+            }
+        }
+
+        self.sstables = vec![new_reader];
+        self.next_sstable_id += 1;
+        Ok(())
     }
 
     fn is_tombstone(value: &[u8]) -> bool {
@@ -123,17 +158,18 @@ impl LsmEngine {
     fn maybe_flush(&mut self) -> Result<()> {
         if self.active_memtable.approximate_size() > self.memtable_size_threshold {
             self.flush_active_memtable(true)?;
+            self.maybe_auto_compact()?;
         }
         Ok(())
     }
 
-    /// 把 active memtable 落盤成一個新的 sstable。
-    ///
-    /// `recreate_wal = true`：
-    /// - 表示 flush 完後刪除舊 WAL，並建立新的空 WAL 繼續接收寫入
-    ///
-    /// `recreate_wal = false`：
-    /// - 表示用於 shutdown，flush 後直接關閉 WAL
+    fn maybe_auto_compact(&mut self) -> Result<()> {
+        if self.sstables.len() > AUTO_COMPACTION_SSTABLE_LIMIT {
+            self.compact()?;
+        }
+        Ok(())
+    }
+
     fn flush_active_memtable(&mut self, recreate_wal: bool) -> Result<()> {
         if self.active_memtable.count() == 0 {
             if !recreate_wal {
@@ -154,7 +190,6 @@ impl LsmEngine {
         let reader = SSTableReader::open(&sstable_path)?;
         self.sstables.insert(0, reader);
 
-        // 到這一步代表新 sstable 已成功寫好，舊 WAL 可安全刪除。
         let wal_path = self.wal_path();
         let old_wal = self.active_wal.take();
         drop(old_wal);
@@ -178,8 +213,6 @@ impl LsmEngine {
     ) -> Result<BTreeMap<Vec<u8>, Vec<u8>>> {
         let mut merged = BTreeMap::<Vec<u8>, Vec<u8>>::new();
 
-        // 先套用最舊到最新的 sstable，再套用 active memtable，
-        // 讓較新的版本自然覆蓋較舊版本。
         for reader in self.sstables.iter().rev() {
             let iter = reader.iter()?;
             for entry in iter {
@@ -267,6 +300,10 @@ impl StorageEngine for LsmEngine {
 
     fn count(&self) -> usize {
         self.list_all().map(|v| v.len()).unwrap_or(0)
+    }
+
+    fn compact(&mut self) -> Result<()> {
+        LsmEngine::compact(self)
     }
 }
 

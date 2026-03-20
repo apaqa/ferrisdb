@@ -2,21 +2,18 @@
 // storage/sstable/writer.rs — SSTableWriter
 // =============================================================================
 //
-// SSTableWriter 的責任：
-// 1. 接收「已排序」的 key-value 資料（呼叫端要保證 key 遞增）
-// 2. 把資料寫到 data section
-// 3. 同時累積 (key -> offset) 索引
-// 4. finish() 時把 index section + footer 一次寫完
-//
-// 為什麼要索引？
-// - data section 是連續資料，若沒有索引就只能線性掃描。
-// - 有了 index（排序 key + offset）就能先二分搜尋 key，再直接 seek 到資料位置。
+// Writer 的責任：
+// 1. 接收排序好的 key/value
+// 2. 寫入 data section
+// 3. 建立 bloom filter 與 index
+// 4. finish() 時把 bloom section、index section、footer 一次寫好
 
 use std::fs::File;
 use std::io::{BufWriter, Seek, Write};
 use std::path::{Path, PathBuf};
 
 use crate::error::{FerrisDbError, Result};
+use crate::storage::bloom::BloomFilter;
 
 use super::format::{self, Footer};
 
@@ -30,7 +27,6 @@ pub struct SSTableWriter {
 }
 
 impl SSTableWriter {
-    /// 建立新 sstable 檔案並寫入 header。
     pub fn new(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
         let file = File::create(&path)?;
@@ -46,7 +42,6 @@ impl SSTableWriter {
         })
     }
 
-    /// 寫入一筆資料，必須按 key 排序（遞增或相等）。
     pub fn write_entry(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
         if self.finished {
             return Err(FerrisDbError::InvalidCommand(
@@ -54,7 +49,6 @@ impl SSTableWriter {
             ));
         }
 
-        // SSTable 必須保持 key 排序，這樣 reader 才能做二分搜尋。
         if let Some(last) = &self.last_key {
             if key < last.as_slice() {
                 return Err(FerrisDbError::InvalidCommand(
@@ -65,17 +59,25 @@ impl SSTableWriter {
 
         let offset = self.file.stream_position()?;
         format::write_entry(&mut self.file, key, value)?;
-
         self.index.push((key.to_vec(), offset));
         self.last_key = Some(key.to_vec());
         Ok(())
     }
 
-    /// 寫入 index + footer，並 flush/sync 檔案。
     pub fn finish(&mut self) -> Result<()> {
         if self.finished {
             return Ok(());
         }
+
+        // 先依最終 key 數量建立 bloom filter，再把所有 key 塞進去。
+        let mut bloom = BloomFilter::new(self.index.len().max(1), 0.01);
+        for (key, _) in &self.index {
+            bloom.insert(key);
+        }
+        let bloom_bytes = bloom.to_bytes();
+
+        let bloom_offset = self.file.stream_position()?;
+        self.file.write_all(&bloom_bytes)?;
 
         let index_offset = self.file.stream_position()?;
         for (key, offset) in &self.index {
@@ -84,6 +86,8 @@ impl SSTableWriter {
         }
 
         let footer = Footer {
+            bloom_offset,
+            bloom_len: bloom_bytes.len() as u64,
             index_offset,
             index_count: self.index.len() as u64,
         };
@@ -95,7 +99,6 @@ impl SSTableWriter {
         Ok(())
     }
 
-    /// 目前 writer 對應的檔案路徑（測試與除錯方便）。
     pub fn path(&self) -> &Path {
         &self.path
     }
@@ -122,12 +125,10 @@ mod tests {
         let path = temp_file("writer-unsorted");
         let mut writer = SSTableWriter::new(&path).expect("create writer");
 
-        writer
-            .write_entry(b"key:2", b"value:2")
-            .expect("write first entry");
+        writer.write_entry(b"key:2", b"value:2").expect("write first");
         let err = writer
             .write_entry(b"key:1", b"value:1")
-            .expect_err("should reject out-of-order key");
+            .expect_err("should reject unsorted keys");
 
         assert!(format!("{}", err).contains("sorted order"));
         let _ = writer.finish();
@@ -141,7 +142,6 @@ mod tests {
         writer.finish().expect("finish empty table");
 
         let metadata = fs::metadata(&path).expect("metadata");
-        // 最少應包含 header + footer
         assert!(metadata.len() >= super::format::HEADER_SIZE + super::format::FOOTER_SIZE);
 
         let _ = fs::remove_file(path);

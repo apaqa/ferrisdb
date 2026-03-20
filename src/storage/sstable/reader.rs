@@ -2,43 +2,41 @@
 // storage/sstable/reader.rs — SSTableReader
 // =============================================================================
 //
-// Reader 的核心流程：
-// 1. open()：
-//    - 讀 header 驗證 magic/version
-//    - 從尾端讀 footer，取得 index_offset/index_count
-//    - 載入 index 到記憶體（Vec<(key, offset)>）
+// Reader 的關鍵步驟：
+// 1. open() 時讀 header/footer，載入 bloom filter 與 index
+// 2. get() 時先查 bloom filter
+//    - 如果 may_contain == false，代表 key 一定不在這個 SSTable
+//    - 可以直接略過，不必做二分搜尋
+// 3. 若 bloom 表示「可能存在」，才進一步在 index 上二分搜尋
 //
-// 2. get(key)：
-//    - 在 index 向量上做「二分搜尋」
-//    - 找到後取出 offset，直接 seek 到 data section 對應 entry 讀值
-//
-// 二分搜尋為什麼可行？
-// - index 依 key 排序（writer 保證按序寫入）
-// - 每次比較中間元素，將搜尋範圍減半，時間複雜度 O(log n)
+// index 二分搜尋原理：
+// - index 中的 key 本身已排序
+// - 每次比較中間 key，將搜尋範圍縮小一半
+// - 找到 offset 後再 seek 到 data section 讀取真正 entry
 
 use std::fs::File;
-use std::io::{BufReader, Seek, SeekFrom};
+use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 use crate::error::{FerrisDbError, Result};
+use crate::storage::bloom::BloomFilter;
 
 use super::format::{self, Footer};
 
 #[derive(Debug, Clone)]
 pub struct SSTableReader {
     path: PathBuf,
+    bloom_filter: BloomFilter,
     index: Vec<(Vec<u8>, u64)>,
-    index_offset: u64,
+    data_end_offset: u64,
 }
 
 impl SSTableReader {
-    /// 開啟既有 sstable 檔案並載入索引。
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
         let mut file = File::open(&path)?;
         let file_len = file.metadata()?.len();
 
-        // 檔案長度至少要容納 header + footer
         if file_len < format::HEADER_SIZE + format::FOOTER_SIZE {
             return Err(FerrisDbError::InvalidCommand(
                 "sstable file is too small".to_string(),
@@ -46,20 +44,25 @@ impl SSTableReader {
         }
 
         format::read_and_validate_header(&mut file)?;
-
         let footer = Self::read_footer(&mut file)?;
         Self::validate_footer_positions(file_len, footer)?;
+
+        let bloom_filter = Self::load_bloom_filter(&mut file, footer)?;
         let index = Self::load_index(&mut file, footer)?;
 
         Ok(Self {
             path,
+            bloom_filter,
             index,
-            index_offset: footer.index_offset,
+            data_end_offset: footer.bloom_offset,
         })
     }
 
-    /// 以 index 二分搜尋 key，若存在則讀回 value。
     pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        if !self.bloom_filter.may_contain(key) {
+            return Ok(None);
+        }
+
         let found = self
             .index
             .binary_search_by(|(idx_key, _)| idx_key.as_slice().cmp(key));
@@ -76,17 +79,21 @@ impl SSTableReader {
                 "sstable index points to mismatched key".to_string(),
             ));
         }
+
         Ok(Some(value))
     }
 
-    /// 取得資料區域迭代器（依 key 排序順序）。
     pub fn iter(&self) -> Result<SSTableIterator> {
         let mut file = File::open(&self.path)?;
         file.seek(SeekFrom::Start(format::HEADER_SIZE))?;
         Ok(SSTableIterator {
             reader: BufReader::new(file),
-            data_end_offset: self.index_offset,
+            data_end_offset: self.data_end_offset,
         })
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
     }
 
     fn read_footer(file: &mut File) -> Result<Footer> {
@@ -95,13 +102,24 @@ impl SSTableReader {
     }
 
     fn validate_footer_positions(file_len: u64, footer: Footer) -> Result<()> {
-        let data_end = file_len - format::FOOTER_SIZE;
-        if footer.index_offset < format::HEADER_SIZE || footer.index_offset > data_end {
+        let footer_offset = file_len - format::FOOTER_SIZE;
+        if footer.bloom_offset < format::HEADER_SIZE
+            || footer.bloom_offset > footer_offset
+            || footer.bloom_offset + footer.bloom_len > footer.index_offset
+            || footer.index_offset > footer_offset
+        {
             return Err(FerrisDbError::InvalidCommand(
-                "sstable footer has invalid index_offset".to_string(),
+                "sstable footer has invalid section offsets".to_string(),
             ));
         }
         Ok(())
+    }
+
+    fn load_bloom_filter(file: &mut File, footer: Footer) -> Result<BloomFilter> {
+        file.seek(SeekFrom::Start(footer.bloom_offset))?;
+        let mut data = vec![0_u8; footer.bloom_len as usize];
+        file.read_exact(&mut data)?;
+        BloomFilter::from_bytes(&data)
     }
 
     fn load_index(file: &mut File, footer: Footer) -> Result<Vec<(Vec<u8>, u64)>> {
@@ -131,9 +149,6 @@ impl SSTableReader {
     }
 }
 
-/// SSTable 的資料區塊迭代器。
-///
-/// 注意：這個迭代器只掃 data section，不會碰 index/footer。
 pub struct SSTableIterator {
     reader: BufReader<File>,
     data_end_offset: u64,

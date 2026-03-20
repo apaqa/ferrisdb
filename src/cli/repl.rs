@@ -1,3 +1,12 @@
+// =============================================================================
+// cli/repl.rs — 命令列互動介面
+// =============================================================================
+//
+// 這個 REPL 讓我們可以直接操作 StorageEngine。
+// 除了基本的 CRUD / scan / stats，也支援：
+// - dump / load：JSON 匯出匯入
+// - compact：對支援 compaction 的引擎手動觸發 compact
+
 use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{self, BufReader, Write};
@@ -22,7 +31,6 @@ pub fn run(engine: &mut dyn StorageEngine) -> Result<()> {
 
         input.clear();
         let bytes_read = io::stdin().read_line(&mut input)?;
-
         if bytes_read == 0 {
             println!("\nBye!");
             break;
@@ -34,13 +42,13 @@ pub fn run(engine: &mut dyn StorageEngine) -> Result<()> {
         }
 
         let parts: Vec<&str> = line.split_whitespace().collect();
-
         match parts[0].to_lowercase().as_str() {
             "set" => handle_set(engine, &parts),
             "get" => handle_get(engine, &parts),
             "delete" | "del" => handle_delete(engine, &parts),
             "dump" => handle_dump(engine, &parts),
             "load" => handle_load(engine, &parts),
+            "compact" => handle_compact(engine),
             "list" | "ls" => handle_list(engine),
             "scan" => handle_scan(engine, &parts),
             "stats" => handle_stats(engine),
@@ -49,9 +57,7 @@ pub fn run(engine: &mut dyn StorageEngine) -> Result<()> {
                 println!("Bye!");
                 break;
             }
-            _ => {
-                println!("Unknown command: '{}'. Type 'help' for usage.", parts[0]);
-            }
+            _ => println!("Unknown command: '{}'. Type 'help' for usage.", parts[0]),
         }
     }
 
@@ -83,7 +89,6 @@ pub fn load_from_file(engine: &mut dyn StorageEngine, filename: &str) -> Result<
     for (key, value) in json_map {
         engine.put(key.into_bytes(), value.into_bytes())?;
     }
-
     Ok(())
 }
 
@@ -95,10 +100,9 @@ fn handle_set(engine: &mut dyn StorageEngine, parts: &[&str]) {
 
     let key = parts[1];
     let value = parts[2..].join(" ");
-
     match engine.put(key.as_bytes().to_vec(), value.as_bytes().to_vec()) {
         Ok(()) => println!("OK"),
-        Err(e) => println!("Error: {}", e),
+        Err(err) => println!("Error: {}", err),
     }
 }
 
@@ -108,11 +112,10 @@ fn handle_get(engine: &mut dyn StorageEngine, parts: &[&str]) {
         return;
     }
 
-    let key = parts[1];
-    match engine.get(key.as_bytes()) {
+    match engine.get(parts[1].as_bytes()) {
         Ok(Some(value)) => println!("{}", String::from_utf8_lossy(&value)),
         Ok(None) => println!("(not found)"),
-        Err(e) => println!("Error: {}", e),
+        Err(err) => println!("Error: {}", err),
     }
 }
 
@@ -122,10 +125,9 @@ fn handle_delete(engine: &mut dyn StorageEngine, parts: &[&str]) {
         return;
     }
 
-    let key = parts[1];
-    match engine.delete(key.as_bytes()) {
+    match engine.delete(parts[1].as_bytes()) {
         Ok(()) => println!("OK"),
-        Err(e) => println!("Error: {}", e),
+        Err(err) => println!("Error: {}", err),
     }
 }
 
@@ -137,7 +139,7 @@ fn handle_dump(engine: &dyn StorageEngine, parts: &[&str]) {
 
     match dump_to_file(engine, parts[1]) {
         Ok(()) => println!("OK"),
-        Err(e) => println!("Error: {}", e),
+        Err(err) => println!("Error: {}", err),
     }
 }
 
@@ -149,7 +151,14 @@ fn handle_load(engine: &mut dyn StorageEngine, parts: &[&str]) {
 
     match load_from_file(engine, parts[1]) {
         Ok(()) => println!("OK"),
-        Err(e) => println!("Error: {}", e),
+        Err(err) => println!("Error: {}", err),
+    }
+}
+
+fn handle_compact(engine: &mut dyn StorageEngine) {
+    match engine.compact() {
+        Ok(()) => println!("OK"),
+        Err(err) => println!("Error: {}", err),
     }
 }
 
@@ -170,7 +179,7 @@ fn handle_list(engine: &dyn StorageEngine) {
             }
             println!("({} entries)", pairs.len());
         }
-        Err(e) => println!("Error: {}", e),
+        Err(err) => println!("Error: {}", err),
     }
 }
 
@@ -180,12 +189,10 @@ fn handle_scan(engine: &dyn StorageEngine, parts: &[&str]) {
         return;
     }
 
-    let start = parts[1];
-    let end = parts[2];
-    match engine.scan(start.as_bytes(), end.as_bytes()) {
+    match engine.scan(parts[1].as_bytes(), parts[2].as_bytes()) {
         Ok(pairs) => {
             if pairs.is_empty() {
-                println!("(no results in range {} .. {})", start, end);
+                println!("(no results in range {} .. {})", parts[1], parts[2]);
                 return;
             }
 
@@ -198,20 +205,19 @@ fn handle_scan(engine: &dyn StorageEngine, parts: &[&str]) {
             }
             println!("({} entries)", pairs.len());
         }
-        Err(e) => println!("Error: {}", e),
+        Err(err) => println!("Error: {}", err),
     }
 }
 
 fn handle_stats(engine: &dyn StorageEngine) {
     let count = engine.count();
-
     match engine.list_all() {
         Ok(pairs) => {
             let total_bytes: usize = pairs.iter().map(|(k, v)| k.len() + v.len()).sum();
             println!("Entries:    {}", count);
             println!("Data size:  {} bytes", total_bytes);
         }
-        Err(e) => println!("Error: {}", e),
+        Err(err) => println!("Error: {}", err),
     }
 }
 
@@ -222,6 +228,7 @@ fn handle_help() {
     println!("  delete <key>            Delete a key (alias: del)");
     println!("  dump <filename>         Dump all key-value pairs to a JSON file");
     println!("  load <filename>         Load key-value pairs from a JSON file");
+    println!("  compact                 Compact SSTables");
     println!("  list                    List all key-value pairs (alias: ls)");
     println!("  scan <start> <end>      Range scan from start to end (inclusive)");
     println!("  stats                   Show database statistics");
