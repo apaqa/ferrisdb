@@ -13,5 +13,6 @@
 pub mod error;
 pub mod storage;
 pub mod transaction;
+pub mod sql;
 pub mod cli;
 pub mod server;

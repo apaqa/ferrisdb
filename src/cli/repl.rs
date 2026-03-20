@@ -26,6 +26,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::Result;
 use crate::storage::traits::StorageEngine;
+use crate::sql::lexer::Lexer;
+use crate::sql::parser::Parser;
 use crate::transaction::mvcc::{MvccEngine, Transaction};
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -50,6 +52,7 @@ pub fn run(engine: Arc<MvccEngine>) -> Result<()> {
 
     let mut input = String::new();
     let mut active_txn: Option<Transaction> = None;
+    let mut sql_mode = false;
 
     loop {
         print!("ferrisdb> ");
@@ -64,6 +67,23 @@ pub fn run(engine: Arc<MvccEngine>) -> Result<()> {
 
         let line = input.trim();
         if line.is_empty() {
+            continue;
+        }
+
+        if line.eq_ignore_ascii_case("sql") {
+            sql_mode = true;
+            println!("Switched to SQL mode");
+            continue;
+        }
+
+        if line.eq_ignore_ascii_case("kv") {
+            sql_mode = false;
+            println!("Switched to KV mode");
+            continue;
+        }
+
+        if sql_mode {
+            handle_sql_line(line);
             continue;
         }
 
@@ -345,6 +365,8 @@ fn handle_stats(engine: &Arc<MvccEngine>, active_txn: &mut Option<Transaction>) 
 
 fn handle_help() {
     println!("Available commands:");
+    println!("  sql                     Switch to SQL mode");
+    println!("  kv                      Switch back to KV mode");
     println!("  begin                   Begin a transaction");
     println!("  commit                  Commit the active transaction");
     println!("  rollback                Roll back the active transaction");
@@ -359,6 +381,23 @@ fn handle_help() {
     println!("  stats                   Show visible statistics");
     println!("  help                    Show this help");
     println!("  exit                    Exit the REPL");
+}
+
+fn handle_sql_line(line: &str) {
+    let mut lexer = Lexer::new(line);
+    let tokens = match lexer.tokenize() {
+        Ok(tokens) => tokens,
+        Err(err) => {
+            println!("SQL lexer error: {}", err);
+            return;
+        }
+    };
+
+    let mut parser = Parser::new(tokens);
+    match parser.parse() {
+        Ok(stmt) => println!("{:#?}", stmt),
+        Err(err) => println!("SQL parser error: {}", err),
+    }
 }
 
 fn dump_pairs_to_file(pairs: &[(Vec<u8>, Vec<u8>)], filename: &str) -> Result<()> {
