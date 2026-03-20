@@ -9,8 +9,19 @@ FerrisDB is a database engine implemented from scratch in Rust, featuring LSM-Tr
 - Bloom Filter for read optimization
 - MVCC with snapshot isolation and transactions
 - SQL support (`CREATE TABLE`, `INSERT`, `SELECT`, `UPDATE`, `DELETE`)
-- SQL `WHERE`, `ORDER BY`, `LIMIT`, `INNER JOIN`, and `EXPLAIN`
+- SQL INNER JOIN with nested loop
+- SQL aggregate functions: COUNT, SUM, MIN, MAX
+- SQL GROUP BY
+- SQL ORDER BY ASC/DESC
+- SQL LIMIT
+- SQL EXPLAIN with query plan
 - SQL `WHERE` with comparison operators (`=`, `!=`, `<`, `>`, `<=`, `>=`)
+- Secondary Index with `CREATE INDEX` / `DROP INDEX`
+- Index Scan optimization for equality queries
+- ALTER TABLE (`ADD COLUMN` / `DROP COLUMN`)
+- DROP TABLE / DROP TABLE IF EXISTS
+- CREATE TABLE IF NOT EXISTS
+- WHERE IN (subquery)
 - TCP server with multi-threaded connections
 - HTTP Admin API (`/health`, `/stats`, `/sstables`, `/compact`, `/flush`)
 - Interactive REPL with KV and SQL modes
@@ -18,7 +29,7 @@ FerrisDB is a database engine implemented from scratch in Rust, featuring LSM-Tr
 - Configurable via `ferrisdb.toml`
 - Built-in benchmark framework
 - Failure injection and stress tests
-- 80+ automated tests
+- 113+ automated tests
 
 ## Architecture
 
@@ -160,6 +171,7 @@ src/
     lexer.rs            # SQL tokenizer
     parser.rs           # SQL parser
     catalog.rs          # Table schema metadata
+    index.rs            # Secondary index metadata and lookup
     row.rs              # Row encoding and storage mapping
     executor.rs         # SQL execution engine
   transaction/
@@ -182,6 +194,7 @@ examples/
   client.rs             # TCP client example
   bench.rs              # KV benchmark
   bench_sql.rs          # SQL benchmark
+  sql_demo.rs           # End-to-end SQL feature demo
 ```
 
 ## What I Learned
@@ -195,11 +208,11 @@ examples/
 
 ## Roadmap
 
-- Secondary indexes
-- JOIN support
-- More complete SQL parsing and planning
+- More advanced SQL planning and cost-based optimization
+- Multi-column and range indexes
+- JOIN algorithm improvements (hash join / merge join)
 - Query optimizer basics
-- HTTP API
+- Richer HTTP / admin APIs
 - Replication and distributed coordination experiments
 - Background compaction scheduling
 - More robust on-disk checksums and validation
