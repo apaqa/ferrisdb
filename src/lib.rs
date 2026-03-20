@@ -1,25 +1,18 @@
 // =============================================================================
-// lib.rs — ferrisdb 的公開 API
+// lib.rs — ferrisdb 對外公開 API
 // =============================================================================
 //
-// 什麼是 lib.rs？
-// ---------------
-// Rust 專案有兩種入口：
-// - main.rs：可執行程式的入口（你 cargo run 跑的就是這個）
-// - lib.rs：函式庫的入口（讓其他程式碼可以 use ferrisdb::xxx 來用）
-//
-// 為什麼兩個都要？
-// 因為我們希望 ferrisdb 既能當獨立程式跑（REPL），
-// 也能被其他程式碼當函式庫使用（例如測試、之後的 TCP server）。
-//
-// pub mod 是什麼？
-// 宣告公開的子模組。外部程式碼就能用 ferrisdb::storage、ferrisdb::error 等等。
+// 這個檔案負責宣告 crate 對外可用的模組。
+// main.rs 主要是執行入口；lib.rs 讓其他程式可以 `use ferrisdb::...`。
 
-/// 錯誤處理模組
+/// 錯誤型別模組
 pub mod error;
 
-/// 儲存引擎模組（MemTable、之後的 SSTable 等等都在這裡）
+/// 儲存引擎模組（目前是 in-memory 的 MemTable）
 pub mod storage;
 
-/// 命令列介面模組
+/// CLI REPL 模組
 pub mod cli;
+
+/// TCP server 模組
+pub mod server;

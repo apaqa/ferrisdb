@@ -1,42 +1,75 @@
 // =============================================================================
-// main.rs — ferrisdb 程式入口
+// main.rs — ferrisdb 執行入口
 // =============================================================================
 //
-// 這個檔案做什麼？
-// ----------------
-// 1. 建立一個 MemTable（記憶體儲存引擎）
-// 2. 啟動 REPL（互動式命令列）
-// 3. 使用者就可以開始用 set / get / delete / list 操作資料
-//
-// 之後的擴充方向：
-// - 加上命令列參數（選擇引擎類型、設定 port 等）
-// - 加上 TCP server 模式
-// - 加上設定檔支援
+// 模式說明：
+// - `cargo run`：啟動 REPL
+// - `cargo run -- --server`：啟動 TCP server（127.0.0.1:6379）
+// - `cargo run -- --server --port 7777`：啟動 TCP server（自訂 port）
 
 use ferrisdb::cli::repl;
+use ferrisdb::server::tcp::{self, DEFAULT_PORT};
 use ferrisdb::storage::memory::MemTable;
 
-/// 程式入口
-///
-/// fn main() 就像其他語言的 main 函式，是程式開始執行的地方。
-///
-/// 為什麼 main 不回傳 Result？
-/// 其實 Rust 的 main 可以回傳 Result，但為了簡單起見，
-/// 我們在這裡用 if let Err 手動處理錯誤，並印出訊息。
 fn main() {
-    // 建立記憶體儲存引擎
-    // mut 表示這個變數是可變的，因為 put/delete 需要修改它
-    let mut engine = MemTable::new();
+    let args: Vec<String> = std::env::args().skip(1).collect();
 
-    // 啟動 REPL，把 engine 的可變借用傳進去
-    // &mut engine 是什麼？
-    // & 表示「借用」（不是給出所有權），mut 表示「允許修改」
-    // 這樣 REPL 可以用 engine，但 engine 的所有權還是在 main 裡
-    if let Err(e) = repl::run(&mut engine) {
-        // 如果 REPL 回傳錯誤，印出來然後結束
-        // eprintln! 跟 println! 一樣，但是印到 stderr（標準錯誤輸出）
-        eprintln!("Fatal error: {}", e);
-        // 用非零 exit code 結束，表示程式異常退出
+    if args.is_empty() {
+        run_repl_mode();
+        return;
+    }
+
+    match parse_server_args(&args) {
+        Ok(Some(port)) => run_server_mode(port),
+        Ok(None) => {
+            eprintln!("Unknown args: {}", args.join(" "));
+            eprintln!("Usage:");
+            eprintln!("  cargo run");
+            eprintln!("  cargo run -- --server");
+            eprintln!("  cargo run -- --server --port <port>");
+            std::process::exit(2);
+        }
+        Err(msg) => {
+            eprintln!("Argument error: {}", msg);
+            std::process::exit(2);
+        }
+    }
+}
+
+fn run_repl_mode() {
+    let mut engine = MemTable::new();
+    if let Err(err) = repl::run(&mut engine) {
+        eprintln!("Fatal error: {}", err);
         std::process::exit(1);
     }
+}
+
+fn run_server_mode(port: u16) {
+    if let Err(err) = tcp::run_server(port) {
+        eprintln!("Fatal server error: {}", err);
+        std::process::exit(1);
+    }
+}
+
+/// 解析是否為 server 模式，成功回傳 `Some(port)`。
+/// 若不是 server 模式，回傳 `None`。
+fn parse_server_args(args: &[String]) -> Result<Option<u16>, String> {
+    if args.is_empty() || args[0] != "--server" {
+        return Ok(None);
+    }
+
+    // 僅 `--server`
+    if args.len() == 1 {
+        return Ok(Some(DEFAULT_PORT));
+    }
+
+    // `--server --port <port>`
+    if args.len() == 3 && args[1] == "--port" {
+        let port: u16 = args[2]
+            .parse()
+            .map_err(|_| format!("invalid port '{}'", args[2]))?;
+        return Ok(Some(port));
+    }
+
+    Err("expected '--server' or '--server --port <port>'".to_string())
 }
