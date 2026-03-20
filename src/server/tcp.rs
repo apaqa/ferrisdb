@@ -45,7 +45,11 @@ pub fn run_on_listener(listener: TcpListener, engine: Arc<MvccEngine>) -> Result
 }
 
 pub fn run_server_with_engine(port: u16, engine: Arc<MvccEngine>) -> Result<()> {
-    let addr = format!("{}:{}", DEFAULT_HOST, port);
+    run_server_at(DEFAULT_HOST, port, engine)
+}
+
+pub fn run_server_at(host: &str, port: u16, engine: Arc<MvccEngine>) -> Result<()> {
+    let addr = format!("{}:{}", host, port);
     let listener = TcpListener::bind(&addr)?;
     run_on_listener(listener, engine)
 }

@@ -1,0 +1,12 @@
+# =============================================================================
+# ferrisdb.example.toml -- FerrisDB 設定範例
+# =============================================================================
+#
+# 複製成 `ferrisdb.toml` 後，主程式啟動時會自動載入。
+
+data_dir = "./ferrisdb-data"
+memtable_size_threshold = 4096
+compaction_threshold = 4
+server_host = "127.0.0.1"
+server_port = 6379
+wal_sync_on_write = true

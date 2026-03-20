@@ -1,49 +1,81 @@
 // =============================================================================
-// main.rs — ferrisdb 執行入口（MVCC REPL / MVCC TCP server）
+// main.rs -- FerrisDB Startup Entry
 // =============================================================================
 //
-// 這一版 main 使用：
-// - 底層儲存：LsmEngine
-// - 交易層：MvccEngine
+// 啟動流程：
+// 1. 先載入 `ferrisdb.toml`，若不存在則用預設設定
+// 2. 再用 CLI 參數覆蓋 config
+// 3. 依模式啟動：
+//    - 預設：REPL
+//    - `--server`：TCP server
 //
-// 因此 REPL 與 TCP server 都會透過 MVCC 存取資料。
+// 目前支援的 CLI 覆蓋：
+// - `--data-dir <path>`
+// - `--port <port>`
+// - `--memtable-threshold <bytes>`
 
+use std::path::Path;
 use std::sync::Arc;
 
 use ferrisdb::cli::repl;
-use ferrisdb::server::tcp::{self, DEFAULT_PORT};
-use ferrisdb::storage::lsm::{LsmEngine, DEFAULT_MEMTABLE_SIZE_THRESHOLD};
+use ferrisdb::config::FerrisDbConfig;
+use ferrisdb::server::tcp;
+use ferrisdb::storage::lsm::LsmEngine;
 use ferrisdb::transaction::mvcc::MvccEngine;
 
-const DEFAULT_DATA_DIR: &str = "./ferrisdb-data";
+const CONFIG_PATH: &str = "ferrisdb.toml";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    Repl,
+    Server,
+}
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
 
-    if args.is_empty() {
-        run_repl_mode();
-        return;
+    let mut config = load_config_or_default(CONFIG_PATH);
+    if let Err(err) = config.merge_cli_args(&args) {
+        eprintln!("Argument error: {}", err);
+        std::process::exit(2);
     }
 
-    match parse_server_args(&args) {
-        Ok(Some(port)) => run_server_mode(port),
-        Ok(None) => {
-            eprintln!("Unknown args: {}", args.join(" "));
-            eprintln!("Usage:");
-            eprintln!("  cargo run");
-            eprintln!("  cargo run -- --server");
-            eprintln!("  cargo run -- --server --port <port>");
+    let mode = match parse_mode(&args) {
+        Ok(mode) => mode,
+        Err(err) => {
+            eprintln!("Argument error: {}", err);
+            print_usage();
             std::process::exit(2);
         }
-        Err(msg) => {
-            eprintln!("Argument error: {}", msg);
-            std::process::exit(2);
-        }
+    };
+
+    match mode {
+        Mode::Repl => run_repl_mode(&config),
+        Mode::Server => run_server_mode(&config),
     }
 }
 
-fn run_repl_mode() {
-    let lsm = match LsmEngine::open(DEFAULT_DATA_DIR, DEFAULT_MEMTABLE_SIZE_THRESHOLD) {
+fn load_config_or_default(path: &str) -> FerrisDbConfig {
+    if Path::new(path).exists() {
+        match FerrisDbConfig::from_file(path) {
+            Ok(config) => config,
+            Err(err) => {
+                eprintln!("Failed to load config '{}': {}", path, err);
+                std::process::exit(2);
+            }
+        }
+    } else {
+        FerrisDbConfig::default()
+    }
+}
+
+fn build_engine(config: &FerrisDbConfig) -> Arc<MvccEngine> {
+    let lsm = match LsmEngine::open_with_options(
+        &config.data_dir,
+        config.memtable_size_threshold,
+        config.compaction_threshold,
+        config.wal_sync_on_write,
+    ) {
         Ok(engine) => engine,
         Err(err) => {
             eprintln!("Failed to open LSM engine: {}", err);
@@ -51,7 +83,11 @@ fn run_repl_mode() {
         }
     };
 
-    let engine = Arc::new(MvccEngine::new(lsm));
+    Arc::new(MvccEngine::new(lsm))
+}
+
+fn run_repl_mode(config: &FerrisDbConfig) {
+    let engine = build_engine(config);
     if let Err(err) = repl::run(Arc::clone(&engine)) {
         eprintln!("Fatal error: {}", err);
         std::process::exit(1);
@@ -63,37 +99,33 @@ fn run_repl_mode() {
     }
 }
 
-fn run_server_mode(port: u16) {
-    let lsm = match LsmEngine::open(DEFAULT_DATA_DIR, DEFAULT_MEMTABLE_SIZE_THRESHOLD) {
-        Ok(engine) => engine,
-        Err(err) => {
-            eprintln!("Failed to open LSM engine: {}", err);
-            std::process::exit(1);
-        }
-    };
-
-    let engine = Arc::new(MvccEngine::new(lsm));
-    if let Err(err) = tcp::run_server_with_engine(port, engine) {
+fn run_server_mode(config: &FerrisDbConfig) {
+    let engine = build_engine(config);
+    if let Err(err) = tcp::run_server_at(&config.server_host, config.server_port, engine) {
         eprintln!("Fatal server error: {}", err);
         std::process::exit(1);
     }
 }
 
-fn parse_server_args(args: &[String]) -> Result<Option<u16>, String> {
-    if args.is_empty() || args[0] != "--server" {
-        return Ok(None);
+fn parse_mode(args: &[String]) -> Result<Mode, String> {
+    if args.iter().any(|arg| arg == "--server") {
+        return Ok(Mode::Server);
     }
 
-    if args.len() == 1 {
-        return Ok(Some(DEFAULT_PORT));
+    for arg in args {
+        if arg.starts_with("--") && arg != "--data-dir" && arg != "--port" && arg != "--memtable-threshold" {
+            return Err(format!("unknown arg '{}'", arg));
+        }
     }
 
-    if args.len() == 3 && args[1] == "--port" {
-        let port: u16 = args[2]
-            .parse()
-            .map_err(|_| format!("invalid port '{}'", args[2]))?;
-        return Ok(Some(port));
-    }
+    Ok(Mode::Repl)
+}
 
-    Err("expected '--server' or '--server --port <port>'".to_string())
+fn print_usage() {
+    eprintln!("Usage:");
+    eprintln!("  cargo run");
+    eprintln!("  cargo run -- --server");
+    eprintln!("  cargo run -- --server --port <port>");
+    eprintln!("  cargo run -- --data-dir <path>");
+    eprintln!("  cargo run -- --memtable-threshold <bytes>");
 }

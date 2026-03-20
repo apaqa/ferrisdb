@@ -38,6 +38,7 @@ pub enum WalRecord {
 pub struct WalWriter {
     path: PathBuf,
     file: File,
+    sync_on_write: bool,
 }
 
 impl WalWriter {
@@ -46,6 +47,10 @@ impl WalWriter {
     /// 之所以不用 truncate，是因為 LSM 重啟後若沿用既有 WAL，
     /// 我們要能繼續把後續操作接在檔尾。
     pub fn new(path: impl AsRef<Path>) -> Result<Self> {
+        Self::new_with_options(path, true)
+    }
+
+    pub fn new_with_options(path: impl AsRef<Path>, sync_on_write: bool) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
         let file = OpenOptions::new()
             .create(true)
@@ -53,7 +58,11 @@ impl WalWriter {
             .append(true)
             .open(&path)?;
 
-        Ok(Self { path, file })
+        Ok(Self {
+            path,
+            file,
+            sync_on_write,
+        })
     }
 
     pub fn append_put(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
@@ -79,7 +88,9 @@ impl WalWriter {
     fn append_record(&mut self, record: WalRecord) -> Result<()> {
         let encoded = encode_record(&record)?;
         self.file.write_all(&encoded)?;
-        self.file.sync_all()?;
+        if self.sync_on_write {
+            self.file.sync_all()?;
+        }
         Ok(())
     }
 }

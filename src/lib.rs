@@ -11,6 +11,8 @@
 // - server：TCP server
 
 pub mod error;
+pub mod config;
+pub mod bench;
 pub mod storage;
 pub mod transaction;
 pub mod sql;

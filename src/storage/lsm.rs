@@ -64,11 +64,27 @@ pub struct LsmEngine {
     pub manifest: Manifest,
     pub data_dir: PathBuf,
     pub memtable_size_threshold: usize,
+    pub compaction_threshold: usize,
+    pub wal_sync_on_write: bool,
     pub next_sstable_id: u64,
 }
 
 impl LsmEngine {
     pub fn open(data_dir: impl AsRef<Path>, threshold: usize) -> Result<Self> {
+        Self::open_with_options(
+            data_dir,
+            threshold,
+            AUTO_COMPACTION_SSTABLE_LIMIT,
+            true,
+        )
+    }
+
+    pub fn open_with_options(
+        data_dir: impl AsRef<Path>,
+        threshold: usize,
+        compaction_threshold: usize,
+        wal_sync_on_write: bool,
+    ) -> Result<Self> {
         let data_dir = data_dir.as_ref().to_path_buf();
         fs::create_dir_all(&data_dir)?;
 
@@ -101,7 +117,7 @@ impl LsmEngine {
         } else {
             MemTable::new()
         };
-        let active_wal = Some(WalWriter::new(&wal_path)?);
+        let active_wal = Some(WalWriter::new_with_options(&wal_path, wal_sync_on_write)?);
 
         manifest.set_state(manifest.state());
         let next_sstable_id = manifest.next_sstable_id;
@@ -113,6 +129,8 @@ impl LsmEngine {
             manifest,
             data_dir,
             memtable_size_threshold,
+            compaction_threshold: compaction_threshold.max(1),
+            wal_sync_on_write,
             next_sstable_id,
         })
     }
@@ -260,7 +278,7 @@ impl LsmEngine {
     }
 
     fn maybe_auto_compact(&mut self) -> Result<()> {
-        if self.sstables.len() > AUTO_COMPACTION_SSTABLE_LIMIT {
+        if self.sstables.len() > self.compaction_threshold {
             self.compact()?;
         }
         Ok(())
@@ -301,7 +319,10 @@ impl LsmEngine {
         self.next_sstable_id = self.manifest.next_sstable_id;
 
         if recreate_wal {
-            self.active_wal = Some(WalWriter::new(&wal_path)?);
+            self.active_wal = Some(WalWriter::new_with_options(
+                &wal_path,
+                self.wal_sync_on_write,
+            )?);
         }
 
         Ok(())

@@ -24,6 +24,7 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
+use crate::bench::{format_bench_results, run_basic_kv_benchmark};
 use crate::error::Result;
 use crate::storage::lsm::TOMBSTONE;
 use crate::storage::traits::StorageEngine;
@@ -101,6 +102,7 @@ pub fn run(engine: Arc<MvccEngine>) -> Result<()> {
             "dump" => handle_dump(&engine, &mut active_txn, &parts),
             "load" => handle_load(&engine, &mut active_txn, &parts),
             "compact" => handle_compact(&engine, &active_txn),
+            "bench" => handle_bench(&engine, &active_txn),
             "flush" => handle_flush(&engine, &active_txn),
             "show" => handle_show(&engine, &active_txn, &parts),
             "debug" => handle_debug(&engine, &active_txn, &parts),
@@ -292,6 +294,18 @@ fn handle_compact(engine: &Arc<MvccEngine>, active_txn: &Option<Transaction>) {
     }
 }
 
+fn handle_bench(engine: &Arc<MvccEngine>, active_txn: &Option<Transaction>) {
+    if active_txn.is_some() {
+        println!("Error: cannot run bench while a transaction is active");
+        return;
+    }
+
+    match run_basic_kv_benchmark(engine, 1000) {
+        Ok(results) => println!("{}", format_bench_results(&results)),
+        Err(err) => println!("Error: {}", err),
+    }
+}
+
 fn handle_flush(engine: &Arc<MvccEngine>, active_txn: &Option<Transaction>) {
     if active_txn.is_some() {
         println!("Error: cannot flush while a transaction is active");
@@ -419,6 +433,7 @@ fn handle_help() {
     println!("  dump <filename>         Dump visible key-value pairs to a JSON file");
     println!("  load <filename>         Load key-value pairs from a JSON file");
     println!("  compact                 Compact SSTables");
+    println!("  bench                   Run a simple built-in benchmark");
     println!("  flush                   Force flush the active MemTable");
     println!("  show sstables           Show active SSTables");
     println!("  show manifest           Show MANIFEST state");
