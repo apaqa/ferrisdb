@@ -1,6 +1,10 @@
 [package]
 name = "ferrisdb"
 version = "0.1.0"
-edition = "2024"
+edition = "2021"
+description = "A database engine built from scratch in Rust — portfolio project"
 
 [dependencies]
+# thiserror: 讓我們可以用 derive macro 快速定義自己的錯誤型別
+# 這比手動實作 std::fmt::Display 和 std::error::Error 方便很多
+thiserror = "2"
