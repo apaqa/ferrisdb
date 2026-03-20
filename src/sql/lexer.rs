@@ -25,6 +25,7 @@ pub enum Token {
     LParen,
     RParen,
     Eq,
+    Dot,
     Ne,
     Lt,
     Gt,
@@ -46,6 +47,9 @@ pub enum Keyword {
     Update,
     Set,
     Delete,
+    Join,
+    On,
+    Inner,
     And,
     Or,
     Int,
@@ -104,6 +108,10 @@ impl<'a> Lexer<'a> {
                 '=' => {
                     self.bump();
                     Token::Eq
+                }
+                '.' => {
+                    self.bump();
+                    Token::Dot
                 }
                 '!' => {
                     self.bump();
@@ -263,6 +271,9 @@ fn keyword_from_ident(ident: &str) -> Option<Keyword> {
         "UPDATE" => Some(Keyword::Update),
         "SET" => Some(Keyword::Set),
         "DELETE" => Some(Keyword::Delete),
+        "JOIN" => Some(Keyword::Join),
+        "ON" => Some(Keyword::On),
+        "INNER" => Some(Keyword::Inner),
         "AND" => Some(Keyword::And),
         "OR" => Some(Keyword::Or),
         "INT" => Some(Keyword::Int),

@@ -31,7 +31,7 @@ use crate::error::Result;
 use crate::transaction::mvcc::{MvccEngine, Transaction};
 
 use super::ast::{
-    Assignment, Operator, SelectColumns, Statement, Value, WhereClause,
+    Assignment, JoinClause, Operator, SelectColumns, Statement, Value, WhereClause,
 };
 use super::catalog::{Catalog, TableSchema};
 use super::row::{
@@ -70,8 +70,9 @@ impl SqlExecutor {
             Statement::Select {
                 table_name,
                 columns,
+                join,
                 where_clause,
-            } => self.execute_select(table_name, columns, where_clause),
+            } => self.execute_select(table_name, columns, join, where_clause),
             Statement::Update {
                 table_name,
                 assignments,
@@ -165,6 +166,7 @@ impl SqlExecutor {
         &self,
         table_name: String,
         columns: SelectColumns,
+        join: Option<JoinClause>,
         where_clause: Option<WhereClause>,
     ) -> Result<ExecuteResult> {
         let txn = self.engine.begin_transaction();
@@ -173,6 +175,10 @@ impl SqlExecutor {
                 message: format!("table '{}' does not exist", table_name),
             });
         };
+
+        if let Some(join_clause) = join {
+            return self.execute_join_select(&txn, &schema, columns, join_clause, where_clause);
+        }
 
         let projection = match self.resolve_projection(&schema, &columns) {
             Ok(columns) => columns,
@@ -190,6 +196,72 @@ impl SqlExecutor {
                     .collect::<Vec<_>>()
             })
             .collect();
+
+        Ok(ExecuteResult::Selected {
+            columns: projection,
+            rows: selected,
+        })
+    }
+
+    fn execute_join_select(
+        &self,
+        txn: &Transaction,
+        left_schema: &TableSchema,
+        columns: SelectColumns,
+        join: JoinClause,
+        where_clause: Option<WhereClause>,
+    ) -> Result<ExecuteResult> {
+        let Some(right_schema) = self.catalog.get_table(txn, &join.right_table)? else {
+            return Ok(ExecuteResult::Error {
+                message: format!("table '{}' does not exist", join.right_table),
+            });
+        };
+
+        let left_rows = self.scan_rows(txn, left_schema)?;
+        let right_rows = self.scan_rows(txn, &right_schema)?;
+        let projection = match self.resolve_join_projection(left_schema, &right_schema, &columns) {
+            Ok(columns) => columns,
+            Err(message) => return Ok(ExecuteResult::Error { message }),
+        };
+
+        let mut selected = Vec::new();
+        for (_, left_row) in &left_rows {
+            let Some(left_value) = resolve_join_value(left_row, &left_schema.table_name, &join.left_column) else {
+                return Ok(ExecuteResult::Error {
+                    message: format!("unknown join column '{}'", join.left_column),
+                });
+            };
+
+            for (_, right_row) in &right_rows {
+                let Some(right_value) =
+                    resolve_join_value(right_row, &right_schema.table_name, &join.right_column)
+                else {
+                    return Ok(ExecuteResult::Error {
+                        message: format!("unknown join column '{}'", join.right_column),
+                    });
+                };
+
+                if left_value != right_value {
+                    continue;
+                }
+
+                let joined = JoinedRow::new(left_schema, left_row, &right_schema, right_row);
+                if !matches_join_where(&joined, where_clause.as_ref()) {
+                    continue;
+                }
+
+                let mut row = Vec::with_capacity(projection.len());
+                for column in &projection {
+                    let Some(value) = joined.get(column) else {
+                        return Ok(ExecuteResult::Error {
+                            message: format!("unknown column '{}'", column),
+                        });
+                    };
+                    row.push(value.clone());
+                }
+                selected.push(row);
+            }
+        }
 
         Ok(ExecuteResult::Selected {
             columns: projection,
@@ -308,6 +380,38 @@ impl SqlExecutor {
         }
         Ok(rows)
     }
+
+    fn resolve_join_projection(
+        &self,
+        left_schema: &TableSchema,
+        right_schema: &TableSchema,
+        columns: &SelectColumns,
+    ) -> std::result::Result<Vec<String>, String> {
+        let all_columns = join_output_columns(left_schema, right_schema);
+        match columns {
+            SelectColumns::All => Ok(all_columns),
+            SelectColumns::Named(names) => {
+                for name in names {
+                    if !all_columns.iter().any(|column| column == name) {
+                        let left_matches = left_schema
+                            .columns
+                            .iter()
+                            .filter(|column| column.name == *name)
+                            .count();
+                        let right_matches = right_schema
+                            .columns
+                            .iter()
+                            .filter(|column| column.name == *name)
+                            .count();
+                        if left_matches + right_matches != 1 {
+                            return Err(format!("unknown or ambiguous column '{}'", name));
+                        }
+                    }
+                }
+                Ok(names.clone())
+            }
+        }
+    }
 }
 
 pub fn format_execute_result(result: &ExecuteResult) -> String {
@@ -407,5 +511,81 @@ fn render_value(value: &Value) -> String {
         Value::Text(v) => v.clone(),
         Value::Bool(v) => v.to_string(),
         Value::Null => "NULL".to_string(),
+    }
+}
+
+fn resolve_join_value<'a>(row: &'a Row, table_name: &str, column: &str) -> Option<&'a Value> {
+    if let Some((qualifier, bare)) = column.split_once('.') {
+        if qualifier == table_name {
+            return row.get(bare);
+        }
+        return None;
+    }
+
+    row.get(column)
+}
+
+fn join_output_columns(left_schema: &TableSchema, right_schema: &TableSchema) -> Vec<String> {
+    let mut columns = Vec::new();
+    for column in &left_schema.columns {
+        columns.push(format!("{}.{}", left_schema.table_name, column.name));
+    }
+    for column in &right_schema.columns {
+        columns.push(format!("{}.{}", right_schema.table_name, column.name));
+    }
+    columns
+}
+
+fn matches_join_where(joined: &JoinedRow, where_clause: Option<&WhereClause>) -> bool {
+    let Some(where_clause) = where_clause else {
+        return true;
+    };
+
+    let Some(left) = joined.get(&where_clause.column) else {
+        return false;
+    };
+
+    compare_values(left, &where_clause.value, where_clause.operator.clone())
+}
+
+#[derive(Debug, Clone)]
+struct JoinedRow {
+    columns: Vec<(String, Value)>,
+}
+
+impl JoinedRow {
+    fn new(left_schema: &TableSchema, left_row: &Row, right_schema: &TableSchema, right_row: &Row) -> Self {
+        let mut columns = Vec::new();
+        for column in &left_schema.columns {
+            if let Some(value) = left_row.get(&column.name) {
+                columns.push((format!("{}.{}", left_schema.table_name, column.name), value.clone()));
+            }
+        }
+        for column in &right_schema.columns {
+            if let Some(value) = right_row.get(&column.name) {
+                columns.push((format!("{}.{}", right_schema.table_name, column.name), value.clone()));
+            }
+        }
+        Self { columns }
+    }
+
+    fn get(&self, column: &str) -> Option<&Value> {
+        if column.contains('.') {
+            return self
+                .columns
+                .iter()
+                .find(|(name, _)| name == column)
+                .map(|(_, value)| value);
+        }
+
+        let mut matches = self
+            .columns
+            .iter()
+            .filter(|(name, _)| name.rsplit('.').next() == Some(column));
+        let first = matches.next()?;
+        if matches.next().is_some() {
+            return None;
+        }
+        Some(&first.1)
     }
 }

@@ -26,6 +26,7 @@ pub enum Statement {
     Select {
         table_name: String,
         columns: SelectColumns,
+        join: Option<JoinClause>,
         where_clause: Option<WhereClause>,
     },
     Update {
@@ -71,6 +72,13 @@ pub struct WhereClause {
     pub column: String,
     pub operator: Operator,
     pub value: Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JoinClause {
+    pub right_table: String,
+    pub left_column: String,
+    pub right_column: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

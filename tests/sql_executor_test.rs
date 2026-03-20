@@ -270,3 +270,112 @@ fn test_schema_and_rows_survive_reopen() {
 
     let _ = std::fs::remove_dir_all(dir);
 }
+
+#[test]
+fn test_inner_join_between_two_tables() {
+    let (dir, _engine, executor) = open_executor("join-basic");
+
+    exec(
+        &executor,
+        "CREATE TABLE users (id INT, name TEXT, active BOOL);",
+    );
+    exec(
+        &executor,
+        "CREATE TABLE orders (id INT, user_id INT, item TEXT);",
+    );
+    exec(
+        &executor,
+        "INSERT INTO users VALUES (1, 'Alice', true), (2, 'Bob', false);",
+    );
+    exec(
+        &executor,
+        "INSERT INTO orders VALUES (10, 1, 'Book'), (11, 1, 'Pen'), (12, 2, 'Cup');",
+    );
+
+    let (columns, rows) = rows_only(exec(
+        &executor,
+        "SELECT * FROM users INNER JOIN orders ON users.id = orders.user_id;",
+    ));
+    assert_eq!(
+        columns,
+        vec![
+            "users.id",
+            "users.name",
+            "users.active",
+            "orders.id",
+            "orders.user_id",
+            "orders.item",
+        ]
+    );
+    assert_eq!(rows.len(), 3);
+
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn test_where_with_join_filters_rows() {
+    let (dir, _engine, executor) = open_executor("join-where");
+
+    exec(
+        &executor,
+        "CREATE TABLE users (id INT, name TEXT, active BOOL);",
+    );
+    exec(
+        &executor,
+        "CREATE TABLE orders (id INT, user_id INT, item TEXT);",
+    );
+    exec(
+        &executor,
+        "INSERT INTO users VALUES (1, 'Alice', true), (2, 'Bob', false);",
+    );
+    exec(
+        &executor,
+        "INSERT INTO orders VALUES (10, 1, 'Book'), (11, 2, 'Cup');",
+    );
+
+    let (columns, rows) = rows_only(exec(
+        &executor,
+        "SELECT users.name, orders.item FROM users INNER JOIN orders ON users.id = orders.user_id WHERE users.id = 1;",
+    ));
+    assert_eq!(columns, vec!["users.name", "orders.item"]);
+    assert_eq!(
+        rows,
+        vec![vec![
+            Value::Text("Alice".to_string()),
+            Value::Text("Book".to_string()),
+        ]]
+    );
+
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn test_join_with_no_matching_rows_returns_empty_result() {
+    let (dir, _engine, executor) = open_executor("join-empty");
+
+    exec(
+        &executor,
+        "CREATE TABLE users (id INT, name TEXT, active BOOL);",
+    );
+    exec(
+        &executor,
+        "CREATE TABLE orders (id INT, user_id INT, item TEXT);",
+    );
+    exec(
+        &executor,
+        "INSERT INTO users VALUES (1, 'Alice', true);",
+    );
+    exec(
+        &executor,
+        "INSERT INTO orders VALUES (10, 99, 'Book');",
+    );
+
+    let (columns, rows) = rows_only(exec(
+        &executor,
+        "SELECT users.name, orders.item FROM users INNER JOIN orders ON users.id = orders.user_id;",
+    ));
+    assert_eq!(columns, vec!["users.name", "orders.item"]);
+    assert!(rows.is_empty());
+
+    let _ = std::fs::remove_dir_all(dir);
+}

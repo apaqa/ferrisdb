@@ -14,7 +14,8 @@
 use crate::error::{FerrisDbError, Result};
 
 use super::ast::{
-    Assignment, ColumnDef, DataType, Operator, SelectColumns, Statement, Value, WhereClause,
+    Assignment, ColumnDef, DataType, JoinClause, Operator, SelectColumns, Statement, Value,
+    WhereClause,
 };
 use super::lexer::{Keyword, Token};
 
@@ -127,7 +128,7 @@ impl Parser {
         } else {
             let mut names = Vec::new();
             loop {
-                names.push(self.expect_ident()?);
+                names.push(self.parse_identifier_path()?);
                 if matches!(self.peek(), Some(Token::Comma)) {
                     self.bump();
                     continue;
@@ -138,12 +139,14 @@ impl Parser {
         };
 
         self.expect_keyword(Keyword::From)?;
-        let table_name = self.expect_ident()?;
+        let table_name = self.parse_identifier_path()?;
+        let join = self.parse_optional_join()?;
         let where_clause = self.parse_optional_where()?;
 
         Ok(Statement::Select {
             table_name,
             columns,
+            join,
             where_clause,
         })
     }
@@ -192,7 +195,7 @@ impl Parser {
         }
 
         self.bump();
-        let column = self.expect_ident()?;
+        let column = self.parse_identifier_path()?;
         let operator = self.parse_operator()?;
         let value = self.parse_value()?;
 
@@ -200,6 +203,31 @@ impl Parser {
             column,
             operator,
             value,
+        }))
+    }
+
+    fn parse_optional_join(&mut self) -> Result<Option<JoinClause>> {
+        if !matches!(
+            self.peek(),
+            Some(Token::Keyword(Keyword::Inner)) | Some(Token::Keyword(Keyword::Join))
+        ) {
+            return Ok(None);
+        }
+
+        if matches!(self.peek(), Some(Token::Keyword(Keyword::Inner))) {
+            self.bump();
+        }
+        self.expect_keyword(Keyword::Join)?;
+        let right_table = self.parse_identifier_path()?;
+        self.expect_keyword(Keyword::On)?;
+        let left_column = self.parse_identifier_path()?;
+        self.expect_token(Token::Eq)?;
+        let right_column = self.parse_identifier_path()?;
+
+        Ok(Some(JoinClause {
+            right_table,
+            left_column,
+            right_column,
         }))
     }
 
@@ -276,6 +304,15 @@ impl Parser {
 
     fn peek(&self) -> Option<&Token> {
         self.tokens.get(self.pos)
+    }
+
+    fn parse_identifier_path(&mut self) -> Result<String> {
+        let mut parts = vec![self.expect_ident()?];
+        while matches!(self.peek(), Some(Token::Dot)) {
+            self.bump();
+            parts.push(self.expect_ident()?);
+        }
+        Ok(parts.join("."))
     }
 
     fn bump(&mut self) -> Option<Token> {

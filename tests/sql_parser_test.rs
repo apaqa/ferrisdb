@@ -9,7 +9,8 @@
 // - 大小寫不敏感與多餘空白情況
 
 use ferrisdb::sql::ast::{
-    Assignment, ColumnDef, DataType, Operator, SelectColumns, Statement, Value, WhereClause,
+    Assignment, ColumnDef, DataType, JoinClause, Operator, SelectColumns, Statement, Value,
+    WhereClause,
 };
 use ferrisdb::sql::lexer::{Keyword, Lexer, Token};
 use ferrisdb::sql::parser::Parser;
@@ -93,6 +94,7 @@ fn test_parse_select() {
         Statement::Select {
             table_name: "users".to_string(),
             columns: SelectColumns::Named(vec!["name".to_string(), "age".to_string()]),
+            join: None,
             where_clause: Some(WhereClause {
                 column: "id".to_string(),
                 operator: Operator::Eq,
@@ -110,6 +112,7 @@ fn test_parse_select_all_and_comparison_operator() {
         Statement::Select {
             table_name: "users".to_string(),
             columns: SelectColumns::All,
+            join: None,
             where_clause: Some(WhereClause {
                 column: "age".to_string(),
                 operator: Operator::Gt,
@@ -181,7 +184,32 @@ fn test_case_insensitive_and_extra_whitespace() {
         Statement::Select {
             table_name: "users".to_string(),
             columns: SelectColumns::All,
+            join: None,
             where_clause: None,
+        }
+    );
+}
+
+#[test]
+fn test_parse_select_with_inner_join() {
+    let stmt = parse_sql(
+        "SELECT * FROM users INNER JOIN orders ON users.id = orders.user_id WHERE users.id = 1;",
+    );
+    assert_eq!(
+        stmt,
+        Statement::Select {
+            table_name: "users".to_string(),
+            columns: SelectColumns::All,
+            join: Some(JoinClause {
+                right_table: "orders".to_string(),
+                left_column: "users.id".to_string(),
+                right_column: "orders.user_id".to_string(),
+            }),
+            where_clause: Some(WhereClause {
+                column: "users.id".to_string(),
+                operator: Operator::Eq,
+                value: Value::Int(1),
+            }),
         }
     );
 }
