@@ -17,7 +17,7 @@
 // - commit 時才一次寫入到底層 LsmEngine
 // - rollback 不需要真的做什麼，只要不 commit 即可
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -136,6 +136,7 @@ impl Transaction {
 
     pub fn scan(&self, start: &[u8], end: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
         let mut visible = BTreeMap::<Vec<u8>, Vec<u8>>::new();
+        let mut seen = BTreeSet::<Vec<u8>>::new();
 
         {
             let inner = self.engine.inner.lock().expect("mvcc engine mutex poisoned");
@@ -148,9 +149,10 @@ impl Transaction {
 
                 // 因為 encoded key 會讓新版本排前面，所以每個 user_key 第一筆
                 // 符合 read_ts 的版本就是這個 transaction 可見的最新版本。
-                if visible.contains_key(user_key) {
+                if seen.contains(user_key) {
                     continue;
                 }
+                seen.insert(user_key.to_vec());
                 if value != TOMBSTONE {
                     visible.insert(user_key.to_vec(), value);
                 }

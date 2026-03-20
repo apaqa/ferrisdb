@@ -12,5 +12,8 @@
 // - parser：token 流 -> AST
 
 pub mod ast;
+pub mod catalog;
+pub mod executor;
 pub mod lexer;
 pub mod parser;
+pub mod row;

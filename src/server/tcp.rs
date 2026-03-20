@@ -15,6 +15,9 @@ use std::sync::Arc;
 use std::thread;
 
 use crate::error::Result;
+use crate::sql::executor::{format_execute_result, SqlExecutor};
+use crate::sql::lexer::Lexer;
+use crate::sql::parser::Parser;
 use crate::transaction::mvcc::MvccEngine;
 
 pub const DEFAULT_HOST: &str = "127.0.0.1";
@@ -52,6 +55,7 @@ fn handle_client(stream: TcpStream, engine: Arc<MvccEngine>) -> Result<()> {
     let mut reader = BufReader::new(reader_stream);
     let mut writer = BufWriter::new(stream);
     let mut line = String::new();
+    let mut sql_mode = false;
 
     loop {
         line.clear();
@@ -65,7 +69,7 @@ fn handle_client(stream: TcpStream, engine: Arc<MvccEngine>) -> Result<()> {
             continue;
         }
 
-        let response = execute_command(cmd, &engine);
+        let response = execute_command(cmd, &engine, &mut sql_mode);
         writer.write_all(response.as_bytes())?;
         writer.write_all(b"\n")?;
         writer.flush()?;
@@ -74,7 +78,21 @@ fn handle_client(stream: TcpStream, engine: Arc<MvccEngine>) -> Result<()> {
     Ok(())
 }
 
-fn execute_command(line: &str, engine: &Arc<MvccEngine>) -> String {
+fn execute_command(line: &str, engine: &Arc<MvccEngine>, sql_mode: &mut bool) -> String {
+    if line.eq_ignore_ascii_case("sql") {
+        *sql_mode = true;
+        return "Switched to SQL mode".to_string();
+    }
+
+    if line.eq_ignore_ascii_case("kv") {
+        *sql_mode = false;
+        return "Switched to KV mode".to_string();
+    }
+
+    if *sql_mode {
+        return execute_sql(line, engine);
+    }
+
     let parts: Vec<&str> = line.split_whitespace().collect();
     if parts.is_empty() {
         return "Error: empty command".to_string();
@@ -88,6 +106,26 @@ fn execute_command(line: &str, engine: &Arc<MvccEngine>) -> String {
         "scan" => cmd_scan(&parts, engine),
         "stats" => cmd_stats(engine),
         _ => format!("Error: unknown command '{}'", parts[0]),
+    }
+}
+
+fn execute_sql(line: &str, engine: &Arc<MvccEngine>) -> String {
+    let mut lexer = Lexer::new(line);
+    let tokens = match lexer.tokenize() {
+        Ok(tokens) => tokens,
+        Err(err) => return format!("SQL lexer error: {}", err),
+    };
+
+    let mut parser = Parser::new(tokens);
+    let statement = match parser.parse() {
+        Ok(statement) => statement,
+        Err(err) => return format!("SQL parser error: {}", err),
+    };
+
+    let executor = SqlExecutor::new(Arc::clone(engine));
+    match executor.execute(statement) {
+        Ok(result) => format_execute_result(&result),
+        Err(err) => format!("SQL execution error: {}", err),
     }
 }
 

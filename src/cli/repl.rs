@@ -26,6 +26,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::Result;
 use crate::storage::traits::StorageEngine;
+use crate::sql::executor::{format_execute_result, SqlExecutor};
 use crate::sql::lexer::Lexer;
 use crate::sql::parser::Parser;
 use crate::transaction::mvcc::{MvccEngine, Transaction};
@@ -83,7 +84,7 @@ pub fn run(engine: Arc<MvccEngine>) -> Result<()> {
         }
 
         if sql_mode {
-            handle_sql_line(line);
+            handle_sql_line(line, &engine, active_txn.is_some());
             continue;
         }
 
@@ -383,7 +384,12 @@ fn handle_help() {
     println!("  exit                    Exit the REPL");
 }
 
-fn handle_sql_line(line: &str) {
+fn handle_sql_line(line: &str, engine: &Arc<MvccEngine>, has_active_txn: bool) {
+    if has_active_txn {
+        println!("SQL error: finish or rollback the active KV transaction first");
+        return;
+    }
+
     let mut lexer = Lexer::new(line);
     let tokens = match lexer.tokenize() {
         Ok(tokens) => tokens,
@@ -395,7 +401,13 @@ fn handle_sql_line(line: &str) {
 
     let mut parser = Parser::new(tokens);
     match parser.parse() {
-        Ok(stmt) => println!("{:#?}", stmt),
+        Ok(stmt) => {
+            let executor = SqlExecutor::new(Arc::clone(engine));
+            match executor.execute(stmt) {
+                Ok(result) => println!("{}", format_execute_result(&result)),
+                Err(err) => println!("SQL execution error: {}", err),
+            }
+        }
         Err(err) => println!("SQL parser error: {}", err),
     }
 }
