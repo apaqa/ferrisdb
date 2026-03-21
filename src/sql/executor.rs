@@ -43,17 +43,42 @@ use super::row::{
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExecuteResult {
-    Explain { plan: String },
-    Created { table_name: String },
-    Altered { table_name: String },
-    Dropped { table_name: String },
-    IndexCreated { table_name: String, column_name: String },
-    IndexDropped { table_name: String, column_name: String },
-    Inserted { count: usize },
-    Selected { columns: Vec<String>, rows: Vec<Vec<Value>> },
-    Updated { count: usize },
-    Deleted { count: usize },
-    Error { message: String },
+    Explain {
+        plan: String,
+    },
+    Created {
+        table_name: String,
+    },
+    Altered {
+        table_name: String,
+    },
+    Dropped {
+        table_name: String,
+    },
+    IndexCreated {
+        table_name: String,
+        column_name: String,
+    },
+    IndexDropped {
+        table_name: String,
+        column_name: String,
+    },
+    Inserted {
+        count: usize,
+    },
+    Selected {
+        columns: Vec<String>,
+        rows: Vec<Vec<Value>>,
+    },
+    Updated {
+        count: usize,
+    },
+    Deleted {
+        count: usize,
+    },
+    Error {
+        message: String,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -103,7 +128,9 @@ impl SqlExecutor {
             } => self.execute_drop_index(table_name, column_name),
             Statement::Insert { table_name, values } => self.execute_insert(table_name, values),
             Statement::Select {
+                distinct,
                 table_name,
+                table_alias,
                 columns,
                 join,
                 where_clause,
@@ -112,7 +139,9 @@ impl SqlExecutor {
                 order_by,
                 limit,
             } => self.execute_select(
+                distinct,
                 table_name,
+                table_alias,
                 columns,
                 join,
                 where_clause,
@@ -175,7 +204,11 @@ impl SqlExecutor {
                 message: format!("table '{}' does not exist", table_name),
             });
         };
-        if schema.columns.iter().any(|existing| existing.name == column.name) {
+        if schema
+            .columns
+            .iter()
+            .any(|existing| existing.name == column.name)
+        {
             return Ok(ExecuteResult::Error {
                 message: format!("column '{}' already exists", column.name),
             });
@@ -208,12 +241,20 @@ impl SqlExecutor {
                 message: format!("table '{}' does not exist", table_name),
             });
         };
-        if schema.columns.first().is_some_and(|column| column.name == column_name) {
+        if schema
+            .columns
+            .first()
+            .is_some_and(|column| column.name == column_name)
+        {
             return Ok(ExecuteResult::Error {
                 message: "dropping the primary key column is not supported".to_string(),
             });
         }
-        if !schema.columns.iter().any(|column| column.name == column_name) {
+        if !schema
+            .columns
+            .iter()
+            .any(|column| column.name == column_name)
+        {
             return Ok(ExecuteResult::Error {
                 message: format!("unknown column '{}'", column_name),
             });
@@ -279,7 +320,11 @@ impl SqlExecutor {
                 message: format!("table '{}' does not exist", table_name),
             });
         };
-        if !schema.columns.iter().any(|column| column.name == column_name) {
+        if !schema
+            .columns
+            .iter()
+            .any(|column| column.name == column_name)
+        {
             return Ok(ExecuteResult::Error {
                 message: format!("unknown column '{}'", column_name),
             });
@@ -300,11 +345,7 @@ impl SqlExecutor {
         })
     }
 
-    fn execute_drop_index(
-        &self,
-        table_name: String,
-        column_name: String,
-    ) -> Result<ExecuteResult> {
+    fn execute_drop_index(&self, table_name: String, column_name: String) -> Result<ExecuteResult> {
         let mut txn = self.engine.begin_transaction();
         if !self
             .index_manager
@@ -325,7 +366,9 @@ impl SqlExecutor {
     fn execute_explain(&self, statement: Statement) -> Result<ExecuteResult> {
         match statement {
             Statement::Select {
+                distinct: _,
                 table_name,
+                table_alias: _,
                 columns,
                 join,
                 where_clause,
@@ -349,8 +392,11 @@ impl SqlExecutor {
 
                 let use_index = self.can_use_index(&txn, &table_name, where_clause.as_ref())?;
                 let index_lookup = if use_index {
-                    self.index_manager
-                        .find_indexable_comparison(&txn, &table_name, where_clause.as_ref())?
+                    self.index_manager.find_indexable_comparison(
+                        &txn,
+                        &table_name,
+                        where_clause.as_ref(),
+                    )?
                 } else {
                     None
                 };
@@ -388,7 +434,8 @@ impl SqlExecutor {
                 }
                 if let Some(where_clause) = where_clause {
                     if use_index && where_eq_comparison_parts(&where_clause).is_some() {
-                        let (column, value) = where_eq_comparison_parts(&where_clause).expect("comparison");
+                        let (column, value) =
+                            where_eq_comparison_parts(&where_clause).expect("comparison");
                         lines.push(format!(
                             "  -> IndexFilter(predicate=\"{} = {}\", rows={}, cost={:.2})",
                             column,
@@ -426,15 +473,28 @@ impl SqlExecutor {
                         "  -> OrderBy(column={}, direction={}, rows={}, cost={:.2})",
                         order_by.column,
                         order_direction_to_str(&order_by.direction),
-                        if has_filter { filtered_rows } else { total_rows },
-                        (if has_filter { filtered_rows } else { total_rows }) as f64 * 0.2
+                        if has_filter {
+                            filtered_rows
+                        } else {
+                            total_rows
+                        },
+                        (if has_filter {
+                            filtered_rows
+                        } else {
+                            total_rows
+                        }) as f64
+                            * 0.2
                     ));
                 }
                 if let Some(limit) = limit {
                     lines.push(format!(
                         "  -> Limit(limit={}, rows={}, cost={:.2})",
                         limit,
-                        limit.min(if has_filter { filtered_rows } else { total_rows }),
+                        limit.min(if has_filter {
+                            filtered_rows
+                        } else {
+                            total_rows
+                        }),
                         0.05
                     ));
                 }
@@ -444,11 +504,12 @@ impl SqlExecutor {
                 } else {
                     total_rows
                 };
-                let project_rows = limit.map(|value| value.min(project_rows)).unwrap_or(project_rows);
+                let project_rows = limit
+                    .map(|value| value.min(project_rows))
+                    .unwrap_or(project_rows);
                 let project_desc = match columns {
                     SelectColumns::All => "*".to_string(),
-                    SelectColumns::Named(names) => names.join(", "),
-                    SelectColumns::Aggregate(items) => items
+                    SelectColumns::Named(items) | SelectColumns::Aggregate(items) => items
                         .iter()
                         .map(render_select_item)
                         .collect::<Vec<_>>()
@@ -532,7 +593,9 @@ impl SqlExecutor {
 
     fn execute_select(
         &self,
+        distinct: bool,
         table_name: String,
+        table_alias: Option<String>,
         columns: SelectColumns,
         join: Option<JoinClause>,
         where_clause: Option<WhereExpr>,
@@ -547,9 +610,24 @@ impl SqlExecutor {
                 message: format!("table '{}' does not exist", table_name),
             });
         };
+        let columns = normalize_select_columns(columns, table_alias.as_deref(), &table_name);
+        let where_clause = where_clause
+            .map(|expr| normalize_where_expr(expr, table_alias.as_deref(), &table_name));
+        let group_by = group_by.map(|group| GroupByClause {
+            column: normalize_column_reference(group.column, table_alias.as_deref(), &table_name),
+        });
+        let having =
+            having.map(|expr| normalize_where_expr(expr, table_alias.as_deref(), &table_name));
+        let order_by = order_by.map(|order| OrderByClause {
+            column: normalize_column_reference(order.column, table_alias.as_deref(), &table_name),
+            direction: order.direction,
+        });
 
         if let Some(join_clause) = join {
-            if matches!(columns, SelectColumns::Aggregate(_)) || group_by.is_some() || having.is_some() {
+            if matches!(columns, SelectColumns::Aggregate(_))
+                || group_by.is_some()
+                || having.is_some()
+            {
                 return Ok(ExecuteResult::Error {
                     message: "JOIN with aggregate queries is not implemented yet".to_string(),
                 });
@@ -557,6 +635,7 @@ impl SqlExecutor {
             return self.execute_join_select(
                 &txn,
                 &schema,
+                distinct,
                 columns,
                 join_clause,
                 where_clause,
@@ -569,6 +648,7 @@ impl SqlExecutor {
             return self.execute_aggregate_select(
                 &txn,
                 &schema,
+                distinct,
                 columns,
                 where_clause,
                 group_by,
@@ -583,31 +663,40 @@ impl SqlExecutor {
             Err(message) => return Ok(ExecuteResult::Error { message }),
         };
 
-        let mut rows: Vec<Row> = self
+        let rows: Vec<Row> = self
             .fetch_rows_for_select(&txn, &schema, where_clause.as_ref())?
             .into_iter()
             .map(|(_, row)| row)
             .collect();
-        if let Some(order_by) = order_by.as_ref() {
-            if let Err(message) = sort_rows_by_order(&mut rows, order_by) {
-                return Ok(ExecuteResult::Error { message });
-            }
-        }
-        if let Some(limit) = limit {
-            rows.truncate(limit);
-        }
-        let selected = rows
+        let output_columns = projection
+            .iter()
+            .map(|item| item.header.clone())
+            .collect::<Vec<_>>();
+        let mut selected = rows
             .into_iter()
             .map(|row| {
                 projection
                     .iter()
-                    .map(|column| row.get(column).cloned().unwrap_or(Value::Null))
+                    .map(|column| row.get(&column.lookup).cloned().unwrap_or(Value::Null))
                     .collect::<Vec<_>>()
             })
-            .collect();
+            .collect::<Vec<_>>();
+        if distinct {
+            dedup_selected_rows(&mut selected);
+        }
+        if let Some(order_by) = order_by.as_ref() {
+            if let Err(message) =
+                sort_result_rows_by_order(&mut selected, &output_columns, order_by)
+            {
+                return Ok(ExecuteResult::Error { message });
+            }
+        }
+        if let Some(limit) = limit {
+            selected.truncate(limit);
+        }
 
         Ok(ExecuteResult::Selected {
-            columns: projection,
+            columns: output_columns,
             rows: selected,
         })
     }
@@ -617,6 +706,7 @@ impl SqlExecutor {
         &self,
         txn: &Transaction,
         schema: &TableSchema,
+        distinct: bool,
         columns: SelectColumns,
         where_clause: Option<WhereExpr>,
         group_by: Option<GroupByClause>,
@@ -630,10 +720,11 @@ impl SqlExecutor {
             });
         };
 
-        let output_columns = match self.resolve_aggregate_projection(schema, &items, group_by.as_ref()) {
-            Ok(columns) => columns,
-            Err(message) => return Ok(ExecuteResult::Error { message }),
-        };
+        let output_columns =
+            match self.resolve_aggregate_projection(schema, &items, group_by.as_ref()) {
+                Ok(columns) => columns,
+                Err(message) => return Ok(ExecuteResult::Error { message }),
+            };
         let resolved_having = self.resolve_where_expr(having.as_ref())?;
 
         let rows: Vec<Row> = self
@@ -660,12 +751,17 @@ impl SqlExecutor {
         }
 
         if let Some(order_by) = order_by.as_ref() {
-            if let Err(message) = sort_result_rows_by_order(&mut selected, &output_columns, order_by) {
+            if let Err(message) =
+                sort_result_rows_by_order(&mut selected, &output_columns, order_by)
+            {
                 return Ok(ExecuteResult::Error { message });
             }
         }
         if let Some(limit) = limit {
             selected.truncate(limit);
+        }
+        if distinct {
+            dedup_selected_rows(&mut selected);
         }
 
         Ok(ExecuteResult::Selected {
@@ -679,6 +775,7 @@ impl SqlExecutor {
         &self,
         txn: &Transaction,
         left_schema: &TableSchema,
+        distinct: bool,
         columns: SelectColumns,
         join: JoinClause,
         where_clause: Option<WhereExpr>,
@@ -701,7 +798,9 @@ impl SqlExecutor {
 
         let mut matched_rows = Vec::new();
         for (_, left_row) in &left_rows {
-            let Some(left_value) = resolve_join_value(left_row, &left_schema.table_name, &join.left_column) else {
+            let Some(left_value) =
+                resolve_join_value(left_row, &left_schema.table_name, &join.left_column)
+            else {
                 return Ok(ExecuteResult::Error {
                     message: format!("unknown join column '{}'", join.left_column),
                 });
@@ -748,18 +847,21 @@ impl SqlExecutor {
         for joined in matched_rows {
             let mut row = Vec::with_capacity(projection.len());
             for column in &projection {
-                let Some(value) = joined.get(column) else {
+                let Some(value) = joined.get(&column.lookup) else {
                     return Ok(ExecuteResult::Error {
-                        message: format!("unknown column '{}'", column),
+                        message: format!("unknown column '{}'", column.lookup),
                     });
                 };
                 row.push(value.clone());
             }
             selected.push(row);
         }
+        if distinct {
+            dedup_selected_rows(&mut selected);
+        }
 
         Ok(ExecuteResult::Selected {
-            columns: projection,
+            columns: projection.into_iter().map(|item| item.header).collect(),
             rows: selected,
         })
     }
@@ -788,7 +890,11 @@ impl SqlExecutor {
         }
 
         for assignment in &assignments {
-            if !schema.columns.iter().any(|column| column.name == assignment.column) {
+            if !schema
+                .columns
+                .iter()
+                .any(|column| column.name == assignment.column)
+            {
                 return Ok(ExecuteResult::Error {
                     message: format!("unknown column '{}'", assignment.column),
                 });
@@ -888,18 +994,37 @@ impl SqlExecutor {
         &self,
         schema: &TableSchema,
         columns: &SelectColumns,
-    ) -> std::result::Result<Vec<String>, String> {
+    ) -> std::result::Result<Vec<ProjectionColumn>, String> {
         match columns {
-            SelectColumns::All => Ok(schema.columns.iter().map(|column| column.name.clone()).collect()),
-            SelectColumns::Named(names) => {
-                for name in names {
-                    if !schema.columns.iter().any(|column| &column.name == name) {
+            SelectColumns::All => Ok(schema
+                .columns
+                .iter()
+                .map(|column| ProjectionColumn {
+                    lookup: column.name.clone(),
+                    header: column.name.clone(),
+                })
+                .collect()),
+            SelectColumns::Named(items) => {
+                let mut projection = Vec::with_capacity(items.len());
+                for item in items {
+                    let SelectItem::Column { name, alias } = item else {
+                        return Err(
+                            "aggregate columns require aggregate execution path".to_string()
+                        );
+                    };
+                    if !schema.columns.iter().any(|column| column.name == *name) {
                         return Err(format!("unknown column '{}'", name));
                     }
+                    projection.push(ProjectionColumn {
+                        lookup: name.clone(),
+                        header: alias.clone().unwrap_or_else(|| name.clone()),
+                    });
                 }
-                Ok(names.clone())
+                Ok(projection)
             }
-            SelectColumns::Aggregate(_) => Err("aggregate columns require aggregate execution path".to_string()),
+            SelectColumns::Aggregate(_) => {
+                Err("aggregate columns require aggregate execution path".to_string())
+            }
         }
     }
 
@@ -912,7 +1037,7 @@ impl SqlExecutor {
         let mut columns = Vec::with_capacity(items.len());
         for item in items {
             match item {
-                SelectItem::Column(name) => {
+                SelectItem::Column { name, alias } => {
                     if !schema.columns.iter().any(|column| &column.name == name) {
                         return Err(format!("unknown column '{}'", name));
                     }
@@ -922,15 +1047,19 @@ impl SqlExecutor {
                             name
                         ));
                     }
-                    columns.push(name.clone());
+                    columns.push(alias.clone().unwrap_or_else(|| name.clone()));
                 }
-                SelectItem::Aggregate { func, column } => {
+                SelectItem::Aggregate {
+                    func,
+                    column,
+                    alias,
+                } => {
                     if let Some(column_name) = column {
                         if !schema.columns.iter().any(|col| &col.name == column_name) {
                             return Err(format!("unknown column '{}'", column_name));
                         }
                     }
-                    columns.push(render_select_item(item));
+                    columns.push(alias.clone().unwrap_or_else(|| render_select_item(item)));
                     if matches!(func, AggregateFunc::Count) {
                         continue;
                     }
@@ -967,23 +1096,23 @@ impl SqlExecutor {
         where_clause: Option<&WhereExpr>,
     ) -> Result<Vec<(Vec<u8>, Row)>> {
         let resolved_where = self.resolve_where_expr(where_clause)?;
-        if let Some((column, value)) = self
-            .index_manager
-            .find_indexable_comparison(txn, &schema.table_name, where_clause)?
+        if let Some((column, value)) =
+            self.index_manager
+                .find_indexable_comparison(txn, &schema.table_name, where_clause)?
         {
             let pks = self
                 .index_manager
                 .lookup(txn, &schema.table_name, column, value)?;
-                let mut rows = Vec::new();
-                for pk in pks {
-                    let row_key = encode_row_key(&schema.table_name, &pk);
-                    if let Some(raw) = txn.get(&row_key)? {
-                        let row: Row = serde_json::from_slice(&raw)?;
-                        if eval_where_expr(&row, resolved_where.as_ref()) {
-                            rows.push((row_key, row));
-                        }
+            let mut rows = Vec::new();
+            for pk in pks {
+                let row_key = encode_row_key(&schema.table_name, &pk);
+                if let Some(raw) = txn.get(&row_key)? {
+                    let row: Row = serde_json::from_slice(&raw)?;
+                    if eval_where_expr(&row, resolved_where.as_ref()) {
+                        rows.push((row_key, row));
                     }
                 }
+            }
             return Ok(rows);
         }
 
@@ -1029,6 +1158,19 @@ impl SqlExecutor {
                 operator: operator.clone(),
                 value: value.clone(),
             }),
+            WhereExpr::Between { column, low, high } => Ok(ResolvedWhereExpr::Between {
+                column: column.clone(),
+                low: low.clone(),
+                high: high.clone(),
+            }),
+            WhereExpr::Like { column, pattern } => Ok(ResolvedWhereExpr::Like {
+                column: column.clone(),
+                pattern: pattern.clone(),
+            }),
+            WhereExpr::IsNull { column, negated } => Ok(ResolvedWhereExpr::IsNull {
+                column: column.clone(),
+                negated: *negated,
+            }),
             WhereExpr::InSubquery { column, subquery } => {
                 let result = self.execute((**subquery).clone())?;
                 let ExecuteResult::Selected { rows, .. } = result else {
@@ -1057,9 +1199,9 @@ impl SqlExecutor {
                 Box::new(self.resolve_where_expr_inner(left)?),
                 Box::new(self.resolve_where_expr_inner(right)?),
             )),
-            WhereExpr::Not(expr) => {
-                Ok(ResolvedWhereExpr::Not(Box::new(self.resolve_where_expr_inner(expr)?)))
-            }
+            WhereExpr::Not(expr) => Ok(ResolvedWhereExpr::Not(Box::new(
+                self.resolve_where_expr_inner(expr)?,
+            ))),
         }
     }
 
@@ -1068,29 +1210,53 @@ impl SqlExecutor {
         left_schema: &TableSchema,
         right_schema: &TableSchema,
         columns: &SelectColumns,
-    ) -> std::result::Result<Vec<String>, String> {
+    ) -> std::result::Result<Vec<ProjectionColumn>, String> {
         let all_columns = join_output_columns(left_schema, right_schema);
         match columns {
-            SelectColumns::All => Ok(all_columns),
-            SelectColumns::Named(names) => {
-                for name in names {
+            SelectColumns::All => Ok(all_columns
+                .into_iter()
+                .map(|column| ProjectionColumn {
+                    lookup: column.clone(),
+                    header: column,
+                })
+                .collect()),
+            SelectColumns::Named(items) => {
+                let mut projection = Vec::with_capacity(items.len());
+                for item in items {
+                    let SelectItem::Column { name, alias } = item else {
+                        return Err(
+                            "aggregate projection is not supported for JOIN queries".to_string()
+                        );
+                    };
                     if !all_columns.iter().any(|column| column == name) {
                         let left_matches = left_schema
                             .columns
                             .iter()
-                            .filter(|column| column.name == *name)
+                            .filter(|column| {
+                                column.name == *name
+                                    || format!("{}.{}", left_schema.table_name, column.name)
+                                        == *name
+                            })
                             .count();
                         let right_matches = right_schema
                             .columns
                             .iter()
-                            .filter(|column| column.name == *name)
+                            .filter(|column| {
+                                column.name == *name
+                                    || format!("{}.{}", right_schema.table_name, column.name)
+                                        == *name
+                            })
                             .count();
                         if left_matches + right_matches != 1 {
                             return Err(format!("unknown or ambiguous column '{}'", name));
                         }
                     }
+                    projection.push(ProjectionColumn {
+                        lookup: name.clone(),
+                        header: alias.clone().unwrap_or_else(|| name.clone()),
+                    });
                 }
-                Ok(names.clone())
+                Ok(projection)
             }
             SelectColumns::Aggregate(_) => {
                 Err("aggregate projection is not supported for JOIN queries".to_string())
@@ -1176,6 +1342,19 @@ enum ResolvedWhereExpr {
         operator: Operator,
         value: Value,
     },
+    Between {
+        column: String,
+        low: Value,
+        high: Value,
+    },
+    Like {
+        column: String,
+        pattern: String,
+    },
+    IsNull {
+        column: String,
+        negated: bool,
+    },
     InValues {
         column: String,
         values: Vec<Value>,
@@ -1187,6 +1366,12 @@ enum ResolvedWhereExpr {
 
 trait ValueLookup {
     fn lookup(&self, column: &str) -> Option<&Value>;
+}
+
+#[derive(Debug, Clone)]
+struct ProjectionColumn {
+    lookup: String,
+    header: String,
 }
 
 fn where_eq_comparison_parts(where_clause: &WhereExpr) -> Option<(&str, &Value)> {
@@ -1212,6 +1397,24 @@ fn render_where_expr(where_clause: &WhereExpr) -> String {
             operator_to_str(operator),
             render_value(value)
         ),
+        WhereExpr::Between { column, low, high } => {
+            format!(
+                "{} BETWEEN {} AND {}",
+                column,
+                render_value(low),
+                render_value(high)
+            )
+        }
+        WhereExpr::Like { column, pattern } => {
+            format!("{} LIKE {}", column, pattern)
+        }
+        WhereExpr::IsNull { column, negated } => {
+            if *negated {
+                format!("{} IS NOT NULL", column)
+            } else {
+                format!("{} IS NULL", column)
+            }
+        }
         WhereExpr::InSubquery { column, .. } => {
             format!("{} IN (subquery)", column)
         }
@@ -1229,6 +1432,122 @@ fn render_where_expr(where_clause: &WhereExpr) -> String {
     }
 }
 
+fn normalize_select_columns(
+    columns: SelectColumns,
+    table_alias: Option<&str>,
+    table_name: &str,
+) -> SelectColumns {
+    match columns {
+        SelectColumns::All => SelectColumns::All,
+        SelectColumns::Named(items) => SelectColumns::Named(
+            items
+                .into_iter()
+                .map(|item| normalize_select_item(item, table_alias, table_name))
+                .collect(),
+        ),
+        SelectColumns::Aggregate(items) => SelectColumns::Aggregate(
+            items
+                .into_iter()
+                .map(|item| normalize_select_item(item, table_alias, table_name))
+                .collect(),
+        ),
+    }
+}
+
+fn normalize_select_item(
+    item: SelectItem,
+    table_alias: Option<&str>,
+    table_name: &str,
+) -> SelectItem {
+    match item {
+        SelectItem::Column { name, alias } => SelectItem::Column {
+            name: normalize_column_reference(name, table_alias, table_name),
+            alias,
+        },
+        SelectItem::Aggregate {
+            func,
+            column,
+            alias,
+        } => SelectItem::Aggregate {
+            func,
+            column: column
+                .map(|column| normalize_column_reference(column, table_alias, table_name)),
+            alias,
+        },
+    }
+}
+
+fn normalize_where_expr(expr: WhereExpr, table_alias: Option<&str>, table_name: &str) -> WhereExpr {
+    match expr {
+        WhereExpr::Comparison {
+            column,
+            operator,
+            value,
+        } => WhereExpr::Comparison {
+            column: normalize_column_reference(column, table_alias, table_name),
+            operator,
+            value,
+        },
+        WhereExpr::Between { column, low, high } => WhereExpr::Between {
+            column: normalize_column_reference(column, table_alias, table_name),
+            low,
+            high,
+        },
+        WhereExpr::Like { column, pattern } => WhereExpr::Like {
+            column: normalize_column_reference(column, table_alias, table_name),
+            pattern,
+        },
+        WhereExpr::IsNull { column, negated } => WhereExpr::IsNull {
+            column: normalize_column_reference(column, table_alias, table_name),
+            negated,
+        },
+        WhereExpr::InSubquery { column, subquery } => WhereExpr::InSubquery {
+            column: normalize_column_reference(column, table_alias, table_name),
+            subquery,
+        },
+        WhereExpr::And(left, right) => WhereExpr::And(
+            Box::new(normalize_where_expr(*left, table_alias, table_name)),
+            Box::new(normalize_where_expr(*right, table_alias, table_name)),
+        ),
+        WhereExpr::Or(left, right) => WhereExpr::Or(
+            Box::new(normalize_where_expr(*left, table_alias, table_name)),
+            Box::new(normalize_where_expr(*right, table_alias, table_name)),
+        ),
+        WhereExpr::Not(expr) => WhereExpr::Not(Box::new(normalize_where_expr(
+            *expr,
+            table_alias,
+            table_name,
+        ))),
+    }
+}
+
+fn normalize_column_reference(
+    column: String,
+    table_alias: Option<&str>,
+    table_name: &str,
+) -> String {
+    let Some(alias) = table_alias else {
+        return column;
+    };
+    let prefix = format!("{}.", alias);
+    if let Some(stripped) = column.strip_prefix(&prefix) {
+        return stripped.to_string();
+    }
+    let table_prefix = format!("{}.", table_name);
+    if let Some(stripped) = column.strip_prefix(&table_prefix) {
+        return stripped.to_string();
+    }
+    column
+}
+
+fn dedup_selected_rows(rows: &mut Vec<Vec<Value>>) {
+    let mut seen = BTreeMap::<String, ()>::new();
+    rows.retain(|row| {
+        let key = format!("{:?}", row);
+        seen.insert(key, ()).is_none()
+    });
+}
+
 // 中文註解：遞迴執行布林 WHERE/HAVING 條件，讓 Row、JOIN 結果與聚合列共用同一套邏輯。
 fn eval_where_expr<T: ValueLookup>(row: &T, where_clause: Option<&ResolvedWhereExpr>) -> bool {
     let Some(where_clause) = where_clause else {
@@ -1243,6 +1562,25 @@ fn eval_where_expr<T: ValueLookup>(row: &T, where_clause: Option<&ResolvedWhereE
         } => row
             .lookup(column)
             .is_some_and(|left| compare_values(left, value, operator.clone())),
+        ResolvedWhereExpr::Between { column, low, high } => {
+            row.lookup(column).is_some_and(|value| {
+                compare_values(value, low, Operator::Ge)
+                    && compare_values(value, high, Operator::Le)
+            })
+        }
+        ResolvedWhereExpr::Like { column, pattern } => row
+            .lookup(column)
+            .is_some_and(|value| matches_like_pattern(value, pattern)),
+        ResolvedWhereExpr::IsNull { column, negated } => {
+            let is_null = row
+                .lookup(column)
+                .is_none_or(|value| matches!(value, Value::Null));
+            if *negated {
+                !is_null
+            } else {
+                is_null
+            }
+        }
         ResolvedWhereExpr::InValues { column, values } => {
             row.lookup(column).is_some_and(|left| values.contains(left))
         }
@@ -1326,33 +1664,22 @@ fn order_direction_to_str(direction: &OrderDirection) -> &'static str {
 
 fn render_select_item(item: &SelectItem) -> String {
     match item {
-        SelectItem::Column(name) => name.clone(),
-        SelectItem::Aggregate { func, column } => match (func, column.as_deref()) {
-            (AggregateFunc::Count, None) => "COUNT(*)".to_string(),
-            (AggregateFunc::Count, Some(column)) => format!("COUNT({})", column),
-            (AggregateFunc::Sum, Some(column)) => format!("SUM({})", column),
-            (AggregateFunc::Min, Some(column)) => format!("MIN({})", column),
-            (AggregateFunc::Max, Some(column)) => format!("MAX({})", column),
-            (_, None) => "INVALID_AGGREGATE".to_string(),
-        },
+        SelectItem::Column { name, alias } => alias.clone().unwrap_or_else(|| name.clone()),
+        SelectItem::Aggregate {
+            func,
+            column,
+            alias,
+        } => alias
+            .clone()
+            .unwrap_or_else(|| match (func, column.as_deref()) {
+                (AggregateFunc::Count, None) => "COUNT(*)".to_string(),
+                (AggregateFunc::Count, Some(column)) => format!("COUNT({})", column),
+                (AggregateFunc::Sum, Some(column)) => format!("SUM({})", column),
+                (AggregateFunc::Min, Some(column)) => format!("MIN({})", column),
+                (AggregateFunc::Max, Some(column)) => format!("MAX({})", column),
+                (_, None) => "INVALID_AGGREGATE".to_string(),
+            }),
     }
-}
-
-fn sort_rows_by_order(rows: &mut [Row], order_by: &OrderByClause) -> std::result::Result<(), String> {
-    if !rows.is_empty() && rows[0].get(&order_by.column).is_none() {
-        return Err(format!("unknown column '{}'", order_by.column));
-    }
-
-    rows.sort_by(|left, right| {
-        let left_value = left.get(&order_by.column).unwrap_or(&Value::Null);
-        let right_value = right.get(&order_by.column).unwrap_or(&Value::Null);
-        let order = compare_order(left_value, right_value).unwrap_or(std::cmp::Ordering::Equal);
-        match order_by.direction {
-            OrderDirection::Asc => order,
-            OrderDirection::Desc => order.reverse(),
-        }
-    });
-    Ok(())
 }
 
 fn sort_result_rows_by_order(
@@ -1367,7 +1694,7 @@ fn sort_result_rows_by_order(
     rows.sort_by(|left, right| {
         let left_value = left.get(index).unwrap_or(&Value::Null);
         let right_value = right.get(index).unwrap_or(&Value::Null);
-        let order = compare_order(left_value, right_value).unwrap_or(std::cmp::Ordering::Equal);
+        let order = compare_sort_order(left_value, right_value);
         match order_by.direction {
             OrderDirection::Asc => order,
             OrderDirection::Desc => order.reverse(),
@@ -1387,7 +1714,7 @@ fn sort_joined_rows_by_order(
     rows.sort_by(|left, right| {
         let left_value = left.get(&order_by.column).unwrap_or(&Value::Null);
         let right_value = right.get(&order_by.column).unwrap_or(&Value::Null);
-        let order = compare_order(left_value, right_value).unwrap_or(std::cmp::Ordering::Equal);
+        let order = compare_sort_order(left_value, right_value);
         match order_by.direction {
             OrderDirection::Asc => order,
             OrderDirection::Desc => order.reverse(),
@@ -1424,10 +1751,7 @@ fn join_output_columns(left_schema: &TableSchema, right_schema: &TableSchema) ->
     columns
 }
 
-fn group_rows(
-    rows: Vec<Row>,
-    group_by: Option<&GroupByClause>,
-) -> Vec<(Option<Value>, Vec<Row>)> {
+fn group_rows(rows: Vec<Row>, group_by: Option<&GroupByClause>) -> Vec<(Option<Value>, Vec<Row>)> {
     if let Some(group_by) = group_by {
         let mut groups: BTreeMap<String, (Option<Value>, Vec<Row>)> = BTreeMap::new();
         for row in rows {
@@ -1464,12 +1788,14 @@ fn schema_with_removed_column(schema: &TableSchema, removed_column: &str) -> Tab
 
 fn evaluate_select_item(item: &SelectItem, rows: &[Row]) -> std::result::Result<Value, String> {
     match item {
-        SelectItem::Column(name) => Ok(rows
+        SelectItem::Column { name, .. } => Ok(rows
             .first()
             .and_then(|row| row.get(name))
             .cloned()
             .unwrap_or(Value::Null)),
-        SelectItem::Aggregate { func, column } => evaluate_aggregate(func, column.as_deref(), rows),
+        SelectItem::Aggregate { func, column, .. } => {
+            evaluate_aggregate(func, column.as_deref(), rows)
+        }
     }
 }
 
@@ -1479,7 +1805,17 @@ fn evaluate_aggregate(
     rows: &[Row],
 ) -> std::result::Result<Value, String> {
     match func {
-        AggregateFunc::Count => Ok(Value::Int(rows.len() as i64)),
+        // 中文註解：COUNT(*) 計入所有列，COUNT(column) 只計算非 NULL 值。
+        AggregateFunc::Count => {
+            let count = match column {
+                Some(column) => rows
+                    .iter()
+                    .filter(|row| !matches!(row.get(column).unwrap_or(&Value::Null), Value::Null))
+                    .count(),
+                None => rows.len(),
+            };
+            Ok(Value::Int(count as i64))
+        }
         AggregateFunc::Sum => {
             let Some(column) = column else {
                 return Err("SUM requires a column".to_string());
@@ -1496,6 +1832,34 @@ fn evaluate_aggregate(
         }
         AggregateFunc::Min => evaluate_min_max(column, rows, true),
         AggregateFunc::Max => evaluate_min_max(column, rows, false),
+    }
+}
+
+fn matches_like_pattern(value: &Value, pattern: &str) -> bool {
+    let Value::Text(text) = value else {
+        return false;
+    };
+
+    // 中文註解：目前 LIKE 只支援 `%foo`、`foo%`、`%foo%` 與完全相等四種簡單樣式。
+    if pattern.starts_with('%') && pattern.ends_with('%') && pattern.len() >= 2 {
+        return text.contains(&pattern[1..pattern.len() - 1]);
+    }
+    if let Some(suffix) = pattern.strip_prefix('%') {
+        return text.ends_with(suffix);
+    }
+    if let Some(prefix) = pattern.strip_suffix('%') {
+        return text.starts_with(prefix);
+    }
+    text == pattern
+}
+
+fn compare_sort_order(left: &Value, right: &Value) -> std::cmp::Ordering {
+    // 中文註解：排序時固定把 NULL 放到最後，避免 ASC/DESC 時被混進正常值前面。
+    match (left, right) {
+        (Value::Null, Value::Null) => std::cmp::Ordering::Equal,
+        (Value::Null, _) => std::cmp::Ordering::Greater,
+        (_, Value::Null) => std::cmp::Ordering::Less,
+        _ => compare_order(left, right).unwrap_or(std::cmp::Ordering::Equal),
     }
 }
 
@@ -1548,7 +1912,10 @@ impl JoinedRow {
         let mut columns = Vec::new();
         for column in &left_schema.columns {
             if let Some(value) = left_row.get(&column.name) {
-                columns.push((format!("{}.{}", left_schema.table_name, column.name), value.clone()));
+                columns.push((
+                    format!("{}.{}", left_schema.table_name, column.name),
+                    value.clone(),
+                ));
             }
         }
         for column in &right_schema.columns {
@@ -1556,7 +1923,10 @@ impl JoinedRow {
                 .and_then(|row| row.get(&column.name))
                 .cloned()
                 .unwrap_or(Value::Null);
-            columns.push((format!("{}.{}", right_schema.table_name, column.name), value));
+            columns.push((
+                format!("{}.{}", right_schema.table_name, column.name),
+                value,
+            ));
         }
         Self { columns }
     }

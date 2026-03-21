@@ -242,6 +242,12 @@ impl Parser {
     // 中文註解：解析 SELECT 主體，包含 JOIN、WHERE、GROUP BY、HAVING、ORDER BY、LIMIT。
     fn parse_select(&mut self) -> Result<Statement> {
         self.expect_keyword(Keyword::Select)?;
+        let distinct = if matches!(self.peek(), Some(Token::Keyword(Keyword::Distinct))) {
+            self.bump();
+            true
+        } else {
+            false
+        };
         let columns = if matches!(self.peek(), Some(Token::Star)) {
             self.bump();
             SelectColumns::All
@@ -261,20 +267,13 @@ impl Parser {
             if has_aggregate {
                 SelectColumns::Aggregate(items)
             } else {
-                SelectColumns::Named(
-                    items
-                        .into_iter()
-                        .map(|item| match item {
-                            SelectItem::Column(name) => name,
-                            SelectItem::Aggregate { .. } => unreachable!("aggregate filtered"),
-                        })
-                        .collect(),
-                )
+                SelectColumns::Named(items)
             }
         };
 
         self.expect_keyword(Keyword::From)?;
         let table_name = self.parse_identifier_path()?;
+        let table_alias = self.parse_optional_table_alias()?;
         let join = self.parse_optional_join()?;
         let where_clause = self.parse_optional_where()?;
         let group_by = self.parse_optional_group_by()?;
@@ -283,7 +282,9 @@ impl Parser {
         let limit = self.parse_optional_limit()?;
 
         Ok(Statement::Select {
+            distinct,
             table_name,
+            table_alias,
             columns,
             join,
             where_clause,
@@ -403,6 +404,37 @@ impl Parser {
     // 中文註解：解析最底層條件，支援 `column op value` 與 `column IN (SELECT ...)`。
     fn parse_predicate_expr(&mut self) -> Result<WhereExpr> {
         let column = self.parse_condition_column()?;
+        if matches!(self.peek(), Some(Token::Keyword(Keyword::Between))) {
+            self.bump();
+            let low = self.parse_value()?;
+            self.expect_keyword(Keyword::And)?;
+            let high = self.parse_value()?;
+            return Ok(WhereExpr::Between { column, low, high });
+        }
+        if matches!(self.peek(), Some(Token::Keyword(Keyword::Like))) {
+            self.bump();
+            let pattern = match self.parse_value()? {
+                Value::Text(pattern) => pattern,
+                other => {
+                    return Err(FerrisDbError::InvalidCommand(format!(
+                        "LIKE expects string pattern, got {:?}",
+                        other
+                    )));
+                }
+            };
+            return Ok(WhereExpr::Like { column, pattern });
+        }
+        if matches!(self.peek(), Some(Token::Keyword(Keyword::Is))) {
+            self.bump();
+            let negated = if matches!(self.peek(), Some(Token::Keyword(Keyword::Not))) {
+                self.bump();
+                true
+            } else {
+                false
+            };
+            self.expect_keyword(Keyword::Null)?;
+            return Ok(WhereExpr::IsNull { column, negated });
+        }
         if matches!(self.peek(), Some(Token::Keyword(Keyword::In))) {
             self.bump();
             self.expect_token(Token::LParen)?;
@@ -454,6 +486,7 @@ impl Parser {
 
         self.expect_keyword(Keyword::Join)?;
         let right_table = self.parse_identifier_path()?;
+        let right_alias = self.parse_optional_table_alias()?;
         self.expect_keyword(Keyword::On)?;
         let left_column = self.parse_identifier_path()?;
         self.expect_token(Token::Eq)?;
@@ -462,6 +495,7 @@ impl Parser {
         Ok(Some(JoinClause {
             join_type,
             right_table,
+            right_alias,
             left_column,
             right_column,
         }))
@@ -565,7 +599,11 @@ impl Parser {
             | Some(Token::Keyword(Keyword::Sum))
             | Some(Token::Keyword(Keyword::Min))
             | Some(Token::Keyword(Keyword::Max)) => self.parse_aggregate_item(),
-            _ => Ok(SelectItem::Column(self.parse_identifier_path()?)),
+            _ => {
+                let name = self.parse_identifier_path()?;
+                let alias = self.parse_optional_alias()?;
+                Ok(SelectItem::Column { name, alias })
+            }
         }
     }
 
@@ -598,7 +636,20 @@ impl Parser {
             ));
         }
 
-        Ok(SelectItem::Aggregate { func, column })
+        let alias = self.parse_optional_alias()?;
+        Ok(SelectItem::Aggregate {
+            func,
+            column,
+            alias,
+        })
+    }
+
+    fn parse_optional_alias(&mut self) -> Result<Option<String>> {
+        if matches!(self.peek(), Some(Token::Keyword(Keyword::As))) {
+            self.bump();
+            return Ok(Some(self.expect_ident()?));
+        }
+        Ok(None)
     }
 
     fn parse_optional_if_exists(&mut self) -> Result<bool> {
@@ -618,6 +669,15 @@ impl Parser {
         self.expect_keyword(Keyword::Not)?;
         self.expect_keyword(Keyword::Exists)?;
         Ok(true)
+    }
+
+    // 中文註解：支援 `FROM table AS t` 與 `JOIN table AS t` 的別名語法。
+    fn parse_optional_table_alias(&mut self) -> Result<Option<String>> {
+        if matches!(self.peek(), Some(Token::Keyword(Keyword::As))) {
+            self.bump();
+            return Ok(Some(self.expect_ident()?));
+        }
+        Ok(None)
     }
 
     fn expect_ident(&mut self) -> Result<String> {
@@ -675,8 +735,8 @@ impl Parser {
 // 中文註解：把聚合函式 token 重新轉回固定字串，讓 HAVING 可以用欄位名稱比對聚合結果。
 fn render_condition_item(item: &SelectItem) -> String {
     match item {
-        SelectItem::Column(name) => name.clone(),
-        SelectItem::Aggregate { func, column } => match (func, column.as_deref()) {
+        SelectItem::Column { name, .. } => name.clone(),
+        SelectItem::Aggregate { func, column, .. } => match (func, column.as_deref()) {
             (AggregateFunc::Count, None) => "COUNT(*)".to_string(),
             (AggregateFunc::Count, Some(column)) => format!("COUNT({})", column),
             (AggregateFunc::Sum, Some(column)) => format!("SUM({})", column),

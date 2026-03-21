@@ -12,10 +12,14 @@ FerrisDB is a database engine implemented from scratch in Rust, featuring LSM-Tr
 - SQL INNER JOIN with nested loop
 - SQL aggregate functions: COUNT, SUM, MIN, MAX
 - SQL GROUP BY
+- SQL DISTINCT
+- SQL AS aliases for columns, aggregates, and tables
 - SQL ORDER BY ASC/DESC
 - SQL LIMIT
 - SQL EXPLAIN with query plan
 - SQL `WHERE` with comparison operators (`=`, `!=`, `<`, `>`, `<=`, `>=`)
+- SQL `BETWEEN`, `LIKE`, `IS NULL`, `IS NOT NULL`
+- SQL NULL-aware behavior for sorting and aggregates
 - Secondary Index with `CREATE INDEX` / `DROP INDEX`
 - Index Scan optimization for equality queries
 - ALTER TABLE (`ADD COLUMN` / `DROP COLUMN`)
@@ -28,8 +32,9 @@ FerrisDB is a database engine implemented from scratch in Rust, featuring LSM-Tr
 - MANIFEST metadata management
 - Configurable via `ferrisdb.toml`
 - Built-in benchmark framework
+- Background compaction worker
 - Failure injection and stress tests
-- 113+ automated tests
+- 138+ automated tests
 
 ## Architecture
 
@@ -120,13 +125,20 @@ Representative benchmark results from the current implementation:
 
 ### KV
 
-- Sequential write: 2,215 ops/sec
-- Random read: 310 ops/sec
+- Sequential write: 2,100 ops/sec
+- Random read: 312 ops/sec
+- Mixed workload: 419 ops/sec
+- Scan: 63 ops/sec
+- Restart recovery: 11 ops/sec
+- Compaction: 5.87 ops/sec
 
 ### SQL
 
-- INSERT: 335 ops/sec
-- SELECT WHERE: 53 ops/sec
+- INSERT: 188 ops/sec
+- SELECT *: 52 ops/sec
+- SELECT WHERE: 46 ops/sec
+- UPDATE: 39 ops/sec
+- DELETE: 38 ops/sec
 
 ## Technical Highlights
 

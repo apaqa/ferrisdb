@@ -43,7 +43,9 @@ pub enum Statement {
         values: Vec<Vec<Value>>,
     },
     Select {
+        distinct: bool,
         table_name: String,
+        table_alias: Option<String>,
         columns: SelectColumns,
         join: Option<JoinClause>,
         where_clause: Option<WhereExpr>,
@@ -87,16 +89,20 @@ pub enum Value {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SelectColumns {
     All,
-    Named(Vec<String>),
+    Named(Vec<SelectItem>),
     Aggregate(Vec<SelectItem>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SelectItem {
-    Column(String),
+    Column {
+        name: String,
+        alias: Option<String>,
+    },
     Aggregate {
         func: AggregateFunc,
         column: Option<String>,
+        alias: Option<String>,
     },
 }
 
@@ -115,6 +121,19 @@ pub enum WhereExpr {
         operator: Operator,
         value: Value,
     },
+    Between {
+        column: String,
+        low: Value,
+        high: Value,
+    },
+    Like {
+        column: String,
+        pattern: String,
+    },
+    IsNull {
+        column: String,
+        negated: bool,
+    },
     InSubquery {
         column: String,
         subquery: Box<Statement>,
@@ -128,6 +147,7 @@ pub enum WhereExpr {
 pub struct JoinClause {
     pub join_type: JoinType,
     pub right_table: String,
+    pub right_alias: Option<String>,
     pub left_column: String,
     pub right_column: String,
 }

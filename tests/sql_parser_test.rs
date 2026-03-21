@@ -111,8 +111,19 @@ fn test_parse_select() {
     assert_eq!(
         stmt,
         Statement::Select {
+            distinct: false,
             table_name: "users".to_string(),
-            columns: SelectColumns::Named(vec!["name".to_string(), "age".to_string()]),
+            table_alias: None,
+            columns: SelectColumns::Named(vec![
+                SelectItem::Column {
+                    name: "name".to_string(),
+                    alias: None,
+                },
+                SelectItem::Column {
+                    name: "age".to_string(),
+                    alias: None,
+                },
+            ]),
             join: None,
             where_clause: Some(WhereExpr::Comparison {
                 column: "id".to_string(),
@@ -129,13 +140,13 @@ fn test_parse_select() {
 
 #[test]
 fn test_parse_where_and_or_not() {
-    let stmt = parse_sql(
-        "SELECT * FROM users WHERE id = 1 AND (age > 20 OR NOT active = false);",
-    );
+    let stmt = parse_sql("SELECT * FROM users WHERE id = 1 AND (age > 20 OR NOT active = false);");
     assert_eq!(
         stmt,
         Statement::Select {
+            distinct: false,
             table_name: "users".to_string(),
+            table_alias: None,
             columns: SelectColumns::All,
             join: None,
             where_clause: Some(WhereExpr::And(
@@ -225,7 +236,9 @@ fn test_case_insensitive_and_extra_whitespace() {
     assert_eq!(
         stmt,
         Statement::Select {
+            distinct: false,
             table_name: "users".to_string(),
+            table_alias: None,
             columns: SelectColumns::All,
             join: None,
             where_clause: None,
@@ -245,11 +258,14 @@ fn test_parse_select_with_inner_join() {
     assert_eq!(
         stmt,
         Statement::Select {
+            distinct: false,
             table_name: "users".to_string(),
+            table_alias: None,
             columns: SelectColumns::All,
             join: Some(JoinClause {
                 join_type: JoinType::Inner,
                 right_table: "orders".to_string(),
+                right_alias: None,
                 left_column: "users.id".to_string(),
                 right_column: "orders.user_id".to_string(),
             }),
@@ -272,11 +288,14 @@ fn test_parse_left_join() {
     assert_eq!(
         stmt,
         Statement::Select {
+            distinct: false,
             table_name: "users".to_string(),
+            table_alias: None,
             columns: SelectColumns::All,
             join: Some(JoinClause {
                 join_type: JoinType::Left,
                 right_table: "orders".to_string(),
+                right_alias: None,
                 left_column: "users.id".to_string(),
                 right_column: "orders.user_id".to_string(),
             }),
@@ -296,7 +315,9 @@ fn test_parse_explain_select() {
         stmt,
         Statement::Explain {
             statement: Box::new(Statement::Select {
+                distinct: false,
                 table_name: "users".to_string(),
+                table_alias: None,
                 columns: SelectColumns::All,
                 join: None,
                 where_clause: Some(WhereExpr::Comparison {
@@ -319,7 +340,9 @@ fn test_parse_select_with_order_by_and_limit() {
     assert_eq!(
         stmt,
         Statement::Select {
+            distinct: false,
             table_name: "users".to_string(),
+            table_alias: None,
             columns: SelectColumns::All,
             join: None,
             where_clause: Some(WhereExpr::Comparison {
@@ -346,12 +369,18 @@ fn test_parse_select_with_count_group_by_and_having() {
     assert_eq!(
         stmt,
         Statement::Select {
+            distinct: false,
             table_name: "users".to_string(),
+            table_alias: None,
             columns: SelectColumns::Aggregate(vec![
-                SelectItem::Column("age".to_string()),
+                SelectItem::Column {
+                    name: "age".to_string(),
+                    alias: None,
+                },
                 SelectItem::Aggregate {
                     func: AggregateFunc::Count,
                     column: None,
+                    alias: None,
                 },
             ]),
             join: None,
@@ -427,14 +456,21 @@ fn test_parse_create_if_not_exists_alter_drop_table_and_subquery() {
     assert_eq!(
         parse_sql("SELECT * FROM users WHERE id IN (SELECT user_id FROM orders);"),
         Statement::Select {
+            distinct: false,
             table_name: "users".to_string(),
+            table_alias: None,
             columns: SelectColumns::All,
             join: None,
             where_clause: Some(WhereExpr::InSubquery {
                 column: "id".to_string(),
                 subquery: Box::new(Statement::Select {
+                    distinct: false,
                     table_name: "orders".to_string(),
-                    columns: SelectColumns::Named(vec!["user_id".to_string()]),
+                    table_alias: None,
+                    columns: SelectColumns::Named(vec![SelectItem::Column {
+                        name: "user_id".to_string(),
+                        alias: None,
+                    }]),
                     join: None,
                     where_clause: None,
                     group_by: None,
@@ -449,6 +485,81 @@ fn test_parse_create_if_not_exists_alter_drop_table_and_subquery() {
             limit: None,
         }
     );
+}
+
+#[test]
+fn test_parse_select_distinct_and_alias() {
+    let stmt = parse_sql("SELECT DISTINCT name AS employee_name FROM employees AS e;");
+    assert_eq!(
+        stmt,
+        Statement::Select {
+            distinct: true,
+            table_name: "employees".to_string(),
+            table_alias: Some("e".to_string()),
+            columns: SelectColumns::Named(vec![SelectItem::Column {
+                name: "name".to_string(),
+                alias: Some("employee_name".to_string()),
+            }]),
+            join: None,
+            where_clause: None,
+            group_by: None,
+            having: None,
+            order_by: None,
+            limit: None,
+        }
+    );
+}
+
+#[test]
+fn test_parse_aggregate_alias_and_predicates() {
+    let stmt = parse_sql(
+        "SELECT COUNT(*) AS total FROM employees WHERE salary BETWEEN 10 AND 20 AND name LIKE 'A%' AND department IS NOT NULL;",
+    );
+    assert_eq!(
+        stmt,
+        Statement::Select {
+            distinct: false,
+            table_name: "employees".to_string(),
+            table_alias: None,
+            columns: SelectColumns::Aggregate(vec![SelectItem::Aggregate {
+                func: AggregateFunc::Count,
+                column: None,
+                alias: Some("total".to_string()),
+            }]),
+            join: None,
+            where_clause: Some(WhereExpr::And(
+                Box::new(WhereExpr::And(
+                    Box::new(WhereExpr::Between {
+                        column: "salary".to_string(),
+                        low: Value::Int(10),
+                        high: Value::Int(20),
+                    }),
+                    Box::new(WhereExpr::Like {
+                        column: "name".to_string(),
+                        pattern: "A%".to_string(),
+                    }),
+                )),
+                Box::new(WhereExpr::IsNull {
+                    column: "department".to_string(),
+                    negated: true,
+                }),
+            )),
+            group_by: None,
+            having: None,
+            order_by: None,
+            limit: None,
+        }
+    );
+}
+
+#[test]
+fn test_parse_multiple_skips_empty_statements() {
+    let statements = Parser::parse_multiple(
+        " ; SELECT DISTINCT name FROM users;;SELECT COUNT(*) AS total FROM users; ; ",
+    )
+    .expect("parse multiple");
+
+    assert_eq!(statements.len(), 2);
 }
 
 // 中文註解：測試內統一走 lexer + parser，避免每個案例重複樣板。
