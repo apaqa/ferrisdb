@@ -828,6 +828,7 @@ fn data_type_name(data_type: &DataType) -> &'static str {
         DataType::Int => "INT",
         DataType::Text => "TEXT",
         DataType::Bool => "BOOL",
+        DataType::Json => "JSON",
     }
 }
 

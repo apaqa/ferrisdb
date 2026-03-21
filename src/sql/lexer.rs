@@ -117,6 +117,7 @@ pub enum Keyword {
     Int,
     Text,
     Bool,
+    Json,
     Null,
     True,
     False,
@@ -142,6 +143,9 @@ pub enum Keyword {
     Revoke,
     Privileges,
     To,
+    Check,
+    JsonExtract,
+    JsonSet,
 }
 
 pub struct Lexer<'a> {
@@ -455,6 +459,7 @@ fn keyword_from_ident(ident: &str) -> Option<Keyword> {
         "INT" => Some(Keyword::Int),
         "TEXT" => Some(Keyword::Text),
         "BOOL" => Some(Keyword::Bool),
+        "JSON" => Some(Keyword::Json),
         "NULL" => Some(Keyword::Null),
         "TRUE" => Some(Keyword::True),
         "FALSE" => Some(Keyword::False),
@@ -480,6 +485,9 @@ fn keyword_from_ident(ident: &str) -> Option<Keyword> {
         "REVOKE" => Some(Keyword::Revoke),
         "PRIVILEGES" => Some(Keyword::Privileges),
         "TO" => Some(Keyword::To),
+        "CHECK" => Some(Keyword::Check),
+        "JSON_EXTRACT" => Some(Keyword::JsonExtract),
+        "JSON_SET" => Some(Keyword::JsonSet),
         _ => None,
     }
 }

@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 use crate::error::Result;
 use crate::transaction::mvcc::{MvccEngine, Transaction};
 
-use super::ast::{ColumnDef, ForeignKey};
+use super::ast::{CheckConstraint, ColumnDef, ForeignKey};
 
 pub const TABLE_META_PREFIX: &str = "__meta:table:";
 pub const VIEW_META_PREFIX: &str = "__meta:view:";
@@ -33,6 +33,8 @@ pub struct TableSchema {
     pub columns: Vec<ColumnDef>,
     // 中文註解：foreign_keys 會在 INSERT / UPDATE / DELETE 時供 executor 做參照完整性檢查。
     pub foreign_keys: Vec<ForeignKey>,
+    // 中文註解：check_constraints 會在 INSERT / UPDATE 時驗證資料列是否符合條件。
+    pub check_constraints: Vec<CheckConstraint>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

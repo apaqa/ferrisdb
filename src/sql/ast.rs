@@ -56,6 +56,7 @@ pub enum Statement {
         if_not_exists: bool,
         columns: Vec<ColumnDef>,
         foreign_keys: Vec<ForeignKey>,
+        check_constraints: Vec<CheckConstraint>,
     },
     AlterTableAdd {
         table_name: String,
@@ -215,6 +216,11 @@ pub struct ForeignKey {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CheckConstraint {
+    pub expr: WhereExpr,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProcedureParam {
     pub name: String,
     pub data_type: DataType,
@@ -225,6 +231,7 @@ pub enum DataType {
     Int,
     Text,
     Bool,
+    Json,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -272,6 +279,17 @@ pub enum Expr {
     Column(String),
     Placeholder(usize),
     Variable(String),
+    // 中文註解：JSON_EXTRACT 會從 JSON 字串欄位依 $.a.b 路徑取出值。
+    JsonExtract {
+        column: String,
+        path: String,
+    },
+    // 中文註解：JSON_SET 會回傳更新指定路徑後的 JSON 字串結果。
+    JsonSet {
+        column: String,
+        path: String,
+        value: Box<Expr>,
+    },
     CaseWhen {
         conditions: Vec<(WhereExpr, Expr)>,
         else_result: Option<Box<Expr>>,
@@ -330,6 +348,12 @@ pub enum WhereExpr {
     IsNull {
         column: String,
         negated: bool,
+    },
+    // 中文註解：ExprComparison 讓 WHERE / CHECK 可以比較 JSON_EXTRACT 這類函式結果。
+    ExprComparison {
+        left: Expr,
+        operator: Operator,
+        right: Expr,
     },
     InSubquery {
         column: String,

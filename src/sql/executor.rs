@@ -32,10 +32,10 @@ use crate::error::Result;
 use crate::transaction::mvcc::{MvccEngine, PreparedStatement, Transaction};
 
 use super::ast::{
-    AggregateFunc, Assignment, CTE, ColumnDef, DataType, Expr, ForeignKey, GroupByClause,
-    InsertSource, IsolationLevel, JoinClause, JoinType, Operator, OrderByClause,
-    OrderDirection, ProcedureParam, Privilege, SelectColumns, SelectItem, Statement,
-    TriggerEvent, TriggerTiming, Value, WhereExpr, WindowFunc,
+    AggregateFunc, Assignment, CTE, CheckConstraint, ColumnDef, DataType, Expr, ForeignKey,
+    GroupByClause, InsertSource, IsolationLevel, JoinClause, JoinType, Operator,
+    OrderByClause, OrderDirection, ProcedureParam, Privilege, SelectColumns, SelectItem,
+    Statement, TriggerEvent, TriggerTiming, Value, WhereExpr, WindowFunc,
 };
 use super::catalog::{Catalog, MaterializedViewDefinition, TableSchema, ViewDefinition};
 use super::index::IndexManager;
@@ -343,7 +343,14 @@ impl SqlExecutor {
                 if_not_exists,
                 columns,
                 foreign_keys,
-            } => self.execute_create_table(table_name, if_not_exists, columns, foreign_keys),
+                check_constraints,
+            } => self.execute_create_table(
+                table_name,
+                if_not_exists,
+                columns,
+                foreign_keys,
+                check_constraints,
+            ),
             Statement::AlterTableAdd { table_name, column } => {
                 self.execute_alter_table_add(table_name, column)
             }
@@ -528,6 +535,7 @@ impl SqlExecutor {
         if_not_exists: bool,
         columns: Vec<super::ast::ColumnDef>,
         foreign_keys: Vec<ForeignKey>,
+        check_constraints: Vec<CheckConstraint>,
     ) -> Result<ExecuteResult> {
         if columns.is_empty() {
             return Ok(ExecuteResult::Error {
@@ -545,7 +553,11 @@ impl SqlExecutor {
             table_name: table_name.clone(),
             columns,
             foreign_keys,
+            check_constraints,
         };
+        if let Some(message) = self.validate_check_constraints_on_create(&schema) {
+            return Ok(ExecuteResult::Error { message });
+        }
 
         if !self.catalog.create_table(&mut txn, &schema)? {
             if if_not_exists {
@@ -2317,6 +2329,12 @@ impl SqlExecutor {
             {
                 return Ok(ExecuteResult::Error { message });
             }
+            if let Some(message) = self.validate_json_columns(&schema, &row) {
+                return Ok(ExecuteResult::Error { message });
+            }
+            if let Some(message) = self.check_check_constraints(&schema, &row) {
+                return Ok(ExecuteResult::Error { message });
+            }
 
             let new_row_key = encode_row_key(&table_name, &new_pk_value);
             if new_row_key != row_key && txn.get(&new_row_key)?.is_some() {
@@ -2650,6 +2668,47 @@ impl SqlExecutor {
         Ok(None)
     }
 
+    fn validate_check_constraints_on_create(&self, schema: &TableSchema) -> Option<String> {
+        for constraint in &schema.check_constraints {
+            if let Err(message) = validate_where_expr_columns(&constraint.expr, schema) {
+                return Some(message);
+            }
+        }
+        None
+    }
+
+    fn validate_json_columns(&self, schema: &TableSchema, row: &Row) -> Option<String> {
+        for column in &schema.columns {
+            if !matches!(column.data_type, DataType::Json) {
+                continue;
+            }
+            let value = row.get(&column.name).unwrap_or(&Value::Null);
+            if matches!(value, Value::Null) {
+                continue;
+            }
+            let Value::Text(text) = value else {
+                return Some(format!("JSON column '{}' expects JSON string value", column.name));
+            };
+            if serde_json::from_str::<serde_json::Value>(text).is_err() {
+                return Some(format!("invalid JSON value for column '{}'", column.name));
+            }
+        }
+        None
+    }
+
+    fn check_check_constraints(&self, schema: &TableSchema, row: &Row) -> Option<String> {
+        for constraint in &schema.check_constraints {
+            if !eval_where_expr_unresolved(row, &constraint.expr) {
+                return Some(format!(
+                    "check constraint failed on table '{}': {}",
+                    schema.table_name,
+                    render_where_expr(&constraint.expr)
+                ));
+            }
+        }
+        None
+    }
+
     fn check_foreign_keys_for_row(
         &self,
         txn: &Transaction,
@@ -2788,6 +2847,7 @@ impl SqlExecutor {
             table_name: view_name.to_string(),
             columns: materialized_schema(view_name, columns, &rows).columns,
             foreign_keys: Vec::new(),
+            check_constraints: Vec::new(),
         };
         for (row_key, _) in self.scan_rows(txn, &schema)? {
             txn.delete(&row_key)?;
@@ -2835,7 +2895,13 @@ impl SqlExecutor {
                     .zip(row_values.into_iter())
                     .collect(),
             );
+            if let Some(message) = self.validate_json_columns(schema, &row) {
+                return Ok(Err(message));
+            }
             if let Some(message) = self.check_foreign_keys_for_row(txn, schema, &row)? {
+                return Ok(Err(message));
+            }
+            if let Some(message) = self.check_check_constraints(schema, &row) {
                 return Ok(Err(message));
             }
             txn.put(
@@ -2964,6 +3030,15 @@ impl SqlExecutor {
             WhereExpr::IsNull { column, negated } => Ok(ResolvedWhereExpr::IsNull {
                 column: column.clone(),
                 negated: *negated,
+            }),
+            WhereExpr::ExprComparison {
+                left,
+                operator,
+                right,
+            } => Ok(ResolvedWhereExpr::ExprComparison {
+                left: left.clone(),
+                operator: operator.clone(),
+                right: right.clone(),
             }),
             WhereExpr::InSubquery { column, subquery } => {
                 let result = self.execute((**subquery).clone())?;
@@ -3184,6 +3259,11 @@ enum ResolvedWhereExpr {
         column: String,
         negated: bool,
     },
+    ExprComparison {
+        left: Expr,
+        operator: Operator,
+        right: Expr,
+    },
     InValues {
         column: String,
         values: Vec<Value>,
@@ -3249,6 +3329,16 @@ fn render_where_expr(where_clause: &WhereExpr) -> String {
                 format!("{} IS NULL", column)
             }
         }
+        WhereExpr::ExprComparison {
+            left,
+            operator,
+            right,
+        } => format!(
+            "{} {} {}",
+            render_expr(left),
+            operator_to_str(operator),
+            render_expr(right)
+        ),
         WhereExpr::InSubquery { column, .. } => {
             format!("{} IN (subquery)", column)
         }
@@ -3323,6 +3413,19 @@ fn normalize_expr(expr: Expr, table_alias: Option<&str>, table_name: &str) -> Ex
         }
         Expr::Placeholder(index) => Expr::Placeholder(index),
         Expr::Variable(name) => Expr::Variable(name),
+        Expr::JsonExtract { column, path } => Expr::JsonExtract {
+            column: normalize_column_reference(column, table_alias, table_name),
+            path,
+        },
+        Expr::JsonSet {
+            column,
+            path,
+            value,
+        } => Expr::JsonSet {
+            column: normalize_column_reference(column, table_alias, table_name),
+            path,
+            value: Box::new(normalize_expr(*value, table_alias, table_name)),
+        },
         Expr::CaseWhen {
             conditions,
             else_result,
@@ -3401,6 +3504,15 @@ fn normalize_where_expr(expr: WhereExpr, table_alias: Option<&str>, table_name: 
         WhereExpr::IsNull { column, negated } => WhereExpr::IsNull {
             column: normalize_column_reference(column, table_alias, table_name),
             negated,
+        },
+        WhereExpr::ExprComparison {
+            left,
+            operator,
+            right,
+        } => WhereExpr::ExprComparison {
+            left: normalize_expr(left, table_alias, table_name),
+            operator,
+            right: normalize_expr(right, table_alias, table_name),
         },
         WhereExpr::InSubquery { column, subquery } => WhereExpr::InSubquery {
             column: normalize_column_reference(column, table_alias, table_name),
@@ -3869,6 +3981,19 @@ fn bind_expr_variables(expr: &Expr, variables: &HashMap<String, Value>) -> Resul
         Expr::Column(column) => Expr::Column(column.clone()),
         Expr::Placeholder(index) => Expr::Placeholder(*index),
         Expr::Variable(name) => Expr::Value(resolve_named_variable(name, variables)?),
+        Expr::JsonExtract { column, path } => Expr::JsonExtract {
+            column: column.clone(),
+            path: path.clone(),
+        },
+        Expr::JsonSet {
+            column,
+            path,
+            value,
+        } => Expr::JsonSet {
+            column: column.clone(),
+            path: path.clone(),
+            value: Box::new(bind_expr_variables(value, variables)?),
+        },
         Expr::CaseWhen {
             conditions,
             else_result,
@@ -3946,6 +4071,15 @@ fn bind_where_expr_variables(
             column: column.clone(),
             negated: *negated,
         },
+        WhereExpr::ExprComparison {
+            left,
+            operator,
+            right,
+        } => WhereExpr::ExprComparison {
+            left: bind_expr_variables(left, variables)?,
+            operator: operator.clone(),
+            right: bind_expr_variables(right, variables)?,
+        },
         WhereExpr::InSubquery { column, subquery } => WhereExpr::InSubquery {
             column: column.clone(),
             subquery: Box::new(bind_statement_variables(subquery, variables)?),
@@ -4021,6 +4155,19 @@ fn substitute_expr(expr: &Expr, params: &HashMap<usize, Value>) -> Result<Expr> 
         Expr::Column(column) => Expr::Column(column.clone()),
         Expr::Placeholder(index) => Expr::Value(resolve_placeholder(*index, params)?),
         Expr::Variable(name) => Expr::Variable(name.clone()),
+        Expr::JsonExtract { column, path } => Expr::JsonExtract {
+            column: column.clone(),
+            path: path.clone(),
+        },
+        Expr::JsonSet {
+            column,
+            path,
+            value,
+        } => Expr::JsonSet {
+            column: column.clone(),
+            path: path.clone(),
+            value: Box::new(substitute_expr(value, params)?),
+        },
         Expr::CaseWhen {
             conditions,
             else_result,
@@ -4095,6 +4242,15 @@ fn substitute_where_expr(expr: &WhereExpr, params: &HashMap<usize, Value>) -> Re
             column: column.clone(),
             negated: *negated,
         },
+        WhereExpr::ExprComparison {
+            left,
+            operator,
+            right,
+        } => WhereExpr::ExprComparison {
+            left: substitute_expr(left, params)?,
+            operator: operator.clone(),
+            right: substitute_expr(right, params)?,
+        },
         WhereExpr::InSubquery { column, subquery } => WhereExpr::InSubquery {
             column: column.clone(),
             subquery: Box::new(substitute_statement_placeholders(subquery, params)?),
@@ -4134,6 +4290,7 @@ fn materialized_schema(table_name: &str, columns: &[String], rows: &[Vec<Value>]
             })
             .collect(),
         foreign_keys: Vec::new(),
+        check_constraints: Vec::new(),
     }
 }
 
@@ -4164,6 +4321,11 @@ fn validate_expr_columns(expr: &Expr, schema: &TableSchema) -> std::result::Resu
             } else {
                 Err(format!("unknown column '{}'", column))
             }
+        }
+        Expr::JsonExtract { column, .. } => validate_expr_columns(&Expr::Column(column.clone()), schema),
+        Expr::JsonSet { column, value, .. } => {
+            validate_expr_columns(&Expr::Column(column.clone()), schema)?;
+            validate_expr_columns(value, schema)
         }
         Expr::CaseWhen {
             conditions,
@@ -4211,6 +4373,10 @@ fn validate_where_expr_columns(
         | WhereExpr::InSubquery { column, .. } => {
             validate_expr_columns(&Expr::Column(column.clone()), schema)
         }
+        WhereExpr::ExprComparison { left, right, .. } => {
+            validate_expr_columns(left, schema)?;
+            validate_expr_columns(right, schema)
+        }
         WhereExpr::ColumnComparison { left, right, .. } => {
             validate_expr_columns(&Expr::Column(left.clone()), schema)?;
             validate_expr_columns(&Expr::Column(right.clone()), schema)
@@ -4229,6 +4395,12 @@ fn render_expr(expr: &Expr) -> String {
         Expr::Column(column) => column.clone(),
         Expr::Placeholder(index) => format!("${}", index),
         Expr::Variable(name) => name.clone(),
+        Expr::JsonExtract { column, path } => {
+            format!("JSON_EXTRACT({}, '{}')", column, path)
+        }
+        Expr::JsonSet { column, path, value } => {
+            format!("JSON_SET({}, '{}', {})", column, path, render_expr(value))
+        }
         Expr::CaseWhen {
             conditions,
             else_result,
@@ -4304,6 +4476,14 @@ fn eval_expr_on_row(row: &Row, expr: &Expr) -> Value {
         Expr::Column(column) => row.get(column).cloned().unwrap_or(Value::Null),
         Expr::Placeholder(_) => Value::Null,
         Expr::Variable(name) => row.get(name).cloned().unwrap_or(Value::Null),
+        Expr::JsonExtract { column, path } => row
+            .get(column)
+            .map(|value| json_extract_value(value, path))
+            .unwrap_or(Value::Null),
+        Expr::JsonSet { column, path, value } => row
+            .get(column)
+            .map(|current| json_set_value(current, path, &eval_expr_on_row(row, value)))
+            .unwrap_or(Value::Null),
         Expr::CaseWhen {
             conditions,
             else_result,
@@ -4320,6 +4500,63 @@ fn eval_expr_on_row(row: &Row, expr: &Expr) -> Value {
         }
         Expr::WindowFunction { .. } => Value::Null,
     }
+}
+
+fn eval_expr_lookup<T: ValueLookup>(row: &T, expr: &Expr) -> Value {
+    match expr {
+        Expr::Value(value) => value.clone(),
+        Expr::Column(column) => row.lookup(column).cloned().unwrap_or(Value::Null),
+        Expr::Placeholder(_) => Value::Null,
+        Expr::Variable(name) => row.lookup(name).cloned().unwrap_or(Value::Null),
+        Expr::JsonExtract { column, path } => row
+            .lookup(column)
+            .map(|value| json_extract_value(value, path))
+            .unwrap_or(Value::Null),
+        Expr::JsonSet { column, path, value } => row
+            .lookup(column)
+            .map(|current| json_set_value(current, path, &eval_expr_lookup(row, value)))
+            .unwrap_or(Value::Null),
+        Expr::CaseWhen {
+            conditions,
+            else_result,
+        } => {
+            for (condition, result) in conditions {
+                if eval_where_expr_unresolved(row, condition) {
+                    return eval_expr_lookup(row, result);
+                }
+            }
+            else_result
+                .as_ref()
+                .map(|result| eval_expr_lookup(row, result))
+                .unwrap_or(Value::Null)
+        }
+        Expr::WindowFunction { .. } => Value::Null,
+    }
+}
+
+fn json_extract_value(value: &Value, path: &str) -> Value {
+    let Value::Text(text) = value else {
+        return Value::Null;
+    };
+    let Ok(json) = serde_json::from_str::<serde_json::Value>(text) else {
+        return Value::Null;
+    };
+    json_path_lookup(&json, path)
+        .map(json_value_to_sql_value)
+        .unwrap_or(Value::Null)
+}
+
+fn json_set_value(value: &Value, path: &str, new_value: &Value) -> Value {
+    let Value::Text(text) = value else {
+        return Value::Null;
+    };
+    let Ok(mut json) = serde_json::from_str::<serde_json::Value>(text) else {
+        return Value::Null;
+    };
+    if !apply_json_path_set(&mut json, path, sql_value_to_json_value(new_value)) {
+        return Value::Null;
+    }
+    Value::Text(json.to_string())
 }
 
 fn eval_where_expr_unresolved<T: ValueLookup>(row: &T, expr: &WhereExpr) -> bool {
@@ -4356,6 +4593,15 @@ fn eval_where_expr_unresolved<T: ValueLookup>(row: &T, expr: &WhereExpr) -> bool
                 is_null
             }
         }
+        WhereExpr::ExprComparison {
+            left,
+            operator,
+            right,
+        } => compare_values(
+            &eval_expr_lookup(row, left),
+            &eval_expr_lookup(row, right),
+            operator.clone(),
+        ),
         WhereExpr::InSubquery { .. } => false,
         WhereExpr::And(left, right) => {
             eval_where_expr_unresolved(row, left) && eval_where_expr_unresolved(row, right)
@@ -4522,6 +4768,15 @@ fn eval_where_expr<T: ValueLookup>(row: &T, where_clause: Option<&ResolvedWhereE
                 is_null
             }
         }
+        ResolvedWhereExpr::ExprComparison {
+            left,
+            operator,
+            right,
+        } => compare_values(
+            &eval_expr_lookup(row, left),
+            &eval_expr_lookup(row, right),
+            operator.clone(),
+        ),
         ResolvedWhereExpr::InValues { column, values } => {
             row.lookup(column).is_some_and(|left| values.contains(left))
         }
@@ -4544,6 +4799,11 @@ fn evaluate_runtime_expr(expr: &Expr, variables: &HashMap<String, Value>) -> Res
             "placeholder ${} is not supported in procedure runtime expression",
             index
         ))),
+        Expr::JsonExtract { .. } | Expr::JsonSet { .. } => Err(
+            crate::error::FerrisDbError::InvalidCommand(
+                "JSON functions are not supported in procedure runtime expression".to_string(),
+            ),
+        ),
         Expr::CaseWhen {
             conditions,
             else_result,
@@ -4604,6 +4864,9 @@ fn evaluate_runtime_condition(
             let is_null = matches!(variables.get(column).unwrap_or(&Value::Null), Value::Null);
             Ok(if *negated { !is_null } else { is_null })
         }
+        WhereExpr::ExprComparison { .. } => Err(crate::error::FerrisDbError::InvalidCommand(
+            "expression comparison is not supported in procedure runtime condition".to_string(),
+        )),
         WhereExpr::InSubquery { .. } => Err(crate::error::FerrisDbError::InvalidCommand(
             "IN subquery is not supported in procedure runtime condition".to_string(),
         )),
@@ -4624,6 +4887,7 @@ fn default_value_for_data_type(data_type: &DataType) -> Value {
         DataType::Int => Value::Int(0),
         DataType::Text => Value::Text(String::new()),
         DataType::Bool => Value::Bool(false),
+        DataType::Json => Value::Text("null".to_string()),
     }
 }
 
@@ -4663,6 +4927,81 @@ fn render_value(value: &Value) -> String {
         Value::Bool(v) => v.to_string(),
         Value::Null => "NULL".to_string(),
         Value::Variable(name) => name.clone(),
+    }
+}
+
+fn json_path_parts(path: &str) -> Option<Vec<&str>> {
+    let path = path.strip_prefix("$.")?;
+    if path.is_empty() {
+        return None;
+    }
+    Some(path.split('.').collect())
+}
+
+fn json_path_lookup<'a>(
+    json: &'a serde_json::Value,
+    path: &str,
+) -> Option<&'a serde_json::Value> {
+    let mut current = json;
+    for part in json_path_parts(path)? {
+        current = current.get(part)?;
+    }
+    Some(current)
+}
+
+fn apply_json_path_set(
+    json: &mut serde_json::Value,
+    path: &str,
+    new_value: serde_json::Value,
+) -> bool {
+    let Some(parts) = json_path_parts(path) else {
+        return false;
+    };
+    if !json.is_object() {
+        return false;
+    }
+
+    let mut current = json;
+    for (index, part) in parts.iter().enumerate() {
+        let is_last = index + 1 == parts.len();
+        if is_last {
+            let Some(object) = current.as_object_mut() else {
+                return false;
+            };
+            object.insert((*part).to_string(), new_value);
+            return true;
+        }
+
+        let Some(object) = current.as_object_mut() else {
+            return false;
+        };
+        current = object
+            .entry((*part).to_string())
+            .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+    }
+    false
+}
+
+fn json_value_to_sql_value(value: &serde_json::Value) -> Value {
+    match value {
+        serde_json::Value::Null => Value::Null,
+        serde_json::Value::Bool(value) => Value::Bool(*value),
+        serde_json::Value::Number(value) => value
+            .as_i64()
+            .map(Value::Int)
+            .unwrap_or_else(|| Value::Text(value.to_string())),
+        serde_json::Value::String(value) => Value::Text(value.clone()),
+        serde_json::Value::Array(_) | serde_json::Value::Object(_) => Value::Text(value.to_string()),
+    }
+}
+
+fn sql_value_to_json_value(value: &Value) -> serde_json::Value {
+    match value {
+        Value::Int(value) => serde_json::Value::Number((*value).into()),
+        Value::Text(value) => serde_json::Value::String(value.clone()),
+        Value::Bool(value) => serde_json::Value::Bool(*value),
+        Value::Null => serde_json::Value::Null,
+        Value::Variable(name) => serde_json::Value::String(name.clone()),
     }
 }
 

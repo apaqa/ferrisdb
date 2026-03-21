@@ -4,10 +4,10 @@
 use crate::error::{FerrisDbError, Result};
 
 use super::ast::{
-    AggregateFunc, Assignment, CTE, ColumnDef, DataType, Expr, ForeignKey, GroupByClause,
-    InsertSource, IsolationLevel, JoinClause, JoinType, Operator, OrderByClause,
-    OrderDirection, ProcedureParam, Privilege, SelectColumns, SelectItem, Statement,
-    TriggerEvent, TriggerTiming, Value, WhereExpr, WindowFunc,
+    AggregateFunc, Assignment, CTE, CheckConstraint, ColumnDef, DataType, Expr, ForeignKey,
+    GroupByClause, InsertSource, IsolationLevel, JoinClause, JoinType, Operator,
+    OrderByClause, OrderDirection, ProcedureParam, Privilege, SelectColumns, SelectItem,
+    Statement, TriggerEvent, TriggerTiming, Value, WhereExpr, WindowFunc,
 };
 use super::lexer::{Keyword, Token};
 
@@ -196,9 +196,12 @@ impl Parser {
 
         let mut columns = Vec::new();
         let mut foreign_keys = Vec::new();
+        let mut check_constraints = Vec::new();
         loop {
             if matches!(self.peek(), Some(Token::Keyword(Keyword::Foreign))) {
                 foreign_keys.push(self.parse_foreign_key_clause()?);
+            } else if matches!(self.peek(), Some(Token::Keyword(Keyword::Check))) {
+                check_constraints.push(self.parse_check_constraint_clause()?);
             } else {
                 let name = self.expect_ident()?;
                 let data_type = self.parse_data_type()?;
@@ -218,6 +221,7 @@ impl Parser {
             if_not_exists,
             columns,
             foreign_keys,
+            check_constraints,
         })
     }
 
@@ -238,6 +242,14 @@ impl Parser {
             ref_table,
             ref_columns,
         })
+    }
+
+    fn parse_check_constraint_clause(&mut self) -> Result<CheckConstraint> {
+        self.expect_keyword(Keyword::Check)?;
+        self.expect_token(Token::LParen)?;
+        let expr = self.parse_where_expr()?;
+        self.expect_token(Token::RParen)?;
+        Ok(CheckConstraint { expr })
     }
 
     fn parse_create_index_after_create(&mut self) -> Result<Statement> {
@@ -1001,6 +1013,22 @@ impl Parser {
     }
 
     fn parse_predicate_expr(&mut self) -> Result<WhereExpr> {
+        if matches!(
+            self.peek(),
+            Some(Token::Keyword(Keyword::JsonExtract))
+                | Some(Token::Keyword(Keyword::JsonSet))
+                | Some(Token::Keyword(Keyword::Case))
+        ) {
+            let left = self.parse_scalar_expr()?;
+            let operator = self.parse_operator()?;
+            let right = self.parse_scalar_expr()?;
+            return Ok(WhereExpr::ExprComparison {
+                left,
+                operator,
+                right,
+            });
+        }
+
         let column = self.parse_condition_column()?;
         if matches!(self.peek(), Some(Token::Keyword(Keyword::Between))) {
             self.bump();
@@ -1196,6 +1224,7 @@ impl Parser {
             Some(Token::Keyword(Keyword::Int)) => Ok(DataType::Int),
             Some(Token::Keyword(Keyword::Text)) => Ok(DataType::Text),
             Some(Token::Keyword(Keyword::Bool)) => Ok(DataType::Bool),
+            Some(Token::Keyword(Keyword::Json)) => Ok(DataType::Json),
             other => Err(FerrisDbError::InvalidCommand(format!(
                 "expected SQL data type, got {:?}",
                 other
@@ -1207,6 +1236,8 @@ impl Parser {
     fn parse_runtime_expr(&mut self) -> Result<Expr> {
         match self.peek() {
             Some(Token::Keyword(Keyword::Case)) => self.parse_case_when_expr(),
+            Some(Token::Keyword(Keyword::JsonExtract))
+            | Some(Token::Keyword(Keyword::JsonSet)) => self.parse_json_function_expr(),
             Some(Token::Ident(_)) => Ok(Expr::Variable(self.expect_ident()?)),
             Some(Token::Placeholder(index)) => {
                 let placeholder = *index;
@@ -1236,6 +1267,12 @@ impl Parser {
         match self.peek() {
             Some(Token::Keyword(Keyword::Case)) => {
                 let expr = self.parse_case_when_expr()?;
+                let alias = self.parse_optional_alias()?;
+                Ok(SelectItem::Expression { expr, alias })
+            }
+            Some(Token::Keyword(Keyword::JsonExtract))
+            | Some(Token::Keyword(Keyword::JsonSet)) => {
+                let expr = self.parse_json_function_expr()?;
                 let alias = self.parse_optional_alias()?;
                 Ok(SelectItem::Expression { expr, alias })
             }
@@ -1290,6 +1327,8 @@ impl Parser {
     fn parse_case_result_expr(&mut self) -> Result<Expr> {
         match self.peek() {
             Some(Token::Keyword(Keyword::Case)) => self.parse_case_when_expr(),
+            Some(Token::Keyword(Keyword::JsonExtract))
+            | Some(Token::Keyword(Keyword::JsonSet)) => self.parse_json_function_expr(),
             Some(Token::Ident(_)) => Ok(Expr::Column(self.parse_identifier_path()?)),
             Some(Token::Placeholder(index)) => {
                 let placeholder = *index;
@@ -1297,6 +1336,68 @@ impl Parser {
                 Ok(Expr::Placeholder(placeholder))
             }
             _ => Ok(Expr::Value(self.parse_value()?)),
+        }
+    }
+
+    fn parse_scalar_expr(&mut self) -> Result<Expr> {
+        match self.peek() {
+            Some(Token::Keyword(Keyword::Case)) => self.parse_case_when_expr(),
+            Some(Token::Keyword(Keyword::JsonExtract))
+            | Some(Token::Keyword(Keyword::JsonSet)) => self.parse_json_function_expr(),
+            Some(Token::Ident(_)) => Ok(Expr::Column(self.parse_identifier_path()?)),
+            Some(Token::Placeholder(index)) => {
+                let placeholder = *index;
+                self.bump();
+                Ok(Expr::Placeholder(placeholder))
+            }
+            _ => Ok(Expr::Value(self.parse_value()?)),
+        }
+    }
+
+    fn parse_json_function_expr(&mut self) -> Result<Expr> {
+        match self.bump() {
+            Some(Token::Keyword(Keyword::JsonExtract)) => {
+                self.expect_token(Token::LParen)?;
+                let column = self.parse_identifier_path()?;
+                self.expect_token(Token::Comma)?;
+                let path = match self.parse_value()? {
+                    Value::Text(path) => path,
+                    other => {
+                        return Err(FerrisDbError::InvalidCommand(format!(
+                            "JSON_EXTRACT expects JSON path string, got {:?}",
+                            other
+                        )));
+                    }
+                };
+                self.expect_token(Token::RParen)?;
+                Ok(Expr::JsonExtract { column, path })
+            }
+            Some(Token::Keyword(Keyword::JsonSet)) => {
+                self.expect_token(Token::LParen)?;
+                let column = self.parse_identifier_path()?;
+                self.expect_token(Token::Comma)?;
+                let path = match self.parse_value()? {
+                    Value::Text(path) => path,
+                    other => {
+                        return Err(FerrisDbError::InvalidCommand(format!(
+                            "JSON_SET expects JSON path string, got {:?}",
+                            other
+                        )));
+                    }
+                };
+                self.expect_token(Token::Comma)?;
+                let value = self.parse_scalar_expr()?;
+                self.expect_token(Token::RParen)?;
+                Ok(Expr::JsonSet {
+                    column,
+                    path,
+                    value: Box::new(value),
+                })
+            }
+            other => Err(FerrisDbError::InvalidCommand(format!(
+                "expected JSON function, got {:?}",
+                other
+            ))),
         }
     }
 
@@ -1803,6 +1904,7 @@ fn keyword_to_sql(keyword: &Keyword) -> &'static str {
         Keyword::Int => "INT",
         Keyword::Text => "TEXT",
         Keyword::Bool => "BOOL",
+        Keyword::Json => "JSON",
         Keyword::Null => "NULL",
         Keyword::True => "TRUE",
         Keyword::False => "FALSE",
@@ -1829,6 +1931,9 @@ fn keyword_to_sql(keyword: &Keyword) -> &'static str {
         Keyword::Revoke => "REVOKE",
         Keyword::Privileges => "PRIVILEGES",
         Keyword::To => "TO",
+        Keyword::Check => "CHECK",
+        Keyword::JsonExtract => "JSON_EXTRACT",
+        Keyword::JsonSet => "JSON_SET",
     }
 }
 
@@ -1926,8 +2031,9 @@ fn max_placeholder_in_columns(columns: &SelectColumns) -> usize {
 
 fn max_placeholder_in_expr(expr: &Expr) -> usize {
     match expr {
-        Expr::Value(_) | Expr::Column(_) | Expr::Variable(_) => 0,
+        Expr::Value(_) | Expr::Column(_) | Expr::Variable(_) | Expr::JsonExtract { .. } => 0,
         Expr::Placeholder(index) => *index,
+        Expr::JsonSet { value, .. } => max_placeholder_in_expr(value),
         Expr::CaseWhen {
             conditions,
             else_result,
@@ -1961,6 +2067,9 @@ fn max_placeholder_in_where(where_clause: &WhereExpr) -> usize {
         | WhereExpr::Between { .. }
         | WhereExpr::Like { .. }
         | WhereExpr::IsNull { .. } => 0,
+        WhereExpr::ExprComparison { left, right, .. } => {
+            max_placeholder_in_expr(left).max(max_placeholder_in_expr(right))
+        }
         WhereExpr::PlaceholderComparison { placeholder, .. } => *placeholder,
         WhereExpr::InSubquery { subquery, .. } => max_placeholder_in_statement(subquery),
         WhereExpr::And(left, right) | WhereExpr::Or(left, right) => {

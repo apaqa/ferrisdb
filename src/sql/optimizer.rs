@@ -402,6 +402,16 @@ fn render_where_expr(where_clause: &WhereExpr) -> String {
                 format!("{} IS NULL", column)
             }
         }
+        WhereExpr::ExprComparison {
+            left,
+            operator,
+            right,
+        } => format!(
+            "{} {} {}",
+            render_expr(left),
+            operator_to_str(operator),
+            render_expr(right)
+        ),
         WhereExpr::InSubquery { column, .. } => format!("{} IN (subquery)", column),
         WhereExpr::And(left, right) => {
             format!("({} AND {})", render_where_expr(left), render_where_expr(right))
@@ -410,6 +420,23 @@ fn render_where_expr(where_clause: &WhereExpr) -> String {
             format!("({} OR {})", render_where_expr(left), render_where_expr(right))
         }
         WhereExpr::Not(inner) => format!("(NOT {})", render_where_expr(inner)),
+    }
+}
+
+fn render_expr(expr: &super::ast::Expr) -> String {
+    match expr {
+        super::ast::Expr::Value(value) => render_value(value),
+        super::ast::Expr::Column(column) => column.clone(),
+        super::ast::Expr::Placeholder(index) => format!("${}", index),
+        super::ast::Expr::Variable(name) => name.clone(),
+        super::ast::Expr::JsonExtract { column, path } => {
+            format!("JSON_EXTRACT({}, '{}')", column, path)
+        }
+        super::ast::Expr::JsonSet { column, path, value } => {
+            format!("JSON_SET({}, '{}', {})", column, path, render_expr(value))
+        }
+        super::ast::Expr::CaseWhen { .. } => "CASE".to_string(),
+        super::ast::Expr::WindowFunction { .. } => "WINDOW".to_string(),
     }
 }
 

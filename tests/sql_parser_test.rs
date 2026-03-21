@@ -6,9 +6,9 @@
 // - parser ?臬?賜???AST
 // - WHERE 撣????EFT JOIN?AVING 蝑?瘜?行迤蝣箏遣璅?
 use ferrisdb::sql::ast::{
-    AggregateFunc, Assignment, CTE, ColumnDef, DataType, ForeignKey, GroupByClause, InsertSource,
-    IsolationLevel, JoinClause, JoinType, Operator, OrderByClause, OrderDirection,
-    ProcedureParam, SelectColumns, SelectItem, Statement, Value, WhereExpr,
+    AggregateFunc, Assignment, CTE, CheckConstraint, ColumnDef, DataType, Expr, ForeignKey,
+    GroupByClause, InsertSource, IsolationLevel, JoinClause, JoinType, Operator, OrderByClause,
+    OrderDirection, ProcedureParam, SelectColumns, SelectItem, Statement, Value, WhereExpr,
 };
 use ferrisdb::sql::lexer::{Keyword, Lexer, Token};
 use ferrisdb::sql::parser::Parser;
@@ -59,6 +59,7 @@ fn test_parse_create_table() {
                 },
             ],
             foreign_keys: vec![],
+            check_constraints: vec![],
         }
     );
 }
@@ -590,6 +591,7 @@ fn test_parse_create_if_not_exists_alter_drop_table_and_subquery() {
                 },
             ],
             foreign_keys: vec![],
+            check_constraints: vec![],
         }
     );
 
@@ -907,6 +909,117 @@ fn test_parse_create_table_with_foreign_key() {
                 ref_table: "customers".to_string(),
                 ref_columns: vec!["id".to_string()],
             }],
+            check_constraints: vec![],
+        }
+    );
+}
+
+#[test]
+fn test_parse_create_table_with_json_and_check() {
+    assert_eq!(
+        parse_sql("CREATE TABLE employees (id INT, data JSON, salary INT, CHECK (salary > 0));"),
+        Statement::CreateTable {
+            table_name: "employees".to_string(),
+            if_not_exists: false,
+            columns: vec![
+                ColumnDef {
+                    name: "id".to_string(),
+                    data_type: DataType::Int,
+                },
+                ColumnDef {
+                    name: "data".to_string(),
+                    data_type: DataType::Json,
+                },
+                ColumnDef {
+                    name: "salary".to_string(),
+                    data_type: DataType::Int,
+                },
+            ],
+            foreign_keys: vec![],
+            check_constraints: vec![CheckConstraint {
+                expr: WhereExpr::Comparison {
+                    column: "salary".to_string(),
+                    operator: Operator::Gt,
+                    value: Value::Int(0),
+                },
+            }],
+        }
+    );
+}
+
+#[test]
+fn test_parse_json_functions() {
+    assert_eq!(
+        parse_sql("SELECT JSON_EXTRACT(data, '$.profile.name') AS name FROM users;"),
+        Statement::Select {
+            ctes: vec![],
+            distinct: false,
+            table_name: "users".to_string(),
+            table_alias: None,
+            columns: SelectColumns::Named(vec![SelectItem::Expression {
+                expr: Expr::JsonExtract {
+                    column: "data".to_string(),
+                    path: "$.profile.name".to_string(),
+                },
+                alias: Some("name".to_string()),
+            }]),
+            join: None,
+            where_clause: None,
+            group_by: None,
+            having: None,
+            order_by: None,
+            limit: None,
+        }
+    );
+
+    assert_eq!(
+        parse_sql("SELECT JSON_SET(data, '$.name', 'Bob') AS updated FROM users;"),
+        Statement::Select {
+            ctes: vec![],
+            distinct: false,
+            table_name: "users".to_string(),
+            table_alias: None,
+            columns: SelectColumns::Named(vec![SelectItem::Expression {
+                expr: Expr::JsonSet {
+                    column: "data".to_string(),
+                    path: "$.name".to_string(),
+                    value: Box::new(Expr::Value(Value::Text("Bob".to_string()))),
+                },
+                alias: Some("updated".to_string()),
+            }]),
+            join: None,
+            where_clause: None,
+            group_by: None,
+            having: None,
+            order_by: None,
+            limit: None,
+        }
+    );
+}
+
+#[test]
+fn test_parse_where_json_extract_comparison() {
+    assert_eq!(
+        parse_sql("SELECT * FROM users WHERE JSON_EXTRACT(data, '$.name') = 'Alice';"),
+        Statement::Select {
+            ctes: vec![],
+            distinct: false,
+            table_name: "users".to_string(),
+            table_alias: None,
+            columns: SelectColumns::All,
+            join: None,
+            where_clause: Some(WhereExpr::ExprComparison {
+                left: Expr::JsonExtract {
+                    column: "data".to_string(),
+                    path: "$.name".to_string(),
+                },
+                operator: Operator::Eq,
+                right: Expr::Value(Value::Text("Alice".to_string())),
+            }),
+            group_by: None,
+            having: None,
+            order_by: None,
+            limit: None,
         }
     );
 }
