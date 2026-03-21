@@ -1,0 +1,732 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>FerrisDB Studio</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #0d1117;
+      --panel: #111827;
+      --panel-soft: #161b22;
+      --text: #c9d1d9;
+      --muted: #8b949e;
+      --accent: #7f77dd;
+      --ok: #3fb950;
+      --warn: #d29922;
+      --danger: #f85149;
+      --cyan: #56d4dd;
+      --shadow: 0 18px 60px rgba(0, 0, 0, 0.35);
+      --radius: 18px;
+      --mono: "Cascadia Code", "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      font-family: var(--mono);
+      background:
+        radial-gradient(circle at top left, rgba(127, 119, 221, 0.14), transparent 28%),
+        radial-gradient(circle at top right, rgba(86, 212, 221, 0.1), transparent 22%),
+        linear-gradient(180deg, #0d1117 0%, #0b1016 100%);
+      color: var(--text);
+    }
+    .shell { min-height: 100vh; display: grid; grid-template-rows: auto 1fr auto; }
+    .topbar {
+      position: sticky;
+      top: 0;
+      z-index: 10;
+      backdrop-filter: blur(12px);
+      background: rgba(13, 17, 23, 0.86);
+      border-bottom: 1px solid rgba(201, 209, 217, 0.08);
+      padding: 18px 24px 14px;
+    }
+    .topbar-row, .editor-toolbar, .section-toolbar, .footer-row, .card-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      flex-wrap: wrap;
+    }
+    .brand h1 { margin: 0; font-size: 20px; letter-spacing: 0.08em; text-transform: uppercase; }
+    .brand p { margin: 6px 0 0; color: var(--muted); font-size: 12px; }
+    .tabs { display: flex; gap: 10px; flex-wrap: wrap; }
+    .tab-btn {
+      border: 1px solid transparent;
+      background: transparent;
+      color: var(--muted);
+      border-radius: 999px;
+      padding: 10px 14px;
+      font: inherit;
+      cursor: pointer;
+      transition: all 0.18s ease;
+    }
+    .tab-btn:hover { color: var(--text); border-color: rgba(127, 119, 221, 0.35); background: rgba(127, 119, 221, 0.08); }
+    .tab-btn.active {
+      color: #fff;
+      background: linear-gradient(135deg, rgba(127, 119, 221, 0.28), rgba(127, 119, 221, 0.15));
+      border-color: rgba(159, 151, 255, 0.55);
+    }
+    main { padding: 22px 24px 20px; }
+    .tab-panel { display: none; animation: fadeUp 0.22s ease; }
+    .tab-panel.active { display: block; }
+    .card {
+      background: linear-gradient(180deg, rgba(22, 27, 34, 0.98), rgba(17, 24, 39, 0.98));
+      border: 1px solid rgba(201, 209, 217, 0.08);
+      border-radius: var(--radius);
+      box-shadow: var(--shadow);
+    }
+    .card-header { padding: 18px 20px 0; }
+    .card-header h2, .card-header h3 { margin: 0; font-size: 14px; text-transform: uppercase; letter-spacing: 0.08em; }
+    .card-body { padding: 18px 20px 20px; }
+    .stats-grid {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 14px;
+      margin-bottom: 18px;
+    }
+    .stat-card {
+      padding: 18px;
+      background: linear-gradient(180deg, rgba(17, 24, 39, 0.96), rgba(15, 23, 42, 0.96));
+      border: 1px solid rgba(201, 209, 217, 0.08);
+      border-radius: var(--radius);
+      position: relative;
+      overflow: hidden;
+    }
+    .stat-card::before {
+      content: "";
+      position: absolute;
+      inset: 0 auto 0 0;
+      width: 4px;
+      background: linear-gradient(180deg, var(--accent), transparent);
+    }
+    .stat-label { color: var(--muted); font-size: 12px; margin-bottom: 12px; }
+    .stat-value { font-size: 28px; font-weight: 700; color: #f0f6fc; }
+    .stat-meta, .toolbar-meta, .result-meta, footer { color: var(--muted); font-size: 12px; }
+    .dashboard-layout, .tables-layout, .storage-layout { display: grid; gap: 18px; }
+    .dashboard-layout, .storage-layout { grid-template-columns: 1.3fr 1fr; }
+    .system-flow, .history-list, .table-list, .sstable-list, .status-stack, .schema-grid { display: grid; gap: 10px; }
+    .flow-step {
+      display: grid;
+      grid-template-columns: 10px 1fr auto;
+      align-items: center;
+      gap: 12px;
+      padding: 12px 14px;
+      background: rgba(13, 17, 23, 0.62);
+      border: 1px solid rgba(201, 209, 217, 0.07);
+      border-radius: 14px;
+    }
+    .flow-accent { width: 10px; height: 100%; border-radius: 999px; }
+    .flow-label { color: #f0f6fc; }
+    .flow-arrow { color: var(--muted); }
+    .sql-layout, .tables-layout { display: grid; grid-template-columns: 280px minmax(0, 1fr); gap: 18px; }
+    .sql-main, .tables-main { display: grid; grid-template-rows: auto 1fr; gap: 18px; min-width: 0; }
+    .history-list, .table-list, .sstable-list { max-height: 560px; overflow: auto; padding-right: 4px; }
+    .history-item, .table-item, .sstable-item {
+      width: 100%;
+      text-align: left;
+      border: 1px solid rgba(201, 209, 217, 0.08);
+      background: rgba(13, 17, 23, 0.72);
+      border-radius: 14px;
+      color: var(--text);
+      padding: 12px 14px;
+      font: inherit;
+      cursor: pointer;
+      transition: border-color 0.18s ease, transform 0.18s ease, background 0.18s ease;
+    }
+    .history-item:hover, .table-item:hover, .sstable-item:hover {
+      transform: translateY(-1px);
+      border-color: rgba(127, 119, 221, 0.38);
+      background: rgba(24, 32, 48, 0.85);
+    }
+    .history-item small, .table-item small, .sstable-item small {
+      display: block;
+      margin-top: 6px;
+      color: var(--muted);
+      font-size: 11px;
+    }
+    .history-empty, .panel-empty { color: var(--muted); font-size: 12px; line-height: 1.8; padding: 8px 0; }
+    textarea {
+      width: 100%;
+      min-height: 240px;
+      resize: vertical;
+      border: 1px solid rgba(201, 209, 217, 0.08);
+      border-radius: 16px;
+      padding: 16px;
+      background: #0b1220;
+      color: #e6edf3;
+      font: inherit;
+      line-height: 1.6;
+      outline: none;
+    }
+    textarea:focus { border-color: rgba(159, 151, 255, 0.72); box-shadow: 0 0 0 3px rgba(127, 119, 221, 0.16); }
+    button.action-btn {
+      border: 0;
+      border-radius: 12px;
+      padding: 10px 16px;
+      font: inherit;
+      cursor: pointer;
+      color: #fff;
+      background: linear-gradient(135deg, #7f77dd, #655dd0);
+      transition: transform 0.18s ease, opacity 0.18s ease;
+    }
+    button.action-btn:hover { transform: translateY(-1px); }
+    button.action-btn.secondary {
+      background: linear-gradient(135deg, #243041, #1a2331);
+      color: var(--text);
+      border: 1px solid rgba(201, 209, 217, 0.08);
+    }
+    button.action-btn.warn { background: linear-gradient(135deg, #b7811f, #8e6317); }
+    button.action-btn:disabled { opacity: 0.6; cursor: not-allowed; transform: none; }
+    .result-box, .schema-box, .status-box {
+      min-height: 280px;
+      background: rgba(11, 18, 32, 0.85);
+      border: 1px solid rgba(201, 209, 217, 0.08);
+      border-radius: 16px;
+      padding: 16px;
+      overflow: auto;
+    }
+    .result-message {
+      padding: 12px 14px;
+      border-radius: 12px;
+      margin-bottom: 14px;
+      line-height: 1.6;
+      white-space: pre-wrap;
+    }
+    .result-message.ok { background: rgba(63, 185, 80, 0.14); color: #9be9a8; border: 1px solid rgba(63, 185, 80, 0.28); }
+    .result-message.error { background: rgba(248, 81, 73, 0.14); color: #ffb1ac; border: 1px solid rgba(248, 81, 73, 0.28); }
+    table { width: 100%; border-collapse: collapse; min-width: 560px; }
+    th, td {
+      text-align: left;
+      padding: 10px 12px;
+      border-bottom: 1px solid rgba(201, 209, 217, 0.08);
+      vertical-align: top;
+      white-space: nowrap;
+    }
+    th { position: sticky; top: 0; background: #0f1726; color: #f0f6fc; z-index: 1; }
+    .mono-block { font: inherit; white-space: pre-wrap; word-break: break-word; }
+    .status-line {
+      display: flex;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 10px 0;
+      border-bottom: 1px solid rgba(201, 209, 217, 0.07);
+      font-size: 12px;
+    }
+    .status-line:last-child { border-bottom: 0; }
+    .pill {
+      display: inline-flex;
+      align-items: center;
+      border-radius: 999px;
+      padding: 4px 8px;
+      font-size: 11px;
+      background: rgba(86, 212, 221, 0.1);
+      color: var(--cyan);
+      border: 1px solid rgba(86, 212, 221, 0.2);
+    }
+    footer { padding: 10px 24px 18px; }
+    @keyframes fadeUp { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: translateY(0); } }
+    @media (max-width: 1100px) {
+      .stats-grid, .dashboard-layout, .sql-layout, .tables-layout, .storage-layout { grid-template-columns: 1fr; }
+    }
+    @media (max-width: 720px) {
+      main, .topbar, footer { padding-left: 14px; padding-right: 14px; }
+      .stats-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .tab-btn { flex: 1 1 calc(50% - 10px); text-align: center; }
+    }
+  </style>
+</head>
+<body>
+  <div class="shell">
+    <header class="topbar">
+      <div class="topbar-row">
+        <div class="brand">
+          <h1>FerrisDB Studio v0.1.0</h1>
+          <p>Embedded browser console for FerrisDB</p>
+        </div>
+        <nav class="tabs" aria-label="Main tabs">
+          <button class="tab-btn active" data-tab="dashboard">Dashboard</button>
+          <button class="tab-btn" data-tab="sql">SQL</button>
+          <button class="tab-btn" data-tab="tables">Tables</button>
+          <button class="tab-btn" data-tab="storage">Storage</button>
+        </nav>
+      </div>
+    </header>
+    <main>
+      <section class="tab-panel active" id="tab-dashboard">
+        <div class="stats-grid">
+          <div class="stat-card"><div class="stat-label">Tables</div><div class="stat-value" id="stat-tables">0</div><div class="stat-meta" id="stat-tables-meta">catalog overview</div></div>
+          <div class="stat-card"><div class="stat-label">Total Rows</div><div class="stat-value" id="stat-rows">0</div><div class="stat-meta" id="stat-rows-meta">live table rows</div></div>
+          <div class="stat-card"><div class="stat-label">SSTables</div><div class="stat-value" id="stat-sstables">0</div><div class="stat-meta" id="stat-sstables-meta">disk segments</div></div>
+          <div class="stat-card"><div class="stat-label">WAL Size</div><div class="stat-value" id="stat-wal">0 B</div><div class="stat-meta" id="stat-wal-meta">write-ahead log</div></div>
+        </div>
+        <div class="dashboard-layout">
+          <article class="card">
+            <div class="card-header"><h2>System Flow</h2><span class="pill">Auto refresh every 5s</span></div>
+            <div class="card-body">
+              <div class="system-flow">
+                <div class="flow-step"><div class="flow-accent" style="background:#56d4dd;"></div><div class="flow-label">Client</div><div class="flow-arrow">→</div></div>
+                <div class="flow-step"><div class="flow-accent" style="background:#7f77dd;"></div><div class="flow-label">SQL</div><div class="flow-arrow">→</div></div>
+                <div class="flow-step"><div class="flow-accent" style="background:#3fb950;"></div><div class="flow-label">MVCC</div><div class="flow-arrow">→</div></div>
+                <div class="flow-step"><div class="flow-accent" style="background:#d29922;"></div><div class="flow-label">Storage</div><div class="flow-arrow">→</div></div>
+                <div class="flow-step"><div class="flow-accent" style="background:#f85149;"></div><div class="flow-label">Disk</div><div class="flow-arrow">•</div></div>
+              </div>
+            </div>
+          </article>
+          <article class="card">
+            <div class="card-header"><h2>Health Snapshot</h2><span class="pill" id="health-pill">checking</span></div>
+            <div class="card-body status-box" id="dashboard-status"><div class="panel-empty">Waiting for stats...</div></div>
+          </article>
+        </div>
+      </section>
+      <section class="tab-panel" id="tab-sql">
+        <div class="sql-layout">
+          <aside class="card">
+            <div class="card-header"><h2>Recent SQL</h2><button class="action-btn secondary" id="clear-history-btn" type="button">Clear</button></div>
+            <div class="card-body"><div class="history-list" id="sql-history"></div></div>
+          </aside>
+          <div class="sql-main">
+            <article class="card">
+              <div class="card-body">
+                <div class="editor-toolbar"><div class="toolbar-meta">Press Ctrl+Enter to run</div><button class="action-btn" id="run-sql-btn" type="button">Run</button></div>
+                <textarea id="sql-editor" spellcheck="false">SELECT * FROM employees LIMIT 10;</textarea>
+              </div>
+            </article>
+            <article class="card">
+              <div class="card-header"><h2>Result</h2><div class="result-meta" id="sql-meta">elapsed: -, rows: -</div></div>
+              <div class="card-body"><div class="result-box" id="sql-result"><div class="panel-empty">Run a query to inspect data, plans, or mutations.</div></div></div>
+            </article>
+          </div>
+        </div>
+      </section>
+      <section class="tab-panel" id="tab-tables">
+        <div class="tables-layout">
+          <aside class="card">
+            <div class="card-header"><h2>Tables</h2><button class="action-btn secondary" id="refresh-tables-btn" type="button">Refresh</button></div>
+            <div class="card-body"><div class="table-list" id="table-list"></div></div>
+          </aside>
+          <div class="tables-main">
+            <article class="card">
+              <div class="card-header"><h2 id="table-schema-title">Schema</h2><span class="pill" id="table-selected-pill">no table selected</span></div>
+              <div class="card-body"><div class="schema-box" id="table-schema-box"><div class="panel-empty">Choose a table on the left.</div></div></div>
+            </article>
+            <article class="card">
+              <div class="card-header"><h2 id="table-rows-title">Rows</h2><button class="action-btn secondary" id="refresh-selected-table-btn" type="button">Refresh</button></div>
+              <div class="card-body"><div class="result-box" id="table-rows-box"><div class="panel-empty">Rows will appear here.</div></div></div>
+            </article>
+          </div>
+        </div>
+      </section>
+      <section class="tab-panel" id="tab-storage">
+        <div class="storage-layout">
+          <article class="card">
+            <div class="card-header"><h2>SSTables</h2><button class="action-btn secondary" id="refresh-storage-btn" type="button">Refresh</button></div>
+            <div class="card-body"><div class="sstable-list" id="sstable-list"></div></div>
+          </article>
+          <div class="status-stack">
+            <article class="card">
+              <div class="card-header"><h2>Storage Status</h2></div>
+              <div class="card-body status-box" id="storage-status-box"><div class="panel-empty">Loading storage status...</div></div>
+            </article>
+            <article class="card">
+              <div class="card-header"><h2>Admin Actions</h2></div>
+              <div class="card-body">
+                <div class="section-toolbar"><button class="action-btn warn" id="flush-btn" type="button">Flush</button><button class="action-btn warn" id="compact-btn" type="button">Compact</button></div>
+                <div class="status-box" id="storage-action-box"><div class="panel-empty">Run Flush or Compact to manage on-disk state.</div></div>
+              </div>
+            </article>
+          </div>
+        </div>
+      </section>
+    </main>
+    <footer>
+      <div class="footer-row">
+        <div>connected to <span id="connection-label">localhost</span></div>
+        <div id="footer-clock">ready</div>
+      </div>
+    </footer>
+  </div>
+  <script>
+    // 中文註解：集中管理前端狀態，避免各個 tab 各自散落資料。
+    const state = { stats: null, health: null, tables: [], selectedTable: null, history: loadHistory(), refreshTimer: null };
+    const els = {
+      tabs: Array.from(document.querySelectorAll(".tab-btn")),
+      panels: Array.from(document.querySelectorAll(".tab-panel")),
+      sqlEditor: document.getElementById("sql-editor"),
+      sqlResult: document.getElementById("sql-result"),
+      sqlMeta: document.getElementById("sql-meta"),
+      sqlHistory: document.getElementById("sql-history"),
+      runSqlBtn: document.getElementById("run-sql-btn"),
+      clearHistoryBtn: document.getElementById("clear-history-btn"),
+      tableList: document.getElementById("table-list"),
+      tableSchemaBox: document.getElementById("table-schema-box"),
+      tableRowsBox: document.getElementById("table-rows-box"),
+      tableSchemaTitle: document.getElementById("table-schema-title"),
+      tableRowsTitle: document.getElementById("table-rows-title"),
+      tableSelectedPill: document.getElementById("table-selected-pill"),
+      refreshTablesBtn: document.getElementById("refresh-tables-btn"),
+      refreshSelectedTableBtn: document.getElementById("refresh-selected-table-btn"),
+      refreshStorageBtn: document.getElementById("refresh-storage-btn"),
+      sstableList: document.getElementById("sstable-list"),
+      storageStatusBox: document.getElementById("storage-status-box"),
+      storageActionBox: document.getElementById("storage-action-box"),
+      flushBtn: document.getElementById("flush-btn"),
+      compactBtn: document.getElementById("compact-btn"),
+      dashboardStatus: document.getElementById("dashboard-status"),
+      healthPill: document.getElementById("health-pill"),
+      statTables: document.getElementById("stat-tables"),
+      statRows: document.getElementById("stat-rows"),
+      statSstables: document.getElementById("stat-sstables"),
+      statWal: document.getElementById("stat-wal"),
+      statTablesMeta: document.getElementById("stat-tables-meta"),
+      statRowsMeta: document.getElementById("stat-rows-meta"),
+      statSstablesMeta: document.getElementById("stat-sstables-meta"),
+      statWalMeta: document.getElementById("stat-wal-meta"),
+      connectionLabel: document.getElementById("connection-label"),
+      footerClock: document.getElementById("footer-clock")
+    };
+
+    init();
+
+    function init() {
+      bindEvents();
+      renderHistory();
+      renderConnection();
+      switchTab("dashboard");
+      refreshDashboard();
+      refreshTables();
+      refreshStorage();
+      startAutoRefresh();
+    }
+
+    function bindEvents() {
+      els.tabs.forEach((tab) => tab.addEventListener("click", () => switchTab(tab.dataset.tab)));
+      // 中文註解：支援 Ctrl+Enter 快速執行 SQL，符合常見資料庫工具操作習慣。
+      els.sqlEditor.addEventListener("keydown", (event) => {
+        if (event.key === "Enter" && event.ctrlKey) {
+          event.preventDefault();
+          runSql();
+        }
+      });
+      els.runSqlBtn.addEventListener("click", runSql);
+      els.clearHistoryBtn.addEventListener("click", clearHistory);
+      els.refreshTablesBtn.addEventListener("click", refreshTables);
+      els.refreshSelectedTableBtn.addEventListener("click", refreshSelectedTable);
+      els.refreshStorageBtn.addEventListener("click", refreshStorage);
+      els.flushBtn.addEventListener("click", () => runAdminAction("flush"));
+      els.compactBtn.addEventListener("click", () => runAdminAction("compact"));
+    }
+
+    function switchTab(tabName) {
+      els.tabs.forEach((tab) => tab.classList.toggle("active", tab.dataset.tab === tabName));
+      els.panels.forEach((panel) => panel.classList.toggle("active", panel.id === `tab-${tabName}`));
+    }
+
+    function renderConnection() {
+      const host = window.location.hostname || "localhost";
+      const port = window.location.port || (window.location.protocol === "https:" ? "443" : "80");
+      els.connectionLabel.textContent = `localhost:${port}`;
+      els.footerClock.textContent = `${host}:${port} ready`;
+    }
+
+    function startAutoRefresh() {
+      if (state.refreshTimer) clearInterval(state.refreshTimer);
+      state.refreshTimer = setInterval(() => refreshDashboard(), 5000);
+    }
+
+    async function refreshDashboard() {
+      try {
+        const [health, stats] = await Promise.all([fetchJson("/health"), fetchJson("/stats")]);
+        state.health = health;
+        state.stats = stats;
+        renderDashboard();
+      } catch (error) {
+        renderErrorBox(els.dashboardStatus, `Dashboard refresh failed / 儀表板更新失敗\n${error.message}`);
+        els.healthPill.textContent = "degraded";
+      }
+    }
+
+    function renderDashboard() {
+      const stats = state.stats || {};
+      els.statTables.textContent = formatNumber(stats.table_count || 0);
+      els.statRows.textContent = formatNumber(stats.total_rows || 0);
+      els.statSstables.textContent = formatNumber(stats.sstable_count || 0);
+      els.statWal.textContent = formatBytes(stats.wal_size_bytes || 0);
+      els.statTablesMeta.textContent = `${formatNumber(stats.entries || 0)} raw KV entries`;
+      els.statRowsMeta.textContent = `manifest next id ${stats.next_sstable_id || 0}`;
+      els.statSstablesMeta.textContent = `bloom avg ${(stats.bloom_filter_hit_rate || 0).toFixed(2)}`;
+      els.statWalMeta.textContent = `${formatNumber(stats.wal_record_count || 0)} WAL records`;
+      const healthy = state.health && state.health.status === "ok";
+      els.healthPill.textContent = healthy ? "healthy" : "error";
+      els.healthPill.style.color = healthy ? "#9be9a8" : "#ffb1ac";
+      els.dashboardStatus.innerHTML = `
+        <div class="status-line"><span>Health</span><span>${escapeHtml((state.health && state.health.message) || "unknown")}</span></div>
+        <div class="status-line"><span>Disk Usage</span><span>${formatBytes(stats.disk_usage_bytes || 0)}</span></div>
+        <div class="status-line"><span>Manifest</span><span>${escapeHtml((stats.manifest_status || {}).summary || "unknown")}</span></div>
+        <div class="status-line"><span>Last Compaction</span><span>${formatTimestamp((stats.manifest_status || {}).last_compaction_ts)}</span></div>
+        <div class="status-line"><span>Auto Refresh</span><span>5 seconds</span></div>
+      `;
+    }
+
+    async function runSql() {
+      const sql = els.sqlEditor.value.trim();
+      if (!sql) return renderErrorBox(els.sqlResult, "Please enter SQL.");
+      setBusy(els.runSqlBtn, true, "Running...");
+      try {
+        const result = await fetchTextJson("/api/sql", sql);
+        updateHistory(sql);
+        renderSqlResult(result);
+        refreshDashboard();
+        refreshTables();
+        refreshStorage();
+      } catch (error) {
+        renderErrorBox(els.sqlResult, `SQL execution failed / SQL 執行失敗\n${error.message}`);
+        els.sqlMeta.textContent = "elapsed: -, rows: -";
+      } finally {
+        setBusy(els.runSqlBtn, false, "Run");
+      }
+    }
+
+    function renderSqlResult(result) {
+      const elapsed = Number(result.elapsed_ms || 0);
+      const rowCount = Number(result.row_count || 0);
+      els.sqlMeta.textContent = `elapsed: ${elapsed} ms, rows: ${rowCount}`;
+      if (!result.success) return renderErrorBox(els.sqlResult, result.message || "Unknown SQL error");
+      if (result.type === "select") return void (els.sqlResult.innerHTML = renderTable(result.columns || [], result.rows || []));
+      if (result.type === "explained") {
+        const plan = (((result.rows || [])[0] || [])[0]) || result.message || "";
+        els.sqlResult.innerHTML = `<div class="result-message ok">Query plan ready.</div><pre class="mono-block">${escapeHtml(String(plan))}</pre>`;
+        return;
+      }
+      let message = result.message || "Command completed.";
+      if (["inserted", "updated", "deleted"].includes(result.type)) message = `${capitalize(result.type)} ${rowCount} row(s).`;
+      els.sqlResult.innerHTML = `<div class="result-message ok">${escapeHtml(message)}</div>`;
+    }
+
+    async function refreshTables() {
+      try {
+        const data = await fetchJson("/api/tables");
+        state.tables = Array.isArray(data.tables) ? data.tables : [];
+        renderTableList();
+        if (!state.selectedTable && state.tables.length > 0) state.selectedTable = state.tables[0];
+        if (state.selectedTable && state.tables.includes(state.selectedTable)) {
+          await loadTable(state.selectedTable);
+        } else {
+          state.selectedTable = null;
+          renderNoTableSelected();
+        }
+      } catch (error) {
+        renderErrorBox(els.tableSchemaBox, `Table list failed / Table 清單取得失敗\n${error.message}`);
+        renderErrorBox(els.tableRowsBox, `Table list failed / Table 清單取得失敗\n${error.message}`);
+      }
+    }
+
+    function renderTableList() {
+      if (state.tables.length === 0) return void (els.tableList.innerHTML = `<div class="history-empty">No tables yet. Try the SQL tab.</div>`);
+      els.tableList.innerHTML = state.tables.map((table) => `
+        <button class="table-item" data-table="${escapeAttr(table)}" type="button">
+          ${escapeHtml(table)}
+          <small>${table === state.selectedTable ? "selected" : "click to inspect"}</small>
+        </button>
+      `).join("");
+      Array.from(els.tableList.querySelectorAll("[data-table]")).forEach((button) => {
+        button.addEventListener("click", () => {
+          state.selectedTable = button.dataset.table;
+          renderTableList();
+          loadTable(state.selectedTable);
+        });
+      });
+    }
+
+    async function refreshSelectedTable() {
+      if (state.selectedTable) await loadTable(state.selectedTable);
+    }
+
+    async function loadTable(tableName) {
+      try {
+        const [schema, rows] = await Promise.all([
+          fetchJson(`/api/tables/${encodeURIComponent(tableName)}/schema`),
+          fetchJson(`/api/tables/${encodeURIComponent(tableName)}/rows?limit=100`)
+        ]);
+        els.tableSchemaTitle.textContent = `Schema · ${tableName}`;
+        els.tableRowsTitle.textContent = `Rows · ${tableName}`;
+        els.tableSelectedPill.textContent = tableName;
+        els.tableSchemaBox.innerHTML = renderTable(["column", "type", "indexed"], (schema.columns || []).map((column) => [column.name, column.type, column.indexed ? "yes" : "no"]));
+        els.tableRowsBox.innerHTML = renderTable(rows.columns || [], rows.rows || []);
+      } catch (error) {
+        renderErrorBox(els.tableSchemaBox, `Schema load failed / schema 載入失敗\n${error.message}`);
+        renderErrorBox(els.tableRowsBox, `Rows load failed / rows 載入失敗\n${error.message}`);
+      }
+    }
+
+    function renderNoTableSelected() {
+      els.tableSchemaTitle.textContent = "Schema";
+      els.tableRowsTitle.textContent = "Rows";
+      els.tableSelectedPill.textContent = "no table selected";
+      els.tableSchemaBox.innerHTML = `<div class="panel-empty">Choose a table on the left.</div>`;
+      els.tableRowsBox.innerHTML = `<div class="panel-empty">Rows will appear here.</div>`;
+    }
+
+    async function refreshStorage() {
+      try {
+        const [stats, sstables] = await Promise.all([fetchJson("/stats"), fetchJson("/sstables")]);
+        state.stats = stats;
+        renderStorageStatus(stats, sstables);
+        renderSstableList(sstables.sstables || []);
+      } catch (error) {
+        renderErrorBox(els.storageStatusBox, `Storage load failed / Storage 狀態取得失敗\n${error.message}`);
+        els.sstableList.innerHTML = `<div class="result-message error">${escapeHtml(`SSTable load failed / SSTable 清單取得失敗\n${error.message}`)}</div>`;
+      }
+    }
+
+    function renderStorageStatus(stats, sstablePayload) {
+      const manifest = stats.manifest_status || {};
+      const wal = stats.wal_status || {};
+      els.storageStatusBox.innerHTML = `
+        <div class="status-line"><span>Manifest</span><span>${escapeHtml(manifest.summary || "unknown")}</span></div>
+        <div class="status-line"><span>Last Compaction</span><span>${formatTimestamp(manifest.last_compaction_ts)}</span></div>
+        <div class="status-line"><span>WAL File</span><span>${escapeHtml(wal.path || "wal.log")}</span></div>
+        <div class="status-line"><span>WAL Size</span><span>${formatBytes(wal.size_bytes || 0)}</span></div>
+        <div class="status-line"><span>WAL Records</span><span>${formatNumber(wal.record_count || 0)}</span></div>
+        <div class="status-line"><span>SSTable Count</span><span>${formatNumber((sstablePayload.sstables || []).length)}</span></div>
+      `;
+    }
+
+    function renderSstableList(items) {
+      if (!Array.isArray(items) || items.length === 0) {
+        els.sstableList.innerHTML = `<div class="panel-empty">No SSTables on disk yet.</div>`;
+        return;
+      }
+      els.sstableList.innerHTML = items.map((item) => `
+        <div class="sstable-item">
+          ${escapeHtml(item.filename || "unknown")}
+          <small>size ${formatBytes(item.size_bytes || 0)} · keys ${formatNumber(item.key_count || 0)} · bloom ${((Number(item.bloom_filter_hit_rate || 0)) / 10000).toFixed(2)}</small>
+        </div>
+      `).join("");
+    }
+
+    async function runAdminAction(action) {
+      const button = action === "flush" ? els.flushBtn : els.compactBtn;
+      setBusy(button, true, `${capitalize(action)}...`);
+      try {
+        const result = await postJson(`/api/admin/${action}`);
+        els.storageActionBox.innerHTML = `<div class="result-message ok">${escapeHtml(result.message || `${capitalize(action)} completed`)}</div>`;
+        refreshDashboard();
+        refreshStorage();
+      } catch (error) {
+        renderErrorBox(els.storageActionBox, `${capitalize(action)} failed / 管理操作失敗\n${error.message}`);
+      } finally {
+        setBusy(button, false, capitalize(action));
+      }
+    }
+
+    function renderHistory() {
+      if (state.history.length === 0) {
+        els.sqlHistory.innerHTML = `<div class="history-empty">Recent statements will appear here.</div>`;
+        return;
+      }
+      els.sqlHistory.innerHTML = state.history.map((sql, index) => `
+        <button class="history-item" data-history-index="${index}" type="button">
+          ${escapeHtml(shortenSql(sql))}
+          <small>${escapeHtml(sql)}</small>
+        </button>
+      `).join("");
+      Array.from(els.sqlHistory.querySelectorAll("[data-history-index]")).forEach((button) => {
+        button.addEventListener("click", () => {
+          els.sqlEditor.value = state.history[Number(button.dataset.historyIndex)];
+          switchTab("sql");
+          els.sqlEditor.focus();
+        });
+      });
+    }
+
+    function updateHistory(sql) {
+      state.history = [sql, ...state.history.filter((item) => item !== sql)].slice(0, 20);
+      localStorage.setItem("ferrisdb-studio-history", JSON.stringify(state.history));
+      renderHistory();
+    }
+
+    function clearHistory() {
+      state.history = [];
+      localStorage.removeItem("ferrisdb-studio-history");
+      renderHistory();
+    }
+
+    function loadHistory() {
+      try {
+        const raw = localStorage.getItem("ferrisdb-studio-history");
+        return raw ? JSON.parse(raw) : [];
+      } catch (_error) {
+        return [];
+      }
+    }
+
+    async function fetchJson(url) {
+      const response = await fetch(url, { headers: { "Accept": "application/json" } });
+      return parseResponse(response);
+    }
+
+    async function fetchTextJson(url, body) {
+      const response = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "text/plain; charset=utf-8", "Accept": "application/json" },
+        body
+      });
+      return parseResponse(response);
+    }
+
+    async function postJson(url) {
+      const response = await fetch(url, { method: "POST", headers: { "Accept": "application/json" } });
+      return parseResponse(response);
+    }
+
+    // 中文註解：統一處理 API 錯誤，讓後端 4xx/5xx 與網路錯誤都能顯示可閱讀訊息。
+    async function parseResponse(response) {
+      const contentType = response.headers.get("content-type") || "";
+      const data = contentType.includes("application/json") ? await response.json() : { message: await response.text() };
+      if (!response.ok) throw new Error(data.message || `HTTP ${response.status}`);
+      return data;
+    }
+
+    function renderTable(columns, rows) {
+      if (!Array.isArray(columns) || columns.length === 0) return `<div class="panel-empty">No columns returned.</div>`;
+      const header = columns.map((column) => `<th>${escapeHtml(String(column))}</th>`).join("");
+      const bodyRows = Array.isArray(rows) && rows.length > 0
+        ? rows.map((row) => `<tr>${row.map((cell) => `<td>${renderCell(cell)}</td>`).join("")}</tr>`).join("")
+        : `<tr>${columns.map(() => `<td><span class="panel-empty">empty</span></td>`).join("")}</tr>`;
+      return `<table><thead><tr>${header}</tr></thead><tbody>${bodyRows}</tbody></table>`;
+    }
+
+    function renderCell(value) {
+      if (value === null || value === undefined) return `<span class="panel-empty">NULL</span>`;
+      if (typeof value === "object") return `<code>${escapeHtml(JSON.stringify(value))}</code>`;
+      return escapeHtml(String(value));
+    }
+
+    function renderErrorBox(target, message) {
+      target.innerHTML = `<div class="result-message error">${escapeHtml(message)}</div>`;
+    }
+
+    function setBusy(button, busy, label) {
+      button.disabled = busy;
+      button.textContent = label;
+    }
+
+    function formatBytes(value) {
+      const bytes = Number(value || 0);
+      if (bytes < 1024) return `${bytes} B`;
+      if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+      if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+      return `${(bytes / (1024 * 1024 * 1024)).toFixed(1)} GB`;
+    }
+
+    function formatNumber(value) { return Number(value || 0).toLocaleString("en-US"); }
+    function formatTimestamp(value) { const ts = Number(value || 0); return ts ? new Date(ts * 1000).toLocaleString("en-US") : "never"; }
+    function shortenSql(sql) { const oneLine = sql.replace(/\s+/g, " ").trim(); return oneLine.length > 58 ? `${oneLine.slice(0, 58)}...` : oneLine; }
+    function capitalize(value) { return value.charAt(0).toUpperCase() + value.slice(1); }
+    function escapeHtml(value) { return String(value).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#39;"); }
+    function escapeAttr(value) { return escapeHtml(value).replace(/`/g, "&#96;"); }
+  </script>
+</body>
+</html>

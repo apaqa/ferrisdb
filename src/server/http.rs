@@ -2,12 +2,9 @@
 // server/http.rs -- HTTP Admin API
 // =============================================================================
 //
-// 這個模組不追求完整的 web framework，而是用 std::net 直接提供一個
-// 輕量的 HTTP 介面，讓前端頁面、curl、或其他腳本可以透過 HTTP 操作
-// FerrisDB。
-//
-// 目前支援：
-// - GET /
+// ?芋蝯?餈賣?摰??web framework嚗??std::net ?湔??銝??// 頛???HTTP 隞嚗??垢??url???嗡??單?臭誑?? HTTP ??
+// FerrisDB??//
+// ?桀??舀嚗?// - GET /
 // - GET /health
 // - GET /stats
 // - GET /sstables
@@ -29,9 +26,11 @@ use serde::Serialize;
 use serde_json::Value as JsonValue;
 
 use crate::error::{FerrisDbError, Result};
+use crate::server::static_assets;
 use crate::sql::ast::{DataType, Value as SqlValue};
 use crate::sql::catalog::Catalog;
 use crate::sql::executor::{ExecuteResult, SqlExecutor};
+use crate::sql::index::IndexManager;
 use crate::sql::lexer::Lexer;
 use crate::sql::parser::Parser;
 use crate::sql::row::{encode_row_prefix_end, encode_row_prefix_start, Row};
@@ -94,9 +93,9 @@ fn route_request(request: &HttpRequest, engine: &Arc<MvccEngine>) -> HttpRespons
     }
 
     match request.path.as_str() {
-        "/" => {
+        "/" | "/index.html" | "/static/index.html" => {
             if request.method == "GET" {
-                handle_homepage()
+                handle_homepage(&request.path)
             } else {
                 method_not_allowed(&request.method, &request.path)
             }
@@ -128,14 +127,14 @@ fn route_request(request: &HttpRequest, engine: &Arc<MvccEngine>) -> HttpRespons
                 method_not_allowed(&request.method, &request.path)
             }
         }
-        "/compact" => {
+        "/compact" | "/api/admin/compact" => {
             if request.method == "POST" {
                 handle_compact(engine)
             } else {
                 method_not_allowed(&request.method, &request.path)
             }
         }
-        "/flush" => {
+        "/flush" | "/api/admin/flush" => {
             if request.method == "POST" {
                 handle_flush(engine)
             } else {
@@ -183,17 +182,37 @@ fn route_request(request: &HttpRequest, engine: &Arc<MvccEngine>) -> HttpRespons
 }
 
 fn handle_stats(engine: &Arc<MvccEngine>) -> HttpResponse {
-    let entries = {
-        let txn = engine.begin_transaction();
-        match txn.scan(&[], &[0xFF]) {
-            Ok(rows) => rows.len(),
-            Err(err) => return json_error_response(500, "scan_failed", err.to_string()),
-        }
+    let txn = engine.begin_transaction();
+    let entries = match txn.scan(&[], &[0xFF]) {
+        Ok(rows) => rows.len(),
+        Err(err) => return json_error_response(500, "scan_failed", err.to_string()),
     };
+    let catalog = Catalog::new(Arc::clone(engine));
+    let tables = match catalog.list_tables(&txn) {
+        Ok(tables) => tables,
+        Err(err) => return json_error_response(500, "stats_failed", err.to_string()),
+    };
+    // 中文註解：逐表掃描 row prefix，統計 Studio 儀表板需要的總筆數。
+    let mut total_rows = 0;
+    for schema in &tables {
+        let rows = match txn.scan(
+            &encode_row_prefix_start(&schema.table_name),
+            &encode_row_prefix_end(&schema.table_name),
+        ) {
+            Ok(rows) => rows,
+            Err(err) => return json_error_response(500, "stats_failed", err.to_string()),
+        };
+        total_rows += rows.len();
+    }
 
     let inner = engine.inner.lock().expect("mvcc engine mutex poisoned");
     let disk_usage_bytes = match inner.disk_usage_bytes() {
         Ok(bytes) => bytes,
+        Err(err) => return json_error_response(500, "stats_failed", err.to_string()),
+    };
+    let manifest_state = inner.manifest_state();
+    let (wal_size_bytes, wal_record_count) = match inner.wal_info() {
+        Ok(info) => info,
         Err(err) => return json_error_response(500, "stats_failed", err.to_string()),
     };
 
@@ -202,21 +221,49 @@ fn handle_stats(engine: &Arc<MvccEngine>) -> HttpResponse {
         &StatsResponse {
             status: "ok",
             entries,
-            sstable_count: inner.manifest_state().sstable_files.len(),
+            table_count: tables.len(),
+            total_rows,
+            sstable_count: manifest_state.sstable_files.len(),
             disk_usage_bytes,
+            wal_size_bytes,
+            wal_record_count,
             bloom_filter_hit_rate: inner.bloom_filter_hit_rate(),
+            next_sstable_id: manifest_state.next_sstable_id,
+            manifest_status: ManifestStatusResponse {
+                summary: format!("{} SSTables tracked", manifest_state.sstable_files.len()),
+                last_compaction_ts: manifest_state.last_compaction_ts,
+            },
+            wal_status: WalStatusResponse {
+                path: inner.wal_path().display().to_string(),
+                size_bytes: wal_size_bytes,
+                record_count: wal_record_count,
+            },
         },
     )
 }
 
 fn handle_sstables(engine: &Arc<MvccEngine>) -> HttpResponse {
     let inner = engine.inner.lock().expect("mvcc engine mutex poisoned");
+    let manifest_state = inner.manifest_state();
+    let wal_info = match inner.wal_info() {
+        Ok(info) => info,
+        Err(err) => return json_error_response(500, "sstables_failed", err.to_string()),
+    };
     match inner.sstable_infos() {
         Ok(sstables) => json_response(
             200,
             &SstablesResponse {
                 status: "ok",
                 sstables,
+                manifest: ManifestStatusResponse {
+                    summary: format!("{} SSTables tracked", manifest_state.sstable_files.len()),
+                    last_compaction_ts: manifest_state.last_compaction_ts,
+                },
+                wal: WalStatusResponse {
+                    path: inner.wal_path().display().to_string(),
+                    size_bytes: wal_info.0,
+                    record_count: wal_info.1,
+                },
             },
         ),
         Err(err) => json_error_response(500, "sstables_failed", err.to_string()),
@@ -250,132 +297,20 @@ fn handle_flush(engine: &Arc<MvccEngine>) -> HttpResponse {
     }
 }
 
-// 中文註解：回傳一個中文化首頁，方便直接用瀏覽器打開 HTTP 服務時看到 API 說明。
-fn handle_homepage() -> HttpResponse {
-    let body = r#"<!DOCTYPE html>
-<html lang="zh-Hant">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>FerrisDB HTTP 服務</title>
-  <style>
-    :root {
-      color-scheme: light;
-      --bg: #f6f1e8;
-      --card: #fffaf2;
-      --ink: #1f2933;
-      --accent: #b85c38;
-      --line: #e4d3bf;
+// 中文註解：首頁直接回傳嵌入式 Studio 單頁應用。
+fn handle_homepage(path: &str) -> HttpResponse {
+    match static_assets::get_asset(path) {
+        Some((content_type, content)) => text_response(200, content_type, content.to_string()),
+        None => json_error_response(404, "not_found", format!("asset '{}' not found", path)),
     }
-    body {
-      margin: 0;
-      font-family: "Noto Sans TC", "Microsoft JhengHei", sans-serif;
-      background: radial-gradient(circle at top, #fff8ef, var(--bg));
-      color: var(--ink);
-    }
-    main {
-      max-width: 960px;
-      margin: 0 auto;
-      padding: 40px 20px 64px;
-    }
-    .hero, .card {
-      background: var(--card);
-      border: 1px solid var(--line);
-      border-radius: 18px;
-      box-shadow: 0 16px 40px rgba(31, 41, 51, 0.08);
-    }
-    .hero {
-      padding: 28px;
-      margin-bottom: 24px;
-    }
-    .hero h1 {
-      margin: 0 0 12px;
-      font-size: 34px;
-    }
-    .hero p {
-      margin: 0;
-      line-height: 1.7;
-    }
-    .grid {
-      display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
-      gap: 16px;
-    }
-    .card {
-      padding: 20px;
-    }
-    .card h2 {
-      margin-top: 0;
-      font-size: 20px;
-    }
-    code, pre {
-      font-family: "Consolas", "Courier New", monospace;
-    }
-    pre {
-      background: #2c2f36;
-      color: #f8f8f2;
-      padding: 16px;
-      border-radius: 12px;
-      overflow-x: auto;
-      margin: 0;
-      line-height: 1.5;
-    }
-    ul {
-      padding-left: 20px;
-      line-height: 1.8;
-    }
-    .accent {
-      color: var(--accent);
-      font-weight: 700;
-    }
-  </style>
-</head>
-<body>
-  <main>
-    <section class="hero">
-      <h1>FerrisDB HTTP 服務</h1>
-      <p>這個介面讓前端網頁、管理工具或腳本可以直接透過 <span class="accent">HTTP + SQL</span> 操作資料庫。所有 API 都支援 CORS，瀏覽器前端可直接呼叫。</p>
-    </section>
-    <section class="grid">
-      <article class="card">
-        <h2>可用 API</h2>
-        <ul>
-          <li><code>POST /api/sql</code>：送出純文字 SQL，直接執行查詢或寫入。</li>
-          <li><code>GET /api/tables</code>：列出目前所有資料表。</li>
-          <li><code>GET /api/tables/{name}/schema</code>：查看欄位名稱與型別。</li>
-          <li><code>GET /api/tables/{name}/rows?limit=100</code>：讀取前 N 筆資料。</li>
-          <li><code>GET /health</code>、<code>/stats</code>、<code>/sstables</code>：查看系統狀態。</li>
-        </ul>
-      </article>
-      <article class="card">
-        <h2>前端串接範例</h2>
-        <pre>fetch("/api/sql", {
-  method: "POST",
-  headers: { "Content-Type": "text/plain" },
-  body: "SELECT * FROM users LIMIT 10;"
-}).then((res) => res.json());</pre>
-      </article>
-      <article class="card">
-        <h2>回應格式</h2>
-        <p>SQL API 會回傳成功狀態、查詢型別、欄位、資料列、影響筆數與耗時毫秒數，方便前端直接渲染表格或顯示錯誤訊息。</p>
-      </article>
-    </section>
-  </main>
-</body>
-</html>"#
-        .to_string();
-
-    html_response(200, body)
 }
 
-// 中文註解：執行純文字 SQL，並把執行結果轉成前端容易使用的 JSON 格式。
+// 中文註解：SQL API 直接接收純文字 SQL，並回傳統一格式的 JSON。
 fn handle_sql_api(request: &HttpRequest, engine: &Arc<MvccEngine>) -> HttpResponse {
     if let Some(content_type) = request.headers.get("content-type") {
         if !content_type.starts_with("text/plain") {
-            let response = SqlApiResponse::error(
-                "request Content-Type must be text/plain".to_string(),
-                0,
-            );
+            let response =
+                SqlApiResponse::error("request Content-Type must be text/plain".to_string(), 0);
             return json_response(415, &response);
         }
     }
@@ -383,10 +318,8 @@ fn handle_sql_api(request: &HttpRequest, engine: &Arc<MvccEngine>) -> HttpRespon
     let sql = match String::from_utf8(request.body.clone()) {
         Ok(sql) => sql,
         Err(_) => {
-            let response = SqlApiResponse::error(
-                "SQL request body must be valid UTF-8 text".to_string(),
-                0,
-            );
+            let response =
+                SqlApiResponse::error("SQL request body must be valid UTF-8 text".to_string(), 0);
             return json_response(400, &response);
         }
     };
@@ -395,7 +328,7 @@ fn handle_sql_api(request: &HttpRequest, engine: &Arc<MvccEngine>) -> HttpRespon
     json_response(200, &response)
 }
 
-// 中文註解：列出目前 catalog 中所有資料表名稱，方便前端做側邊欄或下拉選單。
+// 中文註解：列出目前資料庫內所有資料表，供 Studio 左側導覽使用。
 fn handle_tables_api(engine: &Arc<MvccEngine>) -> HttpResponse {
     let catalog = Catalog::new(Arc::clone(engine));
     let txn = engine.begin_transaction();
@@ -410,26 +343,34 @@ fn handle_tables_api(engine: &Arc<MvccEngine>) -> HttpResponse {
     }
 }
 
-// 中文註解：回傳指定資料表的 schema，讓前端知道每個欄位名稱與型別。
+// 中文註解：回傳欄位型別與 index 狀態，供 Studio schema 區塊顯示。
 fn handle_table_schema_api(engine: &Arc<MvccEngine>, table_name: &str) -> HttpResponse {
     let catalog = Catalog::new(Arc::clone(engine));
+    let index_manager = IndexManager::new(Arc::clone(engine));
     let txn = engine.begin_transaction();
 
     match catalog.get_table(&txn, table_name) {
-        Ok(Some(schema)) => json_response(
-            200,
-            &TableSchemaResponse {
-                table: schema.table_name,
-                columns: schema
-                    .columns
-                    .into_iter()
-                    .map(|column| TableColumnResponse {
-                        name: column.name,
-                        column_type: data_type_name(&column.data_type).to_string(),
-                    })
-                    .collect(),
-            },
-        ),
+        Ok(Some(schema)) => {
+            let indexed_columns: Vec<String> = match index_manager.list_indexes(&txn, table_name) {
+                Ok(columns) => columns,
+                Err(err) => return json_error_response(500, "schema_failed", err.to_string()),
+            };
+            json_response(
+                200,
+                &TableSchemaResponse {
+                    table: schema.table_name,
+                    columns: schema
+                        .columns
+                        .into_iter()
+                        .map(|column| TableColumnResponse {
+                            indexed: indexed_columns.iter().any(|item| item == &column.name),
+                            name: column.name,
+                            column_type: data_type_name(&column.data_type).to_string(),
+                        })
+                        .collect(),
+                },
+            )
+        }
         Ok(None) => json_error_response(
             404,
             "table_not_found",
@@ -439,7 +380,7 @@ fn handle_table_schema_api(engine: &Arc<MvccEngine>, table_name: &str) -> HttpRe
     }
 }
 
-// 中文註解：讀取指定資料表前 N 筆資料，並依照 schema 欄位順序輸出成 JSON。
+// 中文註解：回傳指定資料表的前 N 筆資料，供 Studio 右側表格使用。
 fn handle_table_rows_api(
     request: &HttpRequest,
     engine: &Arc<MvccEngine>,
@@ -570,14 +511,17 @@ fn write_http_response(writer: &mut BufWriter<TcpStream>, response: HttpResponse
     write!(writer, "Content-Length: {}\r\n", body_bytes.len())?;
     write!(writer, "Connection: close\r\n")?;
     write!(writer, "Access-Control-Allow-Origin: *\r\n")?;
-    write!(writer, "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n")?;
+    write!(
+        writer,
+        "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
+    )?;
     write!(writer, "Access-Control-Allow-Headers: Content-Type\r\n")?;
     write!(writer, "\r\n")?;
     writer.write_all(body_bytes)?;
     Ok(())
 }
 
-// 中文註解：把 `POST /api/sql` 的純文字 SQL 解析、執行，並統一轉成 API 回應格式。
+// 中文註解：重用 parser 與 executor，把 SQL 純文字轉成 API 回應格式。
 fn execute_sql_text(engine: &Arc<MvccEngine>, sql: &str) -> SqlApiResponse {
     let start = Instant::now();
 
@@ -602,7 +546,7 @@ fn execute_sql_text(engine: &Arc<MvccEngine>, sql: &str) -> SqlApiResponse {
     SqlApiResponse::from_execute_result(result, elapsed_ms(start))
 }
 
-// 中文註解：把 SQL 的內部值型別轉成一般 JSON 值，方便前端直接顯示。
+// 中文註解：把 SQL Value 轉成 JSON，方便前端直接渲染。
 fn sql_value_to_json(value: SqlValue) -> JsonValue {
     match value {
         SqlValue::Int(value) => JsonValue::from(value),
@@ -612,7 +556,7 @@ fn sql_value_to_json(value: SqlValue) -> JsonValue {
     }
 }
 
-// 中文註解：依照欄位順序把 row 投影成 JSON 陣列，缺少欄位時補上 null。
+// 中文註解：依照 schema 欄位順序把 row 投影成 JSON 陣列。
 fn project_row_to_json(row: &Row, columns: &[String]) -> Vec<JsonValue> {
     columns
         .iter()
@@ -625,7 +569,7 @@ fn project_row_to_json(row: &Row, columns: &[String]) -> Vec<JsonValue> {
         .collect()
 }
 
-// 中文註解：從 `/api/tables/{name}/...` 這類路徑中抽出 table 名稱。
+// 中文註解：從 `/api/tables/{name}/...` 路徑中安全解析資料表名稱。
 fn extract_table_name(path: &str, suffix: &str) -> Option<String> {
     let prefix = "/api/tables/";
     let rest = path.strip_prefix(prefix)?;
@@ -636,7 +580,7 @@ fn extract_table_name(path: &str, suffix: &str) -> Option<String> {
     Some(table_name.to_string())
 }
 
-// 中文註解：解析 query string 的 `limit` 參數，未提供時預設回傳 100 筆。
+// 中文註解：解析 rows API 的 limit 參數，預設值為 100。
 fn parse_limit(query: &HashMap<String, String>) -> std::result::Result<usize, String> {
     match query.get("limit") {
         Some(value) => value
@@ -646,7 +590,7 @@ fn parse_limit(query: &HashMap<String, String>) -> std::result::Result<usize, St
     }
 }
 
-// 中文註解：把 request target 分離成純路徑與 query map，供後續路由與參數解析使用。
+// 中文註解：切開 path 與 query string，提供後續 route 與參數解析使用。
 fn split_request_target(target: &str) -> (String, HashMap<String, String>) {
     let Some((path, raw_query)) = target.split_once('?') else {
         return (target.to_string(), HashMap::new());
@@ -664,7 +608,7 @@ fn split_request_target(target: &str) -> (String, HashMap<String, String>) {
     (path.to_string(), query)
 }
 
-// 中文註解：把 DataType 轉成前端較容易理解的 SQL 型別字串。
+// 中文註解：把內部 DataType 轉成前端與 API 使用的字串名稱。
 fn data_type_name(data_type: &DataType) -> &'static str {
     match data_type {
         DataType::Int => "INT",
@@ -673,7 +617,7 @@ fn data_type_name(data_type: &DataType) -> &'static str {
     }
 }
 
-// 中文註解：建立通用的 JSON 錯誤回應，讓 API 失敗時有一致格式。
+// 中文註解：建立統一格式的 JSON 錯誤回應。
 fn json_error_response(status_code: u16, error: &str, message: String) -> HttpResponse {
     json_response(
         status_code,
@@ -684,7 +628,7 @@ fn json_error_response(status_code: u16, error: &str, message: String) -> HttpRe
     )
 }
 
-// 中文註解：為已知路徑但錯誤 HTTP method 的情況回傳 405，方便前端排查。
+// 中文註解：回傳 405，提示當前路徑不支援該 HTTP method。
 fn method_not_allowed(method: &str, path: &str) -> HttpResponse {
     json_error_response(
         405,
@@ -693,7 +637,7 @@ fn method_not_allowed(method: &str, path: &str) -> HttpResponse {
     )
 }
 
-// 中文註解：回傳 CORS preflight 成功，讓瀏覽器可先完成 OPTIONS 驗證。
+// 中文註解：處理前端 fetch 發出的 CORS preflight 請求。
 fn cors_preflight_response() -> HttpResponse {
     HttpResponse {
         status_code: 204,
@@ -702,10 +646,10 @@ fn cors_preflight_response() -> HttpResponse {
     }
 }
 
-fn html_response(status_code: u16, body: String) -> HttpResponse {
+fn text_response(status_code: u16, content_type: &'static str, body: String) -> HttpResponse {
     HttpResponse {
         status_code,
-        content_type: "text/html; charset=utf-8",
+        content_type,
         body,
     }
 }
@@ -734,7 +678,7 @@ fn http_status_text(status_code: u16) -> &'static str {
     }
 }
 
-// 中文註解：把耗時統一轉成毫秒，避免不同回應格式重複處理。
+// 中文註解：把執行耗時轉成毫秒，提供 SQL tab 顯示。
 fn elapsed_ms(start: Instant) -> u64 {
     start.elapsed().as_millis().min(u128::from(u64::MAX)) as u64
 }
@@ -769,15 +713,37 @@ struct ErrorMessage {
 struct StatsResponse<'a> {
     status: &'a str,
     entries: usize,
+    table_count: usize,
+    total_rows: usize,
     sstable_count: usize,
     disk_usage_bytes: u64,
+    wal_size_bytes: u64,
+    wal_record_count: usize,
     bloom_filter_hit_rate: f64,
+    next_sstable_id: u64,
+    manifest_status: ManifestStatusResponse,
+    wal_status: WalStatusResponse,
 }
 
 #[derive(Serialize)]
 struct SstablesResponse<'a> {
     status: &'a str,
     sstables: Vec<crate::storage::lsm::SstableInfo>,
+    manifest: ManifestStatusResponse,
+    wal: WalStatusResponse,
+}
+
+#[derive(Serialize)]
+struct ManifestStatusResponse {
+    summary: String,
+    last_compaction_ts: u64,
+}
+
+#[derive(Serialize)]
+struct WalStatusResponse {
+    path: String,
+    size_bytes: u64,
+    record_count: usize,
 }
 
 #[derive(Serialize)]
@@ -796,6 +762,7 @@ struct TableColumnResponse {
     name: String,
     #[serde(rename = "type")]
     column_type: String,
+    indexed: bool,
 }
 
 #[derive(Serialize)]
@@ -818,7 +785,7 @@ struct SqlApiResponse {
 }
 
 impl SqlApiResponse {
-    // 中文註解：把 SQL executor 的結果對應到 HTTP API 所需的固定 JSON 欄位。
+    // 中文註解：把 executor 回傳結果轉成前端固定吃的 JSON 格式。
     fn from_execute_result(result: ExecuteResult, elapsed_ms: u64) -> Self {
         match result {
             ExecuteResult::Explain { plan } => Self {
@@ -924,7 +891,7 @@ impl SqlApiResponse {
         }
     }
 
-    // 中文註解：建立 SQL API 的錯誤回應，固定使用 `type = error`。
+    // 中文註解：統一產生 SQL API 的錯誤 payload。
     fn error(message: String, elapsed_ms: u64) -> Self {
         Self {
             success: false,

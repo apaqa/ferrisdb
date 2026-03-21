@@ -140,7 +140,10 @@ fn cmd_set(parts: &[&str], engine: &Arc<MvccEngine>) -> String {
 
     let mut txn = engine.begin_transaction();
     let result = txn
-        .put(parts[1].as_bytes().to_vec(), parts[2..].join(" ").into_bytes())
+        .put(
+            parts[1].as_bytes().to_vec(),
+            parts[2..].join(" ").into_bytes(),
+        )
         .and_then(|_| txn.commit());
 
     match result {

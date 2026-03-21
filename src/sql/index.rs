@@ -27,7 +27,7 @@ use serde::{Deserialize, Serialize};
 use crate::error::Result;
 use crate::transaction::mvcc::{MvccEngine, Transaction};
 
-use super::ast::Value;
+use super::ast::{Operator, Value, WhereExpr};
 use super::catalog::{Catalog, TableSchema};
 use super::row::{
     decode_row_key, encode_row_prefix_end, encode_row_prefix_start, primary_key_to_string, Row,
@@ -181,6 +181,19 @@ impl IndexManager {
         Ok(columns)
     }
 
+    // 中文註解：從 WhereExpr 中找出最適合先走 index scan 的等值條件。
+    pub fn find_indexable_comparison<'a>(
+        &self,
+        txn: &Transaction,
+        table: &str,
+        where_expr: Option<&'a WhereExpr>,
+    ) -> Result<Option<(&'a str, &'a Value)>> {
+        let Some(where_expr) = where_expr else {
+            return Ok(None);
+        };
+        self.find_indexable_comparison_in_expr(txn, table, where_expr)
+    }
+
     fn scan_rows(&self, txn: &Transaction, schema: &TableSchema) -> Result<Vec<(Vec<u8>, Row)>> {
         let start = encode_row_prefix_start(&schema.table_name);
         let end = encode_row_prefix_end(&schema.table_name);
@@ -197,6 +210,32 @@ impl IndexManager {
             rows.push((key, row));
         }
         Ok(rows)
+    }
+
+    // 中文註解：只有單一等值比較或 AND 中的其中一支等值比較可以直接轉成 index lookup。
+    fn find_indexable_comparison_in_expr<'a>(
+        &self,
+        txn: &Transaction,
+        table: &str,
+        where_expr: &'a WhereExpr,
+    ) -> Result<Option<(&'a str, &'a Value)>> {
+        match where_expr {
+            WhereExpr::Comparison {
+                column,
+                operator: Operator::Eq,
+                value,
+            } => {
+                if self.has_index(txn, table, column)? {
+                    Ok(Some((column.as_str(), value)))
+                } else {
+                    Ok(None)
+                }
+            }
+            WhereExpr::And(left, right) => Ok(self
+                .find_indexable_comparison_in_expr(txn, table, left)?
+                .or(self.find_indexable_comparison_in_expr(txn, table, right)?)),
+            _ => Ok(None),
+        }
     }
 }
 

@@ -20,6 +20,10 @@ use std::sync::Arc;
 use ferrisdb::cli::repl;
 use ferrisdb::config::FerrisDbConfig;
 use ferrisdb::server::{http, tcp};
+use ferrisdb::sql::catalog::Catalog;
+use ferrisdb::sql::executor::SqlExecutor;
+use ferrisdb::sql::lexer::Lexer;
+use ferrisdb::sql::parser::Parser;
 use ferrisdb::storage::lsm::LsmEngine;
 use ferrisdb::transaction::mvcc::MvccEngine;
 
@@ -85,7 +89,12 @@ fn build_engine(config: &FerrisDbConfig) -> Arc<MvccEngine> {
         }
     };
 
-    Arc::new(MvccEngine::new(lsm))
+    let engine = Arc::new(MvccEngine::new(lsm));
+    if let Err(err) = seed_demo_data_if_empty(&engine) {
+        eprintln!("Failed to seed demo data: {}", err);
+        std::process::exit(1);
+    }
+    engine
 }
 
 fn run_repl_mode(config: &FerrisDbConfig) {
@@ -111,6 +120,7 @@ fn run_server_mode(config: &FerrisDbConfig) {
 
 fn run_http_mode(config: &FerrisDbConfig, port: u16) {
     let engine = build_engine(config);
+    println!("FerrisDB Studio available at http://127.0.0.1:{}/", port);
     if let Err(err) = http::run_http_at(&config.server_host, port, engine) {
         eprintln!("Fatal HTTP server error: {}", err);
         std::process::exit(1);
@@ -162,4 +172,38 @@ fn print_usage() {
     eprintln!("  cargo run -- --http-port <port>");
     eprintln!("  cargo run -- --data-dir <path>");
     eprintln!("  cargo run -- --memtable-threshold <bytes>");
+}
+
+// 中文註解：只有在全新資料庫完全沒有資料表時，才自動建立 Studio 示範資料。
+fn seed_demo_data_if_empty(engine: &Arc<MvccEngine>) -> ferrisdb::error::Result<()> {
+    let catalog = Catalog::new(Arc::clone(engine));
+    let txn = engine.begin_transaction();
+    if !catalog.list_tables(&txn)?.is_empty() {
+        return Ok(());
+    }
+
+    let demo_sql = [
+        "CREATE TABLE IF NOT EXISTS employees (id INT, name TEXT, department TEXT, salary INT);",
+        "INSERT INTO employees VALUES (1, 'Alice', 'Engineering', 95000), (2, 'Bob', 'Engineering', 88000), (3, 'Cara', 'Design', 72000), (4, 'Dylan', 'Sales', 68000), (5, 'Eva', 'Engineering', 105000), (6, 'Finn', 'HR', 54000), (7, 'Gina', 'Sales', 61000), (8, 'Hank', 'Design', 79000), (9, 'Iris', 'HR', 57000), (10, 'Jake', 'Engineering', 99000), (11, 'Kara', 'Support', 50000), (12, 'Liam', 'Support', 52000);",
+        "CREATE TABLE IF NOT EXISTS departments (id INT, dept_name TEXT, location TEXT);",
+        "INSERT INTO departments VALUES (1, 'Engineering', 'NYC'), (2, 'Design', 'SF'), (3, 'Sales', 'NYC'), (4, 'HR', 'Remote'), (5, 'Support', 'NYC');",
+        "CREATE INDEX ON employees(department);",
+    ];
+
+    let executor = SqlExecutor::new(Arc::clone(engine));
+    for sql in demo_sql {
+        run_startup_sql(&executor, sql)?;
+    }
+
+    Ok(())
+}
+
+// 中文註解：啟動時直接重用 SQL parser 與 executor，避免維護兩套建立資料的邏輯。
+fn run_startup_sql(executor: &SqlExecutor, sql: &str) -> ferrisdb::error::Result<()> {
+    let mut lexer = Lexer::new(sql);
+    let tokens = lexer.tokenize()?;
+    let mut parser = Parser::new(tokens);
+    let statement = parser.parse()?;
+    let _ = executor.execute(statement)?;
+    Ok(())
 }

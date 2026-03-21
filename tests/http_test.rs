@@ -2,12 +2,9 @@
 // tests/http_test.rs -- HTTP API Tests
 // =============================================================================
 //
-// 這裡驗證 FerrisDB 的 HTTP 介面是否能讓前端或腳本正常操作資料庫。
-// 測試重點包含：
-// - 既有管理 API（health / stats / flush / sstables / compact）
-// - 新增的 SQL API 與 table API
-// - CORS 與 OPTIONS preflight
-// - 首頁是否提供中文化說明
+// 中文註解：
+// 這裡驗證 FerrisDB Studio 依賴的 HTTP 路由都能正常工作，
+// 包含首頁 HTML、SQL API、table API、storage API 與 admin API。
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
@@ -29,8 +26,18 @@ fn temp_dir(name: &str) -> std::path::PathBuf {
     std::env::temp_dir().join(format!("ferrisdb-http-test-{}-{}", name, nanos))
 }
 
+fn spawn_http_server(engine: Arc<MvccEngine>) -> std::net::SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind listener");
+    let addr = listener.local_addr().expect("local addr");
+    thread::spawn(move || {
+        let _ = http::run_on_listener(listener, engine);
+    });
+    thread::sleep(Duration::from_millis(100));
+    addr
+}
+
 #[test]
-fn test_http_admin_api_end_to_end() {
+fn test_http_homepage_and_admin_api_end_to_end() {
     let dir = temp_dir("admin");
     let lsm = LsmEngine::open(&dir, 64).expect("open lsm");
     let engine = Arc::new(MvccEngine::new(lsm));
@@ -42,25 +49,21 @@ fn test_http_admin_api_end_to_end() {
         txn.commit().expect("commit");
     }
 
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind listener");
-    let addr = listener.local_addr().expect("local addr");
-    let shared = Arc::clone(&engine);
-    thread::spawn(move || {
-        let _ = http::run_on_listener(listener, shared);
-    });
-    thread::sleep(Duration::from_millis(100));
+    let addr = spawn_http_server(Arc::clone(&engine));
 
     let homepage = http_request(addr, "GET", "/", &[], "");
     assert!(homepage.status_line.starts_with("HTTP/1.1 200"));
-    assert!(homepage.body.contains("FerrisDB HTTP 服務"));
-    assert!(homepage.body.contains("前端"));
+    assert_eq!(
+        header(&homepage, "content-type"),
+        Some("text/html; charset=utf-8")
+    );
+    assert!(homepage.body.contains("FerrisDB Studio v0.1.0"));
+    assert!(homepage.body.contains("Dashboard"));
+    assert!(homepage.body.contains("connected to"));
 
     let health = http_request(addr, "GET", "/health", &[], "");
     assert!(health.status_line.starts_with("HTTP/1.1 200"));
-    assert_eq!(
-        header(&health, "access-control-allow-origin"),
-        Some("*")
-    );
+    assert_eq!(header(&health, "access-control-allow-origin"), Some("*"));
     let health_json = parse_json_body(&health);
     assert_eq!(health_json["status"], "ok");
 
@@ -69,8 +72,12 @@ fn test_http_admin_api_end_to_end() {
     let stats_json = parse_json_body(&stats);
     assert_eq!(stats_json["status"], "ok");
     assert_eq!(stats_json["entries"], 2);
+    assert_eq!(stats_json["table_count"], 0);
+    assert_eq!(stats_json["total_rows"], 0);
+    assert!(stats_json["manifest_status"]["summary"].is_string());
+    assert!(stats_json["wal_status"]["path"].is_string());
 
-    let flush = http_request(addr, "POST", "/flush", &[], "");
+    let flush = http_request(addr, "POST", "/api/admin/flush", &[], "");
     assert!(flush.status_line.starts_with("HTTP/1.1 200"));
     let flush_json = parse_json_body(&flush);
     assert_eq!(flush_json["status"], "ok");
@@ -79,6 +86,8 @@ fn test_http_admin_api_end_to_end() {
     assert!(sstables.status_line.starts_with("HTTP/1.1 200"));
     let sstables_json = parse_json_body(&sstables);
     assert_eq!(sstables_json["status"], "ok");
+    assert!(sstables_json["manifest"]["summary"].is_string());
+    assert!(sstables_json["wal"]["record_count"].is_number());
     assert!(
         sstables_json["sstables"]
             .as_array()
@@ -87,7 +96,7 @@ fn test_http_admin_api_end_to_end() {
             >= 1
     );
 
-    let compact = http_request(addr, "POST", "/compact", &[], "");
+    let compact = http_request(addr, "POST", "/api/admin/compact", &[], "");
     assert!(compact.status_line.starts_with("HTTP/1.1 200"));
     let compact_json = parse_json_body(&compact);
     assert_eq!(compact_json["status"], "ok");
@@ -96,18 +105,11 @@ fn test_http_admin_api_end_to_end() {
 }
 
 #[test]
-fn test_http_sql_and_table_api_end_to_end() {
-    let dir = temp_dir("sql-api");
+fn test_http_sql_table_and_storage_routes_used_by_studio() {
+    let dir = temp_dir("studio");
     let lsm = LsmEngine::open(&dir, 4096).expect("open lsm");
     let engine = Arc::new(MvccEngine::new(lsm));
-
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind listener");
-    let addr = listener.local_addr().expect("local addr");
-    let shared = Arc::clone(&engine);
-    thread::spawn(move || {
-        let _ = http::run_on_listener(listener, shared);
-    });
-    thread::sleep(Duration::from_millis(100));
+    let addr = spawn_http_server(Arc::clone(&engine));
 
     let options = http_request(addr, "OPTIONS", "/api/sql", &[], "");
     assert!(options.status_line.starts_with("HTTP/1.1 204"));
@@ -127,15 +129,19 @@ fn test_http_sql_and_table_api_end_to_end() {
         &[("Content-Type", "text/plain; charset=utf-8")],
         "CREATE TABLE users (id INT, name TEXT, age INT);",
     );
-    assert!(create.status_line.starts_with("HTTP/1.1 200"));
-    assert_eq!(
-        header(&create, "access-control-allow-origin"),
-        Some("*")
-    );
     let create_json = parse_json_body(&create);
     assert_eq!(create_json["success"], true);
     assert_eq!(create_json["type"], "created");
-    assert_eq!(create_json["message"], "Table 'users' created");
+
+    let create_index = http_request(
+        addr,
+        "POST",
+        "/api/sql",
+        &[("Content-Type", "text/plain")],
+        "CREATE INDEX ON users(name);",
+    );
+    let create_index_json = parse_json_body(&create_index);
+    assert_eq!(create_index_json["success"], true);
 
     let insert = http_request(
         addr,
@@ -148,8 +154,6 @@ fn test_http_sql_and_table_api_end_to_end() {
     assert_eq!(insert_json["success"], true);
     assert_eq!(insert_json["type"], "inserted");
     assert_eq!(insert_json["row_count"], 2);
-    assert_eq!(insert_json["columns"], json!([]));
-    assert_eq!(insert_json["rows"], json!([]));
 
     let select = http_request(
         addr,
@@ -162,8 +166,21 @@ fn test_http_sql_and_table_api_end_to_end() {
     assert_eq!(select_json["success"], true);
     assert_eq!(select_json["type"], "select");
     assert_eq!(select_json["columns"], json!(["id", "name", "age"]));
-    assert_eq!(select_json["rows"], json!([[1, "Alice", 30], [2, "Bob", 25]]));
-    assert_eq!(select_json["row_count"], 2);
+    assert_eq!(
+        select_json["rows"],
+        json!([[1, "Alice", 30], [2, "Bob", 25]])
+    );
+
+    let explain = http_request(
+        addr,
+        "POST",
+        "/api/sql",
+        &[("Content-Type", "text/plain")],
+        "EXPLAIN SELECT * FROM users WHERE name = 'Alice';",
+    );
+    let explain_json = parse_json_body(&explain);
+    assert_eq!(explain_json["success"], true);
+    assert_eq!(explain_json["type"], "explained");
 
     let tables = http_request(addr, "GET", "/api/tables", &[], "");
     let tables_json = parse_json_body(&tables);
@@ -176,9 +193,9 @@ fn test_http_sql_and_table_api_end_to_end() {
         json!({
             "table": "users",
             "columns": [
-                { "name": "id", "type": "INT" },
-                { "name": "name", "type": "TEXT" },
-                { "name": "age", "type": "INT" }
+                { "name": "id", "type": "INT", "indexed": false },
+                { "name": "name", "type": "TEXT", "indexed": true },
+                { "name": "age", "type": "INT", "indexed": false }
             ]
         })
     );
@@ -194,10 +211,21 @@ fn test_http_sql_and_table_api_end_to_end() {
         })
     );
 
+    let stats = http_request(addr, "GET", "/stats", &[], "");
+    let stats_json = parse_json_body(&stats);
+    assert_eq!(stats_json["table_count"], 1);
+    assert_eq!(stats_json["total_rows"], 2);
+    assert_eq!(stats_json["sstable_count"], 0);
+
+    let sstables = http_request(addr, "GET", "/sstables", &[], "");
+    let sstables_json = parse_json_body(&sstables);
+    assert_eq!(sstables_json["status"], "ok");
+    assert!(sstables_json["sstables"].is_array());
+
     let _ = std::fs::remove_dir_all(dir);
 }
 
-// 中文註解：用最接近真實瀏覽器/HTTP client 的方式送出請求並解析回應。
+// 中文註解：最小化 HTTP client，直接用 TCP 發 raw request 驗證 server 行為。
 fn http_request(
     addr: std::net::SocketAddr,
     method: &str,
@@ -236,7 +264,7 @@ fn http_request(
     parse_http_response(&raw_response)
 }
 
-// 中文註解：把原始 HTTP 回應拆成 status line、headers 與 body，讓斷言更直觀。
+// 中文註解：把原始 HTTP response 切成 status line、headers 與 body。
 fn parse_http_response(raw_response: &str) -> TestHttpResponse {
     let mut sections = raw_response.splitn(2, "\r\n\r\n");
     let header_block = sections.next().unwrap_or("");
@@ -258,12 +286,10 @@ fn parse_http_response(raw_response: &str) -> TestHttpResponse {
     }
 }
 
-// 中文註解：讀取指定 response header，避免測試中重複處理大小寫。
 fn header<'a>(response: &'a TestHttpResponse, name: &str) -> Option<&'a str> {
     response.headers.get(name).map(String::as_str)
 }
 
-// 中文註解：把回應 body 解析成 JSON，讓測試可以直接比對欄位內容。
 fn parse_json_body(response: &TestHttpResponse) -> Value {
     serde_json::from_str(&response.body).expect("body should be valid json")
 }

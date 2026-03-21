@@ -49,6 +49,14 @@ fn rows_only(result: ExecuteResult) -> (Vec<String>, Vec<Vec<Value>>) {
     }
 }
 
+// 中文註解：把 EXPLAIN 結果抽成字串，方便直接驗證是否走到 IndexScan/Filter。
+fn explain_only(result: ExecuteResult) -> String {
+    match result {
+        ExecuteResult::Explain { plan } => plan,
+        other => panic!("expected explain result, got {:?}", other),
+    }
+}
+
 #[test]
 fn test_create_insert_select_flow() {
     let (dir, _engine, executor) = open_executor("create-insert-select");
@@ -665,6 +673,184 @@ fn test_group_by_with_order_by_and_limit() {
         vec![
             vec![Value::Text("Sales".to_string()), Value::Int(200)],
             vec![Value::Text("HR".to_string()), Value::Int(80)],
+        ]
+    );
+
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn test_where_and_or_not_expressions() {
+    let (dir, _engine, executor) = open_executor("where-bool");
+
+    exec(
+        &executor,
+        "CREATE TABLE flags (id INT, a INT, b INT, c INT);",
+    );
+    exec(
+        &executor,
+        "INSERT INTO flags VALUES (1, 1, 2, 9), (2, 1, 0, 3), (3, 0, 2, 3), (4, 0, 0, 0);",
+    );
+
+    let (_, and_rows) = rows_only(exec(
+        &executor,
+        "SELECT id FROM flags WHERE a = 1 AND b = 2 ORDER BY id ASC;",
+    ));
+    assert_eq!(and_rows, vec![vec![Value::Int(1)]]);
+
+    let (_, or_rows) = rows_only(exec(
+        &executor,
+        "SELECT id FROM flags WHERE a = 1 OR b = 2 ORDER BY id ASC;",
+    ));
+    assert_eq!(
+        or_rows,
+        vec![
+            vec![Value::Int(1)],
+            vec![Value::Int(2)],
+            vec![Value::Int(3)],
+        ]
+    );
+
+    let (_, nested_rows) = rows_only(exec(
+        &executor,
+        "SELECT id FROM flags WHERE a = 1 AND (b = 2 OR c = 3) ORDER BY id ASC;",
+    ));
+    assert_eq!(
+        nested_rows,
+        vec![vec![Value::Int(1)], vec![Value::Int(2)]]
+    );
+
+    let (_, not_rows) = rows_only(exec(
+        &executor,
+        "SELECT id FROM flags WHERE NOT a = 1 ORDER BY id ASC;",
+    ));
+    assert_eq!(not_rows, vec![vec![Value::Int(3)], vec![Value::Int(4)]]);
+
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn test_and_where_can_still_use_index_scan() {
+    let (dir, _engine, executor) = open_executor("where-index-and");
+
+    exec(
+        &executor,
+        "CREATE TABLE users (id INT, age INT, active BOOL);",
+    );
+    exec(
+        &executor,
+        "INSERT INTO users VALUES (1, 30, true), (2, 30, false), (3, 25, true);",
+    );
+    exec(&executor, "CREATE INDEX ON users(age);");
+
+    let plan = explain_only(exec(
+        &executor,
+        "EXPLAIN SELECT * FROM users WHERE age = 30 AND active = true;",
+    ));
+    assert!(plan.contains("IndexScan"));
+    assert!(plan.contains("active = true"));
+
+    let (_, rows) = rows_only(exec(
+        &executor,
+        "SELECT id FROM users WHERE age = 30 AND active = true;",
+    ));
+    assert_eq!(rows, vec![vec![Value::Int(1)]]);
+
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn test_left_join_with_matches_and_missing_rows() {
+    let (dir, _engine, executor) = open_executor("left-join");
+
+    exec(
+        &executor,
+        "CREATE TABLE users (id INT, name TEXT, active BOOL);",
+    );
+    exec(
+        &executor,
+        "CREATE TABLE orders (id INT, user_id INT, item TEXT);",
+    );
+    exec(
+        &executor,
+        "INSERT INTO users VALUES (1, 'Alice', true), (2, 'Bob', false), (3, 'Cara', true);",
+    );
+    exec(
+        &executor,
+        "INSERT INTO orders VALUES (10, 1, 'Book'), (11, 1, 'Pen'), (12, 2, 'Cup');",
+    );
+
+    let (columns, rows) = rows_only(exec(
+        &executor,
+        "SELECT users.name, orders.item FROM users LEFT JOIN orders ON users.id = orders.user_id ORDER BY users.name ASC;",
+    ));
+    assert_eq!(columns, vec!["users.name", "orders.item"]);
+    assert_eq!(
+        rows,
+        vec![
+            vec![
+                Value::Text("Alice".to_string()),
+                Value::Text("Book".to_string()),
+            ],
+            vec![
+                Value::Text("Alice".to_string()),
+                Value::Text("Pen".to_string()),
+            ],
+            vec![
+                Value::Text("Bob".to_string()),
+                Value::Text("Cup".to_string()),
+            ],
+            vec![Value::Text("Cara".to_string()), Value::Null],
+        ]
+    );
+
+    let (_, filtered_rows) = rows_only(exec(
+        &executor,
+        "SELECT users.name, orders.item FROM users LEFT JOIN orders ON users.id = orders.user_id WHERE users.id = 3;",
+    ));
+    assert_eq!(
+        filtered_rows,
+        vec![vec![Value::Text("Cara".to_string()), Value::Null]]
+    );
+
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn test_having_filters_aggregate_rows() {
+    let (dir, _engine, executor) = open_executor("having");
+
+    exec(
+        &executor,
+        "CREATE TABLE employees (id INT, department TEXT, salary INT, active BOOL);",
+    );
+    exec(
+        &executor,
+        "INSERT INTO employees VALUES (1, 'Eng', 100, true), (2, 'Eng', 120, true), (3, 'HR', 90, true), (4, 'Sales', 70, false), (5, 'Sales', 60, true);",
+    );
+
+    let (columns, rows) = rows_only(exec(
+        &executor,
+        "SELECT department, COUNT(*) FROM employees GROUP BY department HAVING COUNT(*) > 1 ORDER BY department ASC;",
+    ));
+    assert_eq!(columns, vec!["department", "COUNT(*)"]);
+    assert_eq!(
+        rows,
+        vec![
+            vec![Value::Text("Eng".to_string()), Value::Int(2)],
+            vec![Value::Text("Sales".to_string()), Value::Int(2)],
+        ]
+    );
+
+    let (_, combo_rows) = rows_only(exec(
+        &executor,
+        "SELECT department, SUM(salary) FROM employees WHERE salary >= 60 GROUP BY department HAVING SUM(salary) >= 130 ORDER BY department DESC LIMIT 2;",
+    ));
+    assert_eq!(
+        combo_rows,
+        vec![
+            vec![Value::Text("Sales".to_string()), Value::Int(130)],
+            vec![Value::Text("Eng".to_string()), Value::Int(220)],
         ]
     );
 

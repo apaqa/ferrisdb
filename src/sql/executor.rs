@@ -32,8 +32,8 @@ use crate::error::Result;
 use crate::transaction::mvcc::{MvccEngine, Transaction};
 
 use super::ast::{
-    AggregateFunc, Assignment, ColumnDef, GroupByClause, JoinClause, Operator, OrderByClause,
-    OrderDirection, SelectColumns, SelectItem, Statement, SubqueryCondition, Value, WhereClause,
+    AggregateFunc, Assignment, ColumnDef, GroupByClause, JoinClause, JoinType, Operator,
+    OrderByClause, OrderDirection, SelectColumns, SelectItem, Statement, Value, WhereExpr,
 };
 use super::catalog::{Catalog, TableSchema};
 use super::index::IndexManager;
@@ -108,6 +108,7 @@ impl SqlExecutor {
                 join,
                 where_clause,
                 group_by,
+                having,
                 order_by,
                 limit,
             } => self.execute_select(
@@ -116,6 +117,7 @@ impl SqlExecutor {
                 join,
                 where_clause,
                 group_by,
+                having,
                 order_by,
                 limit,
             ),
@@ -328,6 +330,7 @@ impl SqlExecutor {
                 join,
                 where_clause,
                 group_by,
+                having,
                 order_by,
                 limit,
             } => {
@@ -345,6 +348,12 @@ impl SqlExecutor {
                 }
 
                 let use_index = self.can_use_index(&txn, &table_name, where_clause.as_ref())?;
+                let index_lookup = if use_index {
+                    self.index_manager
+                        .find_indexable_comparison(&txn, &table_name, where_clause.as_ref())?
+                } else {
+                    None
+                };
                 let total_rows = self.scan_rows(&txn, &schema)?.len();
                 let scan_rows = if use_index {
                     estimate_filtered_rows(total_rows, where_clause.as_ref())
@@ -366,11 +375,7 @@ impl SqlExecutor {
                 let project_cost = estimate_project_cost(filtered_rows, &columns);
 
                 let mut lines = Vec::new();
-                if use_index {
-                    let (column, _, _) = where_comparison_parts(
-                        where_clause.as_ref().expect("index scan requires where"),
-                    )
-                    .expect("index scan requires comparison");
+                if let Some((column, _)) = index_lookup {
                     lines.push(format!(
                         "IndexScan(table={}, column={}, rows={}, cost={:.2})",
                         table_name, column, scan_rows, scan_cost
@@ -382,9 +387,8 @@ impl SqlExecutor {
                     ));
                 }
                 if let Some(where_clause) = where_clause {
-                    if use_index && where_comparison_parts(&where_clause).is_some() {
-                        let (column, _, value) =
-                            where_comparison_parts(&where_clause).expect("comparison");
+                    if use_index && where_eq_comparison_parts(&where_clause).is_some() {
+                        let (column, value) = where_eq_comparison_parts(&where_clause).expect("comparison");
                         lines.push(format!(
                             "  -> IndexFilter(predicate=\"{} = {}\", rows={}, cost={:.2})",
                             column,
@@ -395,7 +399,7 @@ impl SqlExecutor {
                     } else {
                         lines.push(format!(
                             "  -> Filter(predicate=\"{}\", rows={}, cost={:.2})",
-                            render_where_clause(&where_clause),
+                            render_where_expr(&where_clause),
                             filtered_rows,
                             filter_cost
                         ));
@@ -407,6 +411,14 @@ impl SqlExecutor {
                         group_by.column,
                         filtered_rows.max(1),
                         (filtered_rows.max(1)) as f64 * 0.35
+                    ));
+                }
+                if let Some(having) = having {
+                    lines.push(format!(
+                        "  -> Having(predicate=\"{}\", rows={}, cost={:.2})",
+                        render_where_expr(&having),
+                        filtered_rows.max(1),
+                        (filtered_rows.max(1)) as f64 * 0.15
                     ));
                 }
                 if let Some(order_by) = order_by {
@@ -523,8 +535,9 @@ impl SqlExecutor {
         table_name: String,
         columns: SelectColumns,
         join: Option<JoinClause>,
-        where_clause: Option<WhereClause>,
+        where_clause: Option<WhereExpr>,
         group_by: Option<GroupByClause>,
+        having: Option<WhereExpr>,
         order_by: Option<OrderByClause>,
         limit: Option<usize>,
     ) -> Result<ExecuteResult> {
@@ -536,7 +549,7 @@ impl SqlExecutor {
         };
 
         if let Some(join_clause) = join {
-            if matches!(columns, SelectColumns::Aggregate(_)) || group_by.is_some() {
+            if matches!(columns, SelectColumns::Aggregate(_)) || group_by.is_some() || having.is_some() {
                 return Ok(ExecuteResult::Error {
                     message: "JOIN with aggregate queries is not implemented yet".to_string(),
                 });
@@ -559,6 +572,7 @@ impl SqlExecutor {
                 columns,
                 where_clause,
                 group_by,
+                having,
                 order_by,
                 limit,
             );
@@ -598,13 +612,15 @@ impl SqlExecutor {
         })
     }
 
+    // 中文註解：聚合查詢會先做 WHERE 過濾，再做 GROUP BY，最後套用 HAVING。
     fn execute_aggregate_select(
         &self,
         txn: &Transaction,
         schema: &TableSchema,
         columns: SelectColumns,
-        where_clause: Option<WhereClause>,
+        where_clause: Option<WhereExpr>,
         group_by: Option<GroupByClause>,
+        having: Option<WhereExpr>,
         order_by: Option<OrderByClause>,
         limit: Option<usize>,
     ) -> Result<ExecuteResult> {
@@ -618,6 +634,7 @@ impl SqlExecutor {
             Ok(columns) => columns,
             Err(message) => return Ok(ExecuteResult::Error { message }),
         };
+        let resolved_having = self.resolve_where_expr(having.as_ref())?;
 
         let rows: Vec<Row> = self
             .fetch_rows_for_select(txn, schema, where_clause.as_ref())?
@@ -634,6 +651,10 @@ impl SqlExecutor {
                     Ok(value) => output_row.push(value),
                     Err(message) => return Ok(ExecuteResult::Error { message }),
                 }
+            }
+            let projected_row = ProjectedRow::new(&output_columns, &output_row);
+            if !eval_where_expr(&projected_row, resolved_having.as_ref()) {
+                continue;
             }
             selected.push(output_row);
         }
@@ -653,13 +674,14 @@ impl SqlExecutor {
         })
     }
 
+    // 中文註解：JOIN 查詢目前支援 INNER JOIN 與 LEFT JOIN，WHERE 會在 join 結果上再過濾。
     fn execute_join_select(
         &self,
         txn: &Transaction,
         left_schema: &TableSchema,
         columns: SelectColumns,
         join: JoinClause,
-        where_clause: Option<WhereClause>,
+        where_clause: Option<WhereExpr>,
         order_by: Option<OrderByClause>,
         limit: Option<usize>,
     ) -> Result<ExecuteResult> {
@@ -671,7 +693,7 @@ impl SqlExecutor {
 
         let left_rows = self.scan_rows(txn, left_schema)?;
         let right_rows = self.scan_rows(txn, &right_schema)?;
-        let resolved_where = self.resolve_where_clause(where_clause.as_ref())?;
+        let resolved_where = self.resolve_where_expr(where_clause.as_ref())?;
         let projection = match self.resolve_join_projection(left_schema, &right_schema, &columns) {
             Ok(columns) => columns,
             Err(message) => return Ok(ExecuteResult::Error { message }),
@@ -685,6 +707,7 @@ impl SqlExecutor {
                 });
             };
 
+            let mut found_match = false;
             for (_, right_row) in &right_rows {
                 let Some(right_value) =
                     resolve_join_value(right_row, &right_schema.table_name, &join.right_column)
@@ -698,11 +721,19 @@ impl SqlExecutor {
                     continue;
                 }
 
-                let joined = JoinedRow::new(left_schema, left_row, &right_schema, right_row);
-                if !matches_joined_row(&joined, resolved_where.as_ref()) {
+                found_match = true;
+                let joined = JoinedRow::new(left_schema, left_row, &right_schema, Some(right_row));
+                if !eval_where_expr(&joined, resolved_where.as_ref()) {
                     continue;
                 }
                 matched_rows.push(joined);
+            }
+
+            if !found_match && matches!(join.join_type, JoinType::Left) {
+                let joined = JoinedRow::new(left_schema, left_row, &right_schema, None);
+                if eval_where_expr(&joined, resolved_where.as_ref()) {
+                    matched_rows.push(joined);
+                }
             }
         }
         if let Some(order_by) = order_by.as_ref() {
@@ -733,11 +764,12 @@ impl SqlExecutor {
         })
     }
 
+    // 中文註解：UPDATE 會對每一列套用遞迴 WHERE 判斷，再同步維護索引內容。
     fn execute_update(
         &self,
         table_name: String,
         assignments: Vec<Assignment>,
-        where_clause: Option<WhereClause>,
+        where_clause: Option<WhereExpr>,
     ) -> Result<ExecuteResult> {
         let mut txn = self.engine.begin_transaction();
         let Some(schema) = self.catalog.get_table(&txn, &table_name)? else {
@@ -764,10 +796,10 @@ impl SqlExecutor {
         }
 
         let rows = self.scan_rows(&txn, &schema)?;
-        let resolved_where = self.resolve_where_clause(where_clause.as_ref())?;
+        let resolved_where = self.resolve_where_expr(where_clause.as_ref())?;
         let mut updated = 0;
         for (row_key, mut row) in rows {
-            if !matches_row(&row, resolved_where.as_ref()) {
+            if !eval_where_expr(&row, resolved_where.as_ref()) {
                 continue;
             }
 
@@ -809,10 +841,11 @@ impl SqlExecutor {
         Ok(ExecuteResult::Updated { count: updated })
     }
 
+    // 中文註解：DELETE 與 UPDATE 共用同一套布林 WHERE evaluator，避免條件語意不一致。
     fn execute_delete(
         &self,
         table_name: String,
-        where_clause: Option<WhereClause>,
+        where_clause: Option<WhereExpr>,
     ) -> Result<ExecuteResult> {
         let mut txn = self.engine.begin_transaction();
         let Some(schema) = self.catalog.get_table(&txn, &table_name)? else {
@@ -822,10 +855,10 @@ impl SqlExecutor {
         };
 
         let rows = self.scan_rows(&txn, &schema)?;
-        let resolved_where = self.resolve_where_clause(where_clause.as_ref())?;
+        let resolved_where = self.resolve_where_expr(where_clause.as_ref())?;
         let mut deleted = 0;
         for (row_key, row) in rows {
-            if !matches_row(&row, resolved_where.as_ref()) {
+            if !eval_where_expr(&row, resolved_where.as_ref()) {
                 continue;
             }
             let pk_value = row
@@ -926,86 +959,83 @@ impl SqlExecutor {
         Ok(rows)
     }
 
+    // 中文註解：SELECT 會優先嘗試使用 indexable 的等值條件縮小候選列，再用完整條件做二次過濾。
     fn fetch_rows_for_select(
         &self,
         txn: &Transaction,
         schema: &TableSchema,
-        where_clause: Option<&WhereClause>,
+        where_clause: Option<&WhereExpr>,
     ) -> Result<Vec<(Vec<u8>, Row)>> {
-        let resolved_where = self.resolve_where_clause(where_clause)?;
-        if let Some(where_clause) = where_clause {
-            if let Some((column, Operator::Eq, value)) = where_comparison_parts(where_clause) {
-                if self
-                    .index_manager
-                    .has_index(txn, &schema.table_name, column)?
-                {
-                let pks = self.index_manager.lookup(
-                    txn,
-                    &schema.table_name,
-                    column,
-                    value,
-                )?;
+        let resolved_where = self.resolve_where_expr(where_clause)?;
+        if let Some((column, value)) = self
+            .index_manager
+            .find_indexable_comparison(txn, &schema.table_name, where_clause)?
+        {
+            let pks = self
+                .index_manager
+                .lookup(txn, &schema.table_name, column, value)?;
                 let mut rows = Vec::new();
                 for pk in pks {
                     let row_key = encode_row_key(&schema.table_name, &pk);
                     if let Some(raw) = txn.get(&row_key)? {
                         let row: Row = serde_json::from_slice(&raw)?;
-                        if matches_row(&row, resolved_where.as_ref()) {
+                        if eval_where_expr(&row, resolved_where.as_ref()) {
                             rows.push((row_key, row));
                         }
                     }
                 }
-                return Ok(rows);
-            }
-            }
+            return Ok(rows);
         }
 
         let mut rows = self.scan_rows(txn, schema)?;
-        rows.retain(|(_, row)| matches_row(row, resolved_where.as_ref()));
+        rows.retain(|(_, row)| eval_where_expr(row, resolved_where.as_ref()));
         Ok(rows)
     }
 
+    // 中文註解：只要 WHERE 樹中存在可索引的等值比較，就允許 explain/scan 走 index scan 路徑。
     fn can_use_index(
         &self,
         txn: &Transaction,
         table_name: &str,
-        where_clause: Option<&WhereClause>,
+        where_clause: Option<&WhereExpr>,
     ) -> Result<bool> {
-        let Some(where_clause) = where_clause else {
-            return Ok(false);
-        };
-        let Some((column, Operator::Eq, _)) = where_comparison_parts(where_clause) else {
-            return Ok(false);
-        };
-        self.index_manager
-            .has_index(txn, table_name, column)
+        Ok(self
+            .index_manager
+            .find_indexable_comparison(txn, table_name, where_clause)?
+            .is_some())
     }
 
-    fn resolve_where_clause(
+    // 中文註解：先把子查詢解析成值集合，之後 Row / JoinedRow / 聚合列都能共用同一套 evaluator。
+    fn resolve_where_expr(
         &self,
-        where_clause: Option<&WhereClause>,
-    ) -> Result<Option<ResolvedWhereClause>> {
+        where_clause: Option<&WhereExpr>,
+    ) -> Result<Option<ResolvedWhereExpr>> {
         let Some(where_clause) = where_clause else {
             return Ok(None);
         };
 
+        Ok(Some(self.resolve_where_expr_inner(where_clause)?))
+    }
+
+    // 中文註解：遞迴把 WhereExpr 轉成可直接求值的樹，特別是把 IN 子查詢預先展開。
+    fn resolve_where_expr_inner(&self, where_clause: &WhereExpr) -> Result<ResolvedWhereExpr> {
         match where_clause {
-            WhereClause::Comparison {
+            WhereExpr::Comparison {
                 column,
                 operator,
                 value,
-            } => Ok(Some(ResolvedWhereClause::Comparison {
+            } => Ok(ResolvedWhereExpr::Comparison {
                 column: column.clone(),
                 operator: operator.clone(),
                 value: value.clone(),
-            })),
-            WhereClause::Subquery(SubqueryCondition { column, subquery }) => {
+            }),
+            WhereExpr::InSubquery { column, subquery } => {
                 let result = self.execute((**subquery).clone())?;
                 let ExecuteResult::Selected { rows, .. } = result else {
-                    return Ok(Some(ResolvedWhereClause::InValues {
+                    return Ok(ResolvedWhereExpr::InValues {
                         column: column.clone(),
                         values: Vec::new(),
-                    }));
+                    });
                 };
 
                 let mut values = Vec::new();
@@ -1014,10 +1044,21 @@ impl SqlExecutor {
                         values.push(value.clone());
                     }
                 }
-                Ok(Some(ResolvedWhereClause::InValues {
+                Ok(ResolvedWhereExpr::InValues {
                     column: column.clone(),
                     values,
-                }))
+                })
+            }
+            WhereExpr::And(left, right) => Ok(ResolvedWhereExpr::And(
+                Box::new(self.resolve_where_expr_inner(left)?),
+                Box::new(self.resolve_where_expr_inner(right)?),
+            )),
+            WhereExpr::Or(left, right) => Ok(ResolvedWhereExpr::Or(
+                Box::new(self.resolve_where_expr_inner(left)?),
+                Box::new(self.resolve_where_expr_inner(right)?),
+            )),
+            WhereExpr::Not(expr) => {
+                Ok(ResolvedWhereExpr::Not(Box::new(self.resolve_where_expr_inner(expr)?)))
             }
         }
     }
@@ -1129,7 +1170,7 @@ fn format_selected(columns: &[String], rows: &[Vec<Value>]) -> String {
 }
 
 #[derive(Debug, Clone)]
-enum ResolvedWhereClause {
+enum ResolvedWhereExpr {
     Comparison {
         column: String,
         operator: Operator,
@@ -1139,24 +1180,29 @@ enum ResolvedWhereClause {
         column: String,
         values: Vec<Value>,
     },
+    And(Box<ResolvedWhereExpr>, Box<ResolvedWhereExpr>),
+    Or(Box<ResolvedWhereExpr>, Box<ResolvedWhereExpr>),
+    Not(Box<ResolvedWhereExpr>),
 }
 
-fn where_comparison_parts(
-    where_clause: &WhereClause,
-) -> Option<(&str, Operator, &Value)> {
+trait ValueLookup {
+    fn lookup(&self, column: &str) -> Option<&Value>;
+}
+
+fn where_eq_comparison_parts(where_clause: &WhereExpr) -> Option<(&str, &Value)> {
     match where_clause {
-        WhereClause::Comparison {
+        WhereExpr::Comparison {
             column,
-            operator,
+            operator: Operator::Eq,
             value,
-        } => Some((column, operator.clone(), value)),
-        WhereClause::Subquery(_) => None,
+        } => Some((column, value)),
+        _ => None,
     }
 }
 
-fn render_where_clause(where_clause: &WhereClause) -> String {
+fn render_where_expr(where_clause: &WhereExpr) -> String {
     match where_clause {
-        WhereClause::Comparison {
+        WhereExpr::Comparison {
             column,
             operator,
             value,
@@ -1166,47 +1212,47 @@ fn render_where_clause(where_clause: &WhereClause) -> String {
             operator_to_str(operator),
             render_value(value)
         ),
-        WhereClause::Subquery(SubqueryCondition { column, .. }) => {
+        WhereExpr::InSubquery { column, .. } => {
             format!("{} IN (subquery)", column)
         }
+        WhereExpr::And(left, right) => format!(
+            "({} AND {})",
+            render_where_expr(left),
+            render_where_expr(right)
+        ),
+        WhereExpr::Or(left, right) => format!(
+            "({} OR {})",
+            render_where_expr(left),
+            render_where_expr(right)
+        ),
+        WhereExpr::Not(expr) => format!("(NOT {})", render_where_expr(expr)),
     }
 }
 
-fn matches_row(row: &Row, where_clause: Option<&ResolvedWhereClause>) -> bool {
+// 中文註解：遞迴執行布林 WHERE/HAVING 條件，讓 Row、JOIN 結果與聚合列共用同一套邏輯。
+fn eval_where_expr<T: ValueLookup>(row: &T, where_clause: Option<&ResolvedWhereExpr>) -> bool {
     let Some(where_clause) = where_clause else {
         return true;
     };
 
     match where_clause {
-        ResolvedWhereClause::Comparison {
+        ResolvedWhereExpr::Comparison {
             column,
             operator,
             value,
         } => row
-            .get(column)
+            .lookup(column)
             .is_some_and(|left| compare_values(left, value, operator.clone())),
-        ResolvedWhereClause::InValues { column, values } => {
-            row.get(column).is_some_and(|left| values.contains(left))
+        ResolvedWhereExpr::InValues { column, values } => {
+            row.lookup(column).is_some_and(|left| values.contains(left))
         }
-    }
-}
-
-fn matches_joined_row(row: &JoinedRow, where_clause: Option<&ResolvedWhereClause>) -> bool {
-    let Some(where_clause) = where_clause else {
-        return true;
-    };
-
-    match where_clause {
-        ResolvedWhereClause::Comparison {
-            column,
-            operator,
-            value,
-        } => row
-            .get(column)
-            .is_some_and(|left| compare_values(left, value, operator.clone())),
-        ResolvedWhereClause::InValues { column, values } => {
-            row.get(column).is_some_and(|left| values.contains(left))
+        ResolvedWhereExpr::And(left, right) => {
+            eval_where_expr(row, Some(left)) && eval_where_expr(row, Some(right))
         }
+        ResolvedWhereExpr::Or(left, right) => {
+            eval_where_expr(row, Some(left)) || eval_where_expr(row, Some(right))
+        }
+        ResolvedWhereExpr::Not(expr) => !eval_where_expr(row, Some(expr)),
     }
 }
 
@@ -1239,7 +1285,7 @@ fn render_value(value: &Value) -> String {
     }
 }
 
-fn estimate_filtered_rows(total_rows: usize, where_clause: Option<&WhereClause>) -> usize {
+fn estimate_filtered_rows(total_rows: usize, where_clause: Option<&WhereExpr>) -> usize {
     if where_clause.is_none() {
         return total_rows;
     }
@@ -1359,6 +1405,12 @@ fn resolve_join_value<'a>(row: &'a Row, table_name: &str, column: &str) -> Optio
     }
 
     row.get(column)
+}
+
+impl ValueLookup for Row {
+    fn lookup(&self, column: &str) -> Option<&Value> {
+        self.get(column)
+    }
 }
 
 fn join_output_columns(left_schema: &TableSchema, right_schema: &TableSchema) -> Vec<String> {
@@ -1486,7 +1538,13 @@ struct JoinedRow {
 }
 
 impl JoinedRow {
-    fn new(left_schema: &TableSchema, left_row: &Row, right_schema: &TableSchema, right_row: &Row) -> Self {
+    // 中文註解：JOIN 結果會把左右表欄位都展平成一列；LEFT JOIN 沒命中時右表欄位補 NULL。
+    fn new(
+        left_schema: &TableSchema,
+        left_row: &Row,
+        right_schema: &TableSchema,
+        right_row: Option<&Row>,
+    ) -> Self {
         let mut columns = Vec::new();
         for column in &left_schema.columns {
             if let Some(value) = left_row.get(&column.name) {
@@ -1494,9 +1552,11 @@ impl JoinedRow {
             }
         }
         for column in &right_schema.columns {
-            if let Some(value) = right_row.get(&column.name) {
-                columns.push((format!("{}.{}", right_schema.table_name, column.name), value.clone()));
-            }
+            let value = right_row
+                .and_then(|row| row.get(&column.name))
+                .cloned()
+                .unwrap_or(Value::Null);
+            columns.push((format!("{}.{}", right_schema.table_name, column.name), value));
         }
         Self { columns }
     }
@@ -1519,5 +1579,38 @@ impl JoinedRow {
             return None;
         }
         Some(&first.1)
+    }
+}
+
+impl ValueLookup for JoinedRow {
+    fn lookup(&self, column: &str) -> Option<&Value> {
+        self.get(column)
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ProjectedRow {
+    columns: Vec<(String, Value)>,
+}
+
+impl ProjectedRow {
+    // 中文註解：把聚合輸出欄位與值組成一列，讓 HAVING 可以像一般 WHERE 一樣查值。
+    fn new(columns: &[String], values: &[Value]) -> Self {
+        Self {
+            columns: columns
+                .iter()
+                .cloned()
+                .zip(values.iter().cloned())
+                .collect(),
+        }
+    }
+}
+
+impl ValueLookup for ProjectedRow {
+    fn lookup(&self, column: &str) -> Option<&Value> {
+        self.columns
+            .iter()
+            .find(|(name, _)| name == column)
+            .map(|(_, value)| value)
     }
 }

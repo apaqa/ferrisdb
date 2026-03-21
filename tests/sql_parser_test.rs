@@ -1,17 +1,15 @@
 // =============================================================================
-// tests/sql_parser_test.rs — SQL Lexer / Parser 測試
+// tests/sql_parser_test.rs -- SQL Lexer / Parser 測試
 // =============================================================================
 //
-// 這組測試驗證：
-// - lexer 是否能正確把 SQL 切成 token
-// - parser 是否能正確組出 AST
-// - 不合法 SQL 是否有合理錯誤
-// - 大小寫不敏感與多餘空白情況
+// 這裡主要驗證：
+// - lexer 是否能正確切出 SQL token
+// - parser 是否能產生新版 AST
+// - WHERE 布林運算、LEFT JOIN、HAVING 等語法是否正確建模
 
 use ferrisdb::sql::ast::{
-    AggregateFunc, Assignment, ColumnDef, DataType, GroupByClause, JoinClause, Operator,
-    OrderByClause, OrderDirection, SelectColumns, SelectItem, Statement, SubqueryCondition, Value,
-    WhereClause,
+    AggregateFunc, Assignment, ColumnDef, DataType, GroupByClause, JoinClause, JoinType, Operator,
+    OrderByClause, OrderDirection, SelectColumns, SelectItem, Statement, Value, WhereExpr,
 };
 use ferrisdb::sql::lexer::{Keyword, Lexer, Token};
 use ferrisdb::sql::parser::Parser;
@@ -116,12 +114,13 @@ fn test_parse_select() {
             table_name: "users".to_string(),
             columns: SelectColumns::Named(vec!["name".to_string(), "age".to_string()]),
             join: None,
-            where_clause: Some(WhereClause::Comparison {
+            where_clause: Some(WhereExpr::Comparison {
                 column: "id".to_string(),
                 operator: Operator::Eq,
                 value: Value::Int(1),
             }),
             group_by: None,
+            having: None,
             order_by: None,
             limit: None,
         }
@@ -129,20 +128,37 @@ fn test_parse_select() {
 }
 
 #[test]
-fn test_parse_select_all_and_comparison_operator() {
-    let stmt = parse_sql("SELECT * FROM users WHERE age > 25;");
+fn test_parse_where_and_or_not() {
+    let stmt = parse_sql(
+        "SELECT * FROM users WHERE id = 1 AND (age > 20 OR NOT active = false);",
+    );
     assert_eq!(
         stmt,
         Statement::Select {
             table_name: "users".to_string(),
             columns: SelectColumns::All,
             join: None,
-            where_clause: Some(WhereClause::Comparison {
-                column: "age".to_string(),
-                operator: Operator::Gt,
-                value: Value::Int(25),
-            }),
+            where_clause: Some(WhereExpr::And(
+                Box::new(WhereExpr::Comparison {
+                    column: "id".to_string(),
+                    operator: Operator::Eq,
+                    value: Value::Int(1),
+                }),
+                Box::new(WhereExpr::Or(
+                    Box::new(WhereExpr::Comparison {
+                        column: "age".to_string(),
+                        operator: Operator::Gt,
+                        value: Value::Int(20),
+                    }),
+                    Box::new(WhereExpr::Not(Box::new(WhereExpr::Comparison {
+                        column: "active".to_string(),
+                        operator: Operator::Eq,
+                        value: Value::Bool(false),
+                    }))),
+                )),
+            )),
             group_by: None,
+            having: None,
             order_by: None,
             limit: None,
         }
@@ -160,7 +176,7 @@ fn test_parse_update() {
                 column: "name".to_string(),
                 value: Value::Text("Bob".to_string()),
             }],
-            where_clause: Some(WhereClause::Comparison {
+            where_clause: Some(WhereExpr::Comparison {
                 column: "id".to_string(),
                 operator: Operator::Eq,
                 value: Value::Int(1),
@@ -176,7 +192,7 @@ fn test_parse_delete() {
         stmt,
         Statement::Delete {
             table_name: "users".to_string(),
-            where_clause: Some(WhereClause::Comparison {
+            where_clause: Some(WhereExpr::Comparison {
                 column: "id".to_string(),
                 operator: Operator::Eq,
                 value: Value::Int(1),
@@ -214,6 +230,7 @@ fn test_case_insensitive_and_extra_whitespace() {
             join: None,
             where_clause: None,
             group_by: None,
+            having: None,
             order_by: None,
             limit: None,
         }
@@ -231,16 +248,41 @@ fn test_parse_select_with_inner_join() {
             table_name: "users".to_string(),
             columns: SelectColumns::All,
             join: Some(JoinClause {
+                join_type: JoinType::Inner,
                 right_table: "orders".to_string(),
                 left_column: "users.id".to_string(),
                 right_column: "orders.user_id".to_string(),
             }),
-            where_clause: Some(WhereClause::Comparison {
+            where_clause: Some(WhereExpr::Comparison {
                 column: "users.id".to_string(),
                 operator: Operator::Eq,
                 value: Value::Int(1),
             }),
             group_by: None,
+            having: None,
+            order_by: None,
+            limit: None,
+        }
+    );
+}
+
+#[test]
+fn test_parse_left_join() {
+    let stmt = parse_sql("SELECT * FROM users LEFT JOIN orders ON users.id = orders.user_id;");
+    assert_eq!(
+        stmt,
+        Statement::Select {
+            table_name: "users".to_string(),
+            columns: SelectColumns::All,
+            join: Some(JoinClause {
+                join_type: JoinType::Left,
+                right_table: "orders".to_string(),
+                left_column: "users.id".to_string(),
+                right_column: "orders.user_id".to_string(),
+            }),
+            where_clause: None,
+            group_by: None,
+            having: None,
             order_by: None,
             limit: None,
         }
@@ -257,12 +299,13 @@ fn test_parse_explain_select() {
                 table_name: "users".to_string(),
                 columns: SelectColumns::All,
                 join: None,
-                where_clause: Some(WhereClause::Comparison {
+                where_clause: Some(WhereExpr::Comparison {
                     column: "id".to_string(),
                     operator: Operator::Eq,
                     value: Value::Int(1),
                 }),
                 group_by: None,
+                having: None,
                 order_by: None,
                 limit: None,
             }),
@@ -272,21 +315,20 @@ fn test_parse_explain_select() {
 
 #[test]
 fn test_parse_select_with_order_by_and_limit() {
-    let stmt = parse_sql(
-        "SELECT * FROM users WHERE age > 20 ORDER BY age DESC LIMIT 5;",
-    );
+    let stmt = parse_sql("SELECT * FROM users WHERE age > 20 ORDER BY age DESC LIMIT 5;");
     assert_eq!(
         stmt,
         Statement::Select {
             table_name: "users".to_string(),
             columns: SelectColumns::All,
             join: None,
-            where_clause: Some(WhereClause::Comparison {
+            where_clause: Some(WhereExpr::Comparison {
                 column: "age".to_string(),
                 operator: Operator::Gt,
                 value: Value::Int(20),
             }),
             group_by: None,
+            having: None,
             order_by: Some(OrderByClause {
                 column: "age".to_string(),
                 direction: OrderDirection::Desc,
@@ -297,9 +339,9 @@ fn test_parse_select_with_order_by_and_limit() {
 }
 
 #[test]
-fn test_parse_select_with_count_and_group_by() {
+fn test_parse_select_with_count_group_by_and_having() {
     let stmt = parse_sql(
-        "SELECT age, COUNT(*) FROM users WHERE age > 25 GROUP BY age ORDER BY age DESC LIMIT 3;",
+        "SELECT age, COUNT(*) FROM users WHERE age > 25 GROUP BY age HAVING COUNT(*) > 1 ORDER BY age DESC LIMIT 3;",
     );
     assert_eq!(
         stmt,
@@ -313,13 +355,18 @@ fn test_parse_select_with_count_and_group_by() {
                 },
             ]),
             join: None,
-            where_clause: Some(WhereClause::Comparison {
+            where_clause: Some(WhereExpr::Comparison {
                 column: "age".to_string(),
                 operator: Operator::Gt,
                 value: Value::Int(25),
             }),
             group_by: Some(GroupByClause {
                 column: "age".to_string(),
+            }),
+            having: Some(WhereExpr::Comparison {
+                column: "COUNT(*)".to_string(),
+                operator: Operator::Gt,
+                value: Value::Int(1),
             }),
             order_by: Some(OrderByClause {
                 column: "age".to_string(),
@@ -383,7 +430,7 @@ fn test_parse_create_if_not_exists_alter_drop_table_and_subquery() {
             table_name: "users".to_string(),
             columns: SelectColumns::All,
             join: None,
-            where_clause: Some(WhereClause::Subquery(SubqueryCondition {
+            where_clause: Some(WhereExpr::InSubquery {
                 column: "id".to_string(),
                 subquery: Box::new(Statement::Select {
                     table_name: "orders".to_string(),
@@ -391,21 +438,25 @@ fn test_parse_create_if_not_exists_alter_drop_table_and_subquery() {
                     join: None,
                     where_clause: None,
                     group_by: None,
+                    having: None,
                     order_by: None,
                     limit: None,
                 }),
-            })),
+            }),
             group_by: None,
+            having: None,
             order_by: None,
             limit: None,
         }
     );
 }
 
+// 中文註解：測試內統一走 lexer + parser，避免每個案例重複樣板。
 fn parse_sql(sql: &str) -> Statement {
     parse_sql_result(sql).expect("parse sql")
 }
 
+// 中文註解：保留 Result 版 helper，方便直接測錯誤訊息。
 fn parse_sql_result(sql: &str) -> Result<Statement, ferrisdb::error::FerrisDbError> {
     let mut lexer = Lexer::new(sql);
     let tokens = lexer.tokenize()?;

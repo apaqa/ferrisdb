@@ -1,22 +1,16 @@
 // =============================================================================
-// sql/parser.rs — SQL Parser
+// sql/parser.rs -- SQL Parser
 // =============================================================================
 //
-// Parser 接收 lexer 產生的 token 串，並依照 SQL 語法規則組成 AST。
-//
-// 例子：
-// - tokens: SELECT, name, FROM, users, WHERE, id, =, 1
-// - AST: Statement::Select { ... }
-//
-// 這裡採用簡單的 hand-written recursive descent parser，
-// 好處是易讀、容易擴充，也很適合這種子集 SQL。
+// Parser 會把 lexer 產生的 token 串轉成 AST。
+// 這裡採用 hand-written recursive descent parser，讓 SQL 語法的擴充
+// 可以直接透過函式呼叫順序表達優先級與結構。
 
 use crate::error::{FerrisDbError, Result};
 
 use super::ast::{
-    AggregateFunc, Assignment, ColumnDef, DataType, GroupByClause, JoinClause, Operator,
-    OrderByClause, OrderDirection, SelectColumns, SelectItem, Statement, SubqueryCondition, Value,
-    WhereClause,
+    AggregateFunc, Assignment, ColumnDef, DataType, GroupByClause, JoinClause, JoinType, Operator,
+    OrderByClause, OrderDirection, SelectColumns, SelectItem, Statement, Value, WhereExpr,
 };
 use super::lexer::{Keyword, Token};
 
@@ -30,6 +24,7 @@ impl Parser {
         Parser { tokens, pos: 0 }
     }
 
+    // 中文註解：解析整條 SQL，並檢查結尾是否還殘留未消耗的 token。
     pub fn parse(&mut self) -> Result<Statement> {
         if self.tokens.is_empty() {
             return Err(FerrisDbError::InvalidCommand(
@@ -50,7 +45,7 @@ impl Parser {
                 return Err(FerrisDbError::InvalidCommand(format!(
                     "unsupported SQL statement starting with {:?}",
                     other
-                )))
+                )));
             }
         };
 
@@ -189,7 +184,7 @@ impl Parser {
                 return Err(FerrisDbError::InvalidCommand(format!(
                     "EXPLAIN currently only supports SELECT, got {:?}",
                     other
-                )))
+                )));
             }
         };
 
@@ -232,6 +227,7 @@ impl Parser {
         })
     }
 
+    // 中文註解：解析 SELECT 主體，包含 JOIN、WHERE、GROUP BY、HAVING、ORDER BY、LIMIT。
     fn parse_select(&mut self) -> Result<Statement> {
         self.expect_keyword(Keyword::Select)?;
         let columns = if matches!(self.peek(), Some(Token::Star)) {
@@ -269,6 +265,7 @@ impl Parser {
         let join = self.parse_optional_join()?;
         let where_clause = self.parse_optional_where()?;
         let group_by = self.parse_optional_group_by()?;
+        let having = self.parse_optional_having()?;
         let order_by = self.parse_optional_order_by()?;
         let limit = self.parse_optional_limit()?;
 
@@ -278,6 +275,7 @@ impl Parser {
             join,
             where_clause,
             group_by,
+            having,
             order_by,
             limit,
         })
@@ -321,44 +319,126 @@ impl Parser {
         })
     }
 
-    fn parse_optional_where(&mut self) -> Result<Option<WhereClause>> {
+    // 中文註解：WHERE 使用布林運算式樹狀結構，因此這裡只負責判斷有無 WHERE，實際遞迴解析交給 parse_where_expr。
+    fn parse_optional_where(&mut self) -> Result<Option<WhereExpr>> {
         if !matches!(self.peek(), Some(Token::Keyword(Keyword::Where))) {
             return Ok(None);
         }
 
         self.bump();
-        let column = self.parse_identifier_path()?;
+        Ok(Some(self.parse_where_expr()?))
+    }
+
+    // 中文註解：HAVING 也沿用 WhereExpr，讓聚合後條件與一般 WHERE 共用同一套布林語法。
+    fn parse_optional_having(&mut self) -> Result<Option<WhereExpr>> {
+        if !matches!(self.peek(), Some(Token::Keyword(Keyword::Having))) {
+            return Ok(None);
+        }
+
+        self.bump();
+        Ok(Some(self.parse_where_expr()?))
+    }
+
+    // 中文註解：WHERE/HAVING 的入口，最低優先級是 OR。
+    fn parse_where_expr(&mut self) -> Result<WhereExpr> {
+        self.parse_or_expr()
+    }
+
+    // 中文註解：OR 是最低優先級，所以先吃完整個 AND 鏈再組成 OR 節點。
+    fn parse_or_expr(&mut self) -> Result<WhereExpr> {
+        let mut expr = self.parse_and_expr()?;
+        while matches!(self.peek(), Some(Token::Keyword(Keyword::Or))) {
+            self.bump();
+            let rhs = self.parse_and_expr()?;
+            expr = WhereExpr::Or(Box::new(expr), Box::new(rhs));
+        }
+        Ok(expr)
+    }
+
+    // 中文註解：AND 優先級高於 OR，因此在這一層連續吃掉多個 NOT/primary 子句。
+    fn parse_and_expr(&mut self) -> Result<WhereExpr> {
+        let mut expr = self.parse_not_expr()?;
+        while matches!(self.peek(), Some(Token::Keyword(Keyword::And))) {
+            self.bump();
+            let rhs = self.parse_not_expr()?;
+            expr = WhereExpr::And(Box::new(expr), Box::new(rhs));
+        }
+        Ok(expr)
+    }
+
+    // 中文註解：NOT 只套用到右邊的單一運算式，並支援連續巢狀 NOT。
+    fn parse_not_expr(&mut self) -> Result<WhereExpr> {
+        if matches!(self.peek(), Some(Token::Keyword(Keyword::Not))) {
+            self.bump();
+            return Ok(WhereExpr::Not(Box::new(self.parse_not_expr()?)));
+        }
+        self.parse_where_primary()
+    }
+
+    // 中文註解：primary 可以是括號包起來的子運算式，或一個實際比較/IN predicate。
+    fn parse_where_primary(&mut self) -> Result<WhereExpr> {
+        if matches!(self.peek(), Some(Token::LParen)) {
+            self.bump();
+            let expr = self.parse_where_expr()?;
+            self.expect_token(Token::RParen)?;
+            return Ok(expr);
+        }
+
+        self.parse_predicate_expr()
+    }
+
+    // 中文註解：解析最底層條件，支援 `column op value` 與 `column IN (SELECT ...)`。
+    fn parse_predicate_expr(&mut self) -> Result<WhereExpr> {
+        let column = self.parse_condition_column()?;
         if matches!(self.peek(), Some(Token::Keyword(Keyword::In))) {
             self.bump();
             self.expect_token(Token::LParen)?;
             let subquery = self.parse_select()?;
             self.expect_token(Token::RParen)?;
-            return Ok(Some(WhereClause::Subquery(SubqueryCondition {
+            return Ok(WhereExpr::InSubquery {
                 column,
                 subquery: Box::new(subquery),
-            })));
+            });
         }
+
         let operator = self.parse_operator()?;
         let value = self.parse_value()?;
-
-        Ok(Some(WhereClause::Comparison {
+        Ok(WhereExpr::Comparison {
             column,
             operator,
             value,
-        }))
+        })
     }
 
-    fn parse_optional_join(&mut self) -> Result<Option<JoinClause>> {
-        if !matches!(
-            self.peek(),
-            Some(Token::Keyword(Keyword::Inner)) | Some(Token::Keyword(Keyword::Join))
-        ) {
-            return Ok(None);
+    // 中文註解：條件左側除了普通欄位，也允許 HAVING 使用聚合函式結果，例如 `COUNT(*) > 2`。
+    fn parse_condition_column(&mut self) -> Result<String> {
+        match self.peek() {
+            Some(Token::Keyword(Keyword::Count))
+            | Some(Token::Keyword(Keyword::Sum))
+            | Some(Token::Keyword(Keyword::Min))
+            | Some(Token::Keyword(Keyword::Max)) => {
+                let item = self.parse_aggregate_item()?;
+                Ok(render_condition_item(&item))
+            }
+            _ => self.parse_identifier_path(),
         }
+    }
 
-        if matches!(self.peek(), Some(Token::Keyword(Keyword::Inner))) {
-            self.bump();
-        }
+    // 中文註解：JOIN 目前支援 `JOIN`/`INNER JOIN` 與 `LEFT JOIN`。
+    fn parse_optional_join(&mut self) -> Result<Option<JoinClause>> {
+        let join_type = match self.peek() {
+            Some(Token::Keyword(Keyword::Inner)) => {
+                self.bump();
+                JoinType::Inner
+            }
+            Some(Token::Keyword(Keyword::Left)) => {
+                self.bump();
+                JoinType::Left
+            }
+            Some(Token::Keyword(Keyword::Join)) => JoinType::Inner,
+            _ => return Ok(None),
+        };
+
         self.expect_keyword(Keyword::Join)?;
         let right_table = self.parse_identifier_path()?;
         self.expect_keyword(Keyword::On)?;
@@ -367,6 +447,7 @@ impl Parser {
         let right_column = self.parse_identifier_path()?;
 
         Ok(Some(JoinClause {
+            join_type,
             right_table,
             left_column,
             right_column,
@@ -396,6 +477,7 @@ impl Parser {
         Ok(Some(OrderByClause { column, direction }))
     }
 
+    // 中文註解：GROUP BY 目前仍維持單欄位群組，但可以搭配 HAVING 做聚合後過濾。
     fn parse_optional_group_by(&mut self) -> Result<Option<GroupByClause>> {
         if !matches!(self.peek(), Some(Token::Keyword(Keyword::Group))) {
             return Ok(None);
@@ -484,7 +566,7 @@ impl Parser {
                 return Err(FerrisDbError::InvalidCommand(format!(
                     "expected aggregate function, got {:?}",
                     other
-                )))
+                )));
             }
         };
 
@@ -574,5 +656,20 @@ impl Parser {
             self.pos += 1;
         }
         token
+    }
+}
+
+// 中文註解：把聚合函式 token 重新轉回固定字串，讓 HAVING 可以用欄位名稱比對聚合結果。
+fn render_condition_item(item: &SelectItem) -> String {
+    match item {
+        SelectItem::Column(name) => name.clone(),
+        SelectItem::Aggregate { func, column } => match (func, column.as_deref()) {
+            (AggregateFunc::Count, None) => "COUNT(*)".to_string(),
+            (AggregateFunc::Count, Some(column)) => format!("COUNT({})", column),
+            (AggregateFunc::Sum, Some(column)) => format!("SUM({})", column),
+            (AggregateFunc::Min, Some(column)) => format!("MIN({})", column),
+            (AggregateFunc::Max, Some(column)) => format!("MAX({})", column),
+            (_, None) => "INVALID_AGGREGATE".to_string(),
+        },
     }
 }

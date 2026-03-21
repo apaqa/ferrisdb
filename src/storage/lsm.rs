@@ -48,6 +48,7 @@ pub struct SstableInfo {
     pub filename: String,
     pub size_bytes: u64,
     pub key_count: usize,
+    pub bloom_filter_hit_rate: u64,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -73,12 +74,7 @@ pub struct LsmEngine {
 
 impl LsmEngine {
     pub fn open(data_dir: impl AsRef<Path>, threshold: usize) -> Result<Self> {
-        Self::open_with_options(
-            data_dir,
-            threshold,
-            AUTO_COMPACTION_SSTABLE_LIMIT,
-            true,
-        )
+        Self::open_with_options(data_dir, threshold, AUTO_COMPACTION_SSTABLE_LIMIT, true)
     }
 
     pub fn open_with_options(
@@ -185,7 +181,11 @@ impl LsmEngine {
             .collect();
         let removed: Vec<String> = source_paths
             .iter()
-            .filter_map(|path| path.file_name().and_then(|name| name.to_str()).map(|s| s.to_string()))
+            .filter_map(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .map(|s| s.to_string())
+            })
             .collect();
 
         let next_id = self.manifest.next_id();
@@ -226,6 +226,8 @@ impl LsmEngine {
                         .to_string(),
                     size_bytes: reader.file_size()?,
                     key_count: reader.entry_count(),
+                    // 中文註解：為了避免 JSON 浮點比較在測試中太脆弱，這裡以萬分比整數輸出。
+                    bloom_filter_hit_rate: (reader.bloom_filter_hit_rate() * 10_000.0) as u64,
                 })
             })
             .collect()
@@ -233,7 +235,11 @@ impl LsmEngine {
 
     pub fn wal_info(&self) -> Result<(u64, usize)> {
         let path = self.wal_path();
-        let size = if path.exists() { fs::metadata(&path)?.len() } else { 0 };
+        let size = if path.exists() {
+            fs::metadata(&path)?.len()
+        } else {
+            0
+        };
         let count = if path.exists() && size > 0 {
             WalReader::open(&path)?.record_count()?
         } else {
@@ -315,8 +321,9 @@ impl LsmEngine {
         }
         writer.finish()?;
 
-        self.manifest
-            .append_record(ManifestRecord::AddSstable { filename: filename.clone() })?;
+        self.manifest.append_record(ManifestRecord::AddSstable {
+            filename: filename.clone(),
+        })?;
         let reader = SSTableReader::open(&sstable_path)?;
         self.sstables.insert(0, reader);
 

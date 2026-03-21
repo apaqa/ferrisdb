@@ -1,15 +1,10 @@
 // =============================================================================
-// sql/ast.rs — SQL 抽象語法樹（AST）
+// sql/ast.rs -- SQL AST Definitions
 // =============================================================================
 //
-// AST（Abstract Syntax Tree）是 parser 的輸出。
-// 它把 SQL 的字串形式轉成結構化資料，讓後續執行器不需要再處理字串細節。
-//
-// 例如：
-//   SELECT name FROM users WHERE id = 1;
-//
-// 解析後會變成一個 Statement::Select，
-// 其中 table_name / columns / where_clause 都是明確欄位。
+// AST（Abstract Syntax Tree）是 parser 輸出的結構化 SQL 表示。
+// 這一層不直接執行查詢，只負責把 SQL 的語意明確描述出來，
+// 讓 executor 後續可以依照欄位、條件、JOIN、GROUP BY、HAVING 等資訊執行。
 
 use serde::{Deserialize, Serialize};
 
@@ -51,19 +46,20 @@ pub enum Statement {
         table_name: String,
         columns: SelectColumns,
         join: Option<JoinClause>,
-        where_clause: Option<WhereClause>,
+        where_clause: Option<WhereExpr>,
         group_by: Option<GroupByClause>,
+        having: Option<WhereExpr>,
         order_by: Option<OrderByClause>,
         limit: Option<usize>,
     },
     Update {
         table_name: String,
         assignments: Vec<Assignment>,
-        where_clause: Option<WhereClause>,
+        where_clause: Option<WhereExpr>,
     },
     Delete {
         table_name: String,
-        where_clause: Option<WhereClause>,
+        where_clause: Option<WhereExpr>,
     },
 }
 
@@ -113,26 +109,33 @@ pub enum AggregateFunc {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum WhereClause {
+pub enum WhereExpr {
     Comparison {
         column: String,
         operator: Operator,
         value: Value,
     },
-    Subquery(SubqueryCondition),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SubqueryCondition {
-    pub column: String,
-    pub subquery: Box<Statement>,
+    InSubquery {
+        column: String,
+        subquery: Box<Statement>,
+    },
+    And(Box<WhereExpr>, Box<WhereExpr>),
+    Or(Box<WhereExpr>, Box<WhereExpr>),
+    Not(Box<WhereExpr>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JoinClause {
+    pub join_type: JoinType,
     pub right_table: String,
     pub left_column: String,
     pub right_column: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum JoinType {
+    Inner,
+    Left,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
