@@ -9,6 +9,7 @@ FerrisDB is a database engine implemented from scratch in Rust, featuring LSM-Tr
 - Bloom Filter for read optimization
 - MVCC with `READ COMMITTED`, `REPEATABLE READ`, and `SERIALIZABLE`
 - SQL support (`CREATE TABLE`, `INSERT`, `SELECT`, `UPDATE`, `DELETE`)
+- SQL Views and Materialized Views (`CREATE VIEW`, `CREATE MATERIALIZED VIEW`, `REFRESH MATERIALIZED VIEW`, `DROP MATERIALIZED VIEW`)
 - SQL Common Table Expressions (`WITH`)
 - SQL prepared statements (`PREPARE`, `EXECUTE`, `DEALLOCATE`)
 - SQL INNER JOIN with nested loop
@@ -31,6 +32,7 @@ FerrisDB is a database engine implemented from scratch in Rust, featuring LSM-Tr
 - ALTER TABLE (`ADD COLUMN` / `DROP COLUMN`)
 - DROP TABLE / DROP TABLE IF EXISTS
 - CREATE TABLE IF NOT EXISTS
+- Foreign Key constraints (`FOREIGN KEY ... REFERENCES ...`) with insert/update/delete checks
 - WHERE IN (subquery)
 - SQL Triggers (`CREATE TRIGGER ... BEFORE/AFTER INSERT/UPDATE/DELETE ON table FOR EACH ROW BEGIN ... END`)
 - BEFORE trigger modifies row values via `SET NEW.col = value`
@@ -48,7 +50,7 @@ FerrisDB is a database engine implemented from scratch in Rust, featuring LSM-Tr
 - Built-in benchmark framework
 - Background compaction worker
 - Failure injection and stress tests
-- 189+ automated tests
+- 196 automated tests
 
 ## Architecture
 

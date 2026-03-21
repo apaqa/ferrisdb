@@ -36,6 +36,16 @@ pub enum Statement {
         query_sql: String,
         query: Box<Statement>,
     },
+    // 中文註解：CREATE MATERIALIZED VIEW 會同時保存原始查詢 SQL 與解析後查詢，供 refresh 重新計算。
+    CreateMaterializedView {
+        view_name: String,
+        query_sql: String,
+        query: Box<Statement>,
+    },
+    // 中文註解：REFRESH MATERIALIZED VIEW 會重新執行保存的查詢並覆寫快取資料。
+    RefreshMaterializedView {
+        view_name: String,
+    },
     CreateProcedure {
         name: String,
         params: Vec<ProcedureParam>,
@@ -45,6 +55,7 @@ pub enum Statement {
         table_name: String,
         if_not_exists: bool,
         columns: Vec<ColumnDef>,
+        foreign_keys: Vec<ForeignKey>,
     },
     AlterTableAdd {
         table_name: String,
@@ -59,6 +70,11 @@ pub enum Statement {
         if_exists: bool,
     },
     DropView {
+        view_name: String,
+        if_exists: bool,
+    },
+    // 中文註解：DROP MATERIALIZED VIEW 會刪除 metadata 與已快取的實體 rows。
+    DropMaterializedView {
         view_name: String,
         if_exists: bool,
     },
@@ -189,6 +205,13 @@ pub struct CTE {
 pub struct ColumnDef {
     pub name: String,
     pub data_type: DataType,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ForeignKey {
+    pub columns: Vec<String>,
+    pub ref_table: String,
+    pub ref_columns: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

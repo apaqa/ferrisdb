@@ -6,9 +6,9 @@
 // - parser ?臬?賜???AST
 // - WHERE 撣????EFT JOIN?AVING 蝑?瘜?行迤蝣箏遣璅?
 use ferrisdb::sql::ast::{
-    AggregateFunc, Assignment, CTE, ColumnDef, DataType, GroupByClause, InsertSource,
-    IsolationLevel, JoinClause, JoinType, Operator, OrderByClause, OrderDirection, ProcedureParam,
-    SelectColumns, SelectItem, Statement, Value, WhereExpr,
+    AggregateFunc, Assignment, CTE, ColumnDef, DataType, ForeignKey, GroupByClause, InsertSource,
+    IsolationLevel, JoinClause, JoinType, Operator, OrderByClause, OrderDirection,
+    ProcedureParam, SelectColumns, SelectItem, Statement, Value, WhereExpr,
 };
 use ferrisdb::sql::lexer::{Keyword, Lexer, Token};
 use ferrisdb::sql::parser::Parser;
@@ -58,6 +58,7 @@ fn test_parse_create_table() {
                     data_type: DataType::Bool,
                 },
             ],
+            foreign_keys: vec![],
         }
     );
 }
@@ -588,6 +589,7 @@ fn test_parse_create_if_not_exists_alter_drop_table_and_subquery() {
                     data_type: DataType::Text,
                 },
             ],
+            foreign_keys: vec![],
         }
     );
 
@@ -759,6 +761,48 @@ fn test_parse_create_drop_view_insert_select_and_union() {
     );
 
     assert_eq!(
+        parse_sql(
+            "CREATE MATERIALIZED VIEW high_earners_cache AS SELECT * FROM employees WHERE salary > 80000;"
+        ),
+        Statement::CreateMaterializedView {
+            view_name: "high_earners_cache".to_string(),
+            query_sql: "SELECT * FROM employees WHERE salary > 80000".to_string(),
+            query: Box::new(Statement::Select {
+            ctes: vec![],
+                distinct: false,
+                table_name: "employees".to_string(),
+                table_alias: None,
+                columns: SelectColumns::All,
+                join: None,
+                where_clause: Some(WhereExpr::Comparison {
+                    column: "salary".to_string(),
+                    operator: Operator::Gt,
+                    value: Value::Int(80000),
+                }),
+                group_by: None,
+                having: None,
+                order_by: None,
+                limit: None,
+            }),
+        }
+    );
+
+    assert_eq!(
+        parse_sql("REFRESH MATERIALIZED VIEW high_earners_cache;"),
+        Statement::RefreshMaterializedView {
+            view_name: "high_earners_cache".to_string(),
+        }
+    );
+
+    assert_eq!(
+        parse_sql("DROP MATERIALIZED VIEW IF EXISTS high_earners_cache;"),
+        Statement::DropMaterializedView {
+            view_name: "high_earners_cache".to_string(),
+            if_exists: true,
+        }
+    );
+
+    assert_eq!(
         parse_sql("DROP VIEW IF EXISTS high_earners;"),
         Statement::DropView {
             view_name: "high_earners".to_string(),
@@ -835,6 +879,34 @@ fn test_parse_create_drop_view_insert_select_and_union() {
                 limit: None,
             }),
             all: true,
+        }
+    );
+}
+
+#[test]
+fn test_parse_create_table_with_foreign_key() {
+    assert_eq!(
+        parse_sql(
+            "CREATE TABLE orders (id INT, customer_id INT, FOREIGN KEY (customer_id) REFERENCES customers(id));"
+        ),
+        Statement::CreateTable {
+            table_name: "orders".to_string(),
+            if_not_exists: false,
+            columns: vec![
+                ColumnDef {
+                    name: "id".to_string(),
+                    data_type: DataType::Int,
+                },
+                ColumnDef {
+                    name: "customer_id".to_string(),
+                    data_type: DataType::Int,
+                },
+            ],
+            foreign_keys: vec![ForeignKey {
+                columns: vec!["customer_id".to_string()],
+                ref_table: "customers".to_string(),
+                ref_columns: vec!["id".to_string()],
+            }],
         }
     );
 }

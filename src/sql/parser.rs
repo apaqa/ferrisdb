@@ -4,10 +4,10 @@
 use crate::error::{FerrisDbError, Result};
 
 use super::ast::{
-    AggregateFunc, Assignment, CTE, ColumnDef, DataType, Expr, GroupByClause, InsertSource,
-    IsolationLevel, JoinClause, JoinType, Operator, OrderByClause, OrderDirection, ProcedureParam,
-    Privilege, SelectColumns, SelectItem, Statement, TriggerEvent, TriggerTiming, Value,
-    WhereExpr, WindowFunc,
+    AggregateFunc, Assignment, CTE, ColumnDef, DataType, Expr, ForeignKey, GroupByClause,
+    InsertSource, IsolationLevel, JoinClause, JoinType, Operator, OrderByClause,
+    OrderDirection, ProcedureParam, Privilege, SelectColumns, SelectItem, Statement,
+    TriggerEvent, TriggerTiming, Value, WhereExpr, WindowFunc,
 };
 use super::lexer::{Keyword, Token};
 
@@ -65,6 +65,7 @@ impl Parser {
             Some(Token::Keyword(Keyword::Call)) => self.parse_call_procedure()?,
             Some(Token::Keyword(Keyword::Declare)) => self.parse_declare_statement()?,
             Some(Token::Keyword(Keyword::Create)) => self.parse_create_statement()?,
+            Some(Token::Keyword(Keyword::Refresh)) => self.parse_refresh_statement()?,
             Some(Token::Keyword(Keyword::Drop)) => self.parse_drop_statement()?,
             Some(Token::Keyword(Keyword::Insert)) => self.parse_insert()?,
             Some(Token::Keyword(Keyword::With)) => self.parse_query_expression()?,
@@ -98,6 +99,9 @@ impl Parser {
     fn parse_create_statement(&mut self) -> Result<Statement> {
         self.expect_keyword(Keyword::Create)?;
         match self.peek() {
+            Some(Token::Keyword(Keyword::Materialized)) => {
+                self.parse_create_materialized_view_after_create()
+            }
             Some(Token::Keyword(Keyword::View)) => self.parse_create_view_after_create(),
             Some(Token::Keyword(Keyword::Procedure)) => self.parse_create_procedure_after_create(),
             Some(Token::Keyword(Keyword::Table)) => self.parse_create_table_after_create(),
@@ -105,10 +109,33 @@ impl Parser {
             // 中文註解：CREATE TRIGGER 觸發器定義
             Some(Token::Keyword(Keyword::Trigger)) => self.parse_create_trigger_after_create(),
             other => Err(FerrisDbError::InvalidCommand(format!(
-                "expected VIEW, PROCEDURE, TABLE, INDEX or TRIGGER after CREATE, got {:?}",
+                "expected MATERIALIZED VIEW, VIEW, PROCEDURE, TABLE, INDEX or TRIGGER after CREATE, got {:?}",
                 other
             ))),
         }
+    }
+
+    fn parse_create_materialized_view_after_create(&mut self) -> Result<Statement> {
+        self.expect_keyword(Keyword::Materialized)?;
+        self.expect_keyword(Keyword::View)?;
+        let view_name = self.expect_ident()?;
+        self.expect_keyword(Keyword::As)?;
+
+        // 中文註解：物化視圖需要保留原始查詢 SQL，讓 REFRESH 可以直接重跑同一段查詢。
+        let mut query_tokens = self.tokens[self.pos..].to_vec();
+        if matches!(query_tokens.last(), Some(Token::Semicolon)) {
+            query_tokens.pop();
+        }
+        let query_sql = tokens_to_sql(&query_tokens);
+        let mut query_parser = Parser::new(query_tokens);
+        let query = query_parser.parse_query_expression()?;
+        self.pos = self.tokens.len();
+
+        Ok(Statement::CreateMaterializedView {
+            view_name,
+            query_sql,
+            query: Box::new(query),
+        })
     }
 
     fn parse_create_view_after_create(&mut self) -> Result<Statement> {
@@ -168,10 +195,15 @@ impl Parser {
         self.expect_token(Token::LParen)?;
 
         let mut columns = Vec::new();
+        let mut foreign_keys = Vec::new();
         loop {
-            let name = self.expect_ident()?;
-            let data_type = self.parse_data_type()?;
-            columns.push(ColumnDef { name, data_type });
+            if matches!(self.peek(), Some(Token::Keyword(Keyword::Foreign))) {
+                foreign_keys.push(self.parse_foreign_key_clause()?);
+            } else {
+                let name = self.expect_ident()?;
+                let data_type = self.parse_data_type()?;
+                columns.push(ColumnDef { name, data_type });
+            }
 
             if matches!(self.peek(), Some(Token::Comma)) {
                 self.bump();
@@ -185,6 +217,26 @@ impl Parser {
             table_name,
             if_not_exists,
             columns,
+            foreign_keys,
+        })
+    }
+
+    fn parse_foreign_key_clause(&mut self) -> Result<ForeignKey> {
+        self.expect_keyword(Keyword::Foreign)?;
+        self.expect_keyword(Keyword::Key)?;
+        self.expect_token(Token::LParen)?;
+        let columns = self.parse_identifier_list()?;
+        self.expect_token(Token::RParen)?;
+        self.expect_keyword(Keyword::References)?;
+        let ref_table = self.expect_ident()?;
+        self.expect_token(Token::LParen)?;
+        let ref_columns = self.parse_identifier_list()?;
+        self.expect_token(Token::RParen)?;
+
+        Ok(ForeignKey {
+            columns,
+            ref_table,
+            ref_columns,
         })
     }
 
@@ -370,6 +422,16 @@ impl Parser {
     fn parse_drop_statement(&mut self) -> Result<Statement> {
         self.expect_keyword(Keyword::Drop)?;
         match self.peek() {
+            Some(Token::Keyword(Keyword::Materialized)) => {
+                self.expect_keyword(Keyword::Materialized)?;
+                self.expect_keyword(Keyword::View)?;
+                let if_exists = self.parse_optional_if_exists()?;
+                let view_name = self.expect_ident()?;
+                Ok(Statement::DropMaterializedView {
+                    view_name,
+                    if_exists,
+                })
+            }
             Some(Token::Keyword(Keyword::View)) => {
                 self.expect_keyword(Keyword::View)?;
                 let if_exists = self.parse_optional_if_exists()?;
@@ -412,10 +474,19 @@ impl Parser {
                 Ok(Statement::DropTrigger { trigger_name })
             }
             other => Err(FerrisDbError::InvalidCommand(format!(
-                "expected VIEW, PROCEDURE, INDEX, TABLE or TRIGGER after DROP, got {:?}",
+                "expected MATERIALIZED VIEW, VIEW, PROCEDURE, INDEX, TABLE or TRIGGER after DROP, got {:?}",
                 other
             ))),
         }
+    }
+
+    fn parse_refresh_statement(&mut self) -> Result<Statement> {
+        self.expect_keyword(Keyword::Refresh)?;
+        self.expect_keyword(Keyword::Materialized)?;
+        self.expect_keyword(Keyword::View)?;
+        Ok(Statement::RefreshMaterializedView {
+            view_name: self.expect_ident()?,
+        })
     }
 
     fn parse_alter_table(&mut self) -> Result<Statement> {
@@ -1692,6 +1763,8 @@ fn keyword_to_sql(keyword: &Keyword) -> &'static str {
         Keyword::Variable => "VARIABLE",
         Keyword::Return => "RETURN",
         Keyword::View => "VIEW",
+        Keyword::Materialized => "MATERIALIZED",
+        Keyword::Refresh => "REFRESH",
         Keyword::Index => "INDEX",
         Keyword::Table => "TABLE",
         Keyword::Add => "ADD",
@@ -1741,6 +1814,9 @@ fn keyword_to_sql(keyword: &Keyword) -> &'static str {
         Keyword::For => "FOR",
         Keyword::Each => "EACH",
         Keyword::Row => "ROW",
+        Keyword::Foreign => "FOREIGN",
+        Keyword::Key => "KEY",
+        Keyword::References => "REFERENCES",
         Keyword::Begin => "BEGIN",
         Keyword::Cursor => "CURSOR",
         Keyword::Open => "OPEN",
@@ -1762,10 +1838,13 @@ fn max_placeholder_in_statement(statement: &Statement) -> usize {
         Statement::AnalyzeTable { .. }
         | Statement::CreateProcedure { .. }
         | Statement::CreateTable { .. }
+        | Statement::CreateMaterializedView { .. }
+        | Statement::RefreshMaterializedView { .. }
         | Statement::AlterTableAdd { .. }
         | Statement::AlterTableDropColumn { .. }
         | Statement::DropTable { .. }
         | Statement::DropView { .. }
+        | Statement::DropMaterializedView { .. }
         | Statement::DropProcedure { .. }
         | Statement::CreateView { .. }
         | Statement::CreateIndex { .. }

@@ -32,12 +32,12 @@ use crate::error::Result;
 use crate::transaction::mvcc::{MvccEngine, PreparedStatement, Transaction};
 
 use super::ast::{
-    AggregateFunc, Assignment, CTE, ColumnDef, DataType, Expr, GroupByClause, InsertSource,
-    IsolationLevel, JoinClause, JoinType, Operator, OrderByClause, OrderDirection, ProcedureParam,
-    Privilege, SelectColumns, SelectItem, Statement, TriggerEvent, TriggerTiming, Value,
-    WhereExpr, WindowFunc,
+    AggregateFunc, Assignment, CTE, ColumnDef, DataType, Expr, ForeignKey, GroupByClause,
+    InsertSource, IsolationLevel, JoinClause, JoinType, Operator, OrderByClause,
+    OrderDirection, ProcedureParam, Privilege, SelectColumns, SelectItem, Statement,
+    TriggerEvent, TriggerTiming, Value, WhereExpr, WindowFunc,
 };
-use super::catalog::{Catalog, TableSchema, ViewDefinition};
+use super::catalog::{Catalog, MaterializedViewDefinition, TableSchema, ViewDefinition};
 use super::index::IndexManager;
 use super::optimizer::{Optimizer, Plan, QueryPlanNode};
 use super::parser::Parser;
@@ -333,11 +333,17 @@ impl SqlExecutor {
                 query_sql,
                 query: _,
             } => self.execute_create_view(view_name, query_sql),
+            Statement::CreateMaterializedView {
+                view_name,
+                query_sql,
+                query,
+            } => self.execute_create_materialized_view(view_name, query_sql, *query),
             Statement::CreateTable {
                 table_name,
                 if_not_exists,
                 columns,
-            } => self.execute_create_table(table_name, if_not_exists, columns),
+                foreign_keys,
+            } => self.execute_create_table(table_name, if_not_exists, columns, foreign_keys),
             Statement::AlterTableAdd { table_name, column } => {
                 self.execute_alter_table_add(table_name, column)
             }
@@ -353,6 +359,10 @@ impl SqlExecutor {
                 view_name,
                 if_exists,
             } => self.execute_drop_view(view_name, if_exists),
+            Statement::DropMaterializedView {
+                view_name,
+                if_exists,
+            } => self.execute_drop_materialized_view(view_name, if_exists),
             Statement::DropProcedure { name } => self.execute_drop_procedure(name),
             Statement::CreateIndex {
                 table_name,
@@ -391,6 +401,9 @@ impl SqlExecutor {
             }
             Statement::CloseCursor { name } => self.execute_close_cursor(name),
             Statement::Insert { table_name, source } => self.execute_insert(table_name, source),
+            Statement::RefreshMaterializedView { view_name } => {
+                self.execute_refresh_materialized_view(view_name)
+            }
             Statement::Select {
                 ctes,
                 distinct,
@@ -514,6 +527,7 @@ impl SqlExecutor {
         table_name: String,
         if_not_exists: bool,
         columns: Vec<super::ast::ColumnDef>,
+        foreign_keys: Vec<ForeignKey>,
     ) -> Result<ExecuteResult> {
         if columns.is_empty() {
             return Ok(ExecuteResult::Error {
@@ -522,9 +536,15 @@ impl SqlExecutor {
         }
 
         let mut txn = self.engine.begin_transaction();
+        if let Some(message) =
+            self.validate_foreign_keys_on_create(&txn, &table_name, &columns, &foreign_keys)?
+        {
+            return Ok(ExecuteResult::Error { message });
+        }
         let schema = TableSchema {
             table_name: table_name.clone(),
             columns,
+            foreign_keys,
         };
 
         if !self.catalog.create_table(&mut txn, &schema)? {
@@ -554,6 +574,47 @@ impl SqlExecutor {
             });
         }
 
+        txn.commit()?;
+        Ok(ExecuteResult::Created {
+            table_name: view_name,
+        })
+    }
+
+    fn execute_create_materialized_view(
+        &self,
+        view_name: String,
+        query_sql: String,
+        query: Statement,
+    ) -> Result<ExecuteResult> {
+        let ExecuteResult::Selected { columns, rows } = self.execute(query)? else {
+            return Ok(ExecuteResult::Error {
+                message: format!("materialized view '{}' does not produce tabular rows", view_name),
+            });
+        };
+
+        let schema = materialized_schema(&view_name, &columns, &rows);
+        let mut txn = self.engine.begin_transaction();
+        if self.catalog.get_table(&txn, &view_name)?.is_some()
+            || self.catalog.get_view(&txn, &view_name)?.is_some()
+            || self.catalog.get_materialized_view(&txn, &view_name)?.is_some()
+        {
+            return Ok(ExecuteResult::Error {
+                message: format!("relation '{}' already exists", view_name),
+            });
+        }
+
+        let view = MaterializedViewDefinition {
+            view_name: view_name.clone(),
+            query_sql,
+            schema: schema.clone(),
+        };
+        if !self.catalog.create_materialized_view(&mut txn, &view)? {
+            return Ok(ExecuteResult::Error {
+                message: format!("materialized view '{}' already exists", view_name),
+            });
+        }
+
+        self.replace_materialized_view_rows(&mut txn, &view_name, &columns, rows)?;
         txn.commit()?;
         Ok(ExecuteResult::Created {
             table_name: view_name,
@@ -695,6 +756,54 @@ impl SqlExecutor {
         Ok(ExecuteResult::Dropped {
             table_name: view_name,
         })
+    }
+
+    fn execute_refresh_materialized_view(&self, view_name: String) -> Result<ExecuteResult> {
+        let mut txn = self.engine.begin_transaction();
+        let Some(mut view) = self.catalog.get_materialized_view(&txn, &view_name)? else {
+            return Ok(ExecuteResult::Error {
+                message: format!("materialized view '{}' does not exist", view_name),
+            });
+        };
+
+        let ExecuteResult::Selected { columns, rows } =
+            self.execute(parse_sql_to_statement(&view.query_sql)?)?
+        else {
+            return Ok(ExecuteResult::Error {
+                message: format!("materialized view '{}' does not produce tabular rows", view_name),
+            });
+        };
+
+        view.schema = materialized_schema(&view_name, &columns, &rows);
+        self.catalog.put_materialized_view(&mut txn, &view)?;
+        self.replace_materialized_view_rows(&mut txn, &view_name, &columns, rows)?;
+        txn.commit()?;
+        Ok(ExecuteResult::Created {
+            table_name: view_name,
+        })
+    }
+
+    fn execute_drop_materialized_view(
+        &self,
+        view_name: String,
+        if_exists: bool,
+    ) -> Result<ExecuteResult> {
+        let mut txn = self.engine.begin_transaction();
+        let Some(view) = self.catalog.get_materialized_view(&txn, &view_name)? else {
+            if if_exists {
+                return Ok(ExecuteResult::Dropped { table_name: view_name });
+            }
+            return Ok(ExecuteResult::Error {
+                message: format!("materialized view '{}' does not exist", view_name),
+            });
+        };
+
+        for (row_key, _) in self.scan_rows(&txn, &view.schema)? {
+            txn.delete(&row_key)?;
+        }
+        self.catalog.drop_materialized_view(&mut txn, &view_name)?;
+        txn.commit()?;
+        Ok(ExecuteResult::Dropped { table_name: view_name })
     }
 
     fn execute_create_index(
@@ -1536,6 +1645,27 @@ impl SqlExecutor {
                     limit,
                 );
             }
+            if let Some(view) = self.catalog.get_materialized_view(&txn, &table_name)? {
+                let rows = self
+                    .scan_rows(&txn, &view.schema)?
+                    .into_iter()
+                    .map(|(_, row)| row)
+                    .collect();
+                return self.execute_select_from_materialized_rows(
+                    &txn,
+                    view.schema,
+                    rows,
+                    distinct,
+                    table_alias,
+                    columns,
+                    join,
+                    where_clause,
+                    group_by,
+                    having,
+                    order_by,
+                    limit,
+                );
+            }
         }
         let Some(schema) = self.catalog.get_table(&txn, &table_name)? else {
             return Ok(ExecuteResult::Error {
@@ -2127,15 +2257,6 @@ impl SqlExecutor {
             });
         };
 
-        if assignments
-            .iter()
-            .any(|assignment| assignment.column == schema.columns[0].name)
-        {
-            return Ok(ExecuteResult::Error {
-                message: "updating the primary key column is not supported".to_string(),
-            });
-        }
-
         for assignment in &assignments {
             if !schema
                 .columns
@@ -2173,7 +2294,7 @@ impl SqlExecutor {
             }
 
             let old_row = row.clone();
-            let pk_value = old_row
+            let old_pk_value = old_row
                 .get(&schema.columns[0].name)
                 .cloned()
                 .unwrap_or(Value::Null);
@@ -2182,7 +2303,35 @@ impl SqlExecutor {
                 row.set(&assignment.column, assignment.value.clone());
             }
 
-            txn.put(row_key, serde_json::to_vec(&row)?)?;
+            let new_pk_value = row
+                .get(&schema.columns[0].name)
+                .cloned()
+                .unwrap_or(Value::Null);
+            if matches!(new_pk_value, Value::Null) {
+                return Ok(ExecuteResult::Error {
+                    message: "primary key cannot be NULL".to_string(),
+                });
+            }
+            if let Some(message) =
+                self.check_update_foreign_key_constraints(&txn, &schema, &old_row, &row)?
+            {
+                return Ok(ExecuteResult::Error { message });
+            }
+
+            let new_row_key = encode_row_key(&table_name, &new_pk_value);
+            if new_row_key != row_key && txn.get(&new_row_key)?.is_some() {
+                return Ok(ExecuteResult::Error {
+                    message: format!("duplicate primary key '{}' for table '{}'", render_value(&new_pk_value), table_name),
+                });
+            }
+            if let Some(message) = self.check_foreign_keys_for_row(&txn, &schema, &row)? {
+                return Ok(ExecuteResult::Error { message });
+            }
+
+            if new_row_key != row_key {
+                txn.delete(&row_key)?;
+            }
+            txn.put(new_row_key, serde_json::to_vec(&row)?)?;
             for indexed_columns in self.index_manager.list_indexes(&txn, &table_name)? {
                 let old_values = indexed_columns
                     .iter()
@@ -2198,14 +2347,29 @@ impl SqlExecutor {
                         &table_name,
                         &indexed_columns,
                         &old_row,
-                        &pk_value,
+                        &old_pk_value,
                     )?;
                     self.index_manager.insert_index_entry(
                         &mut txn,
                         &table_name,
                         &indexed_columns,
                         &row,
-                        &pk_value,
+                        &new_pk_value,
+                    )?;
+                } else if old_pk_value != new_pk_value {
+                    self.index_manager.delete_index_entry(
+                        &mut txn,
+                        &table_name,
+                        &indexed_columns,
+                        &old_row,
+                        &old_pk_value,
+                    )?;
+                    self.index_manager.insert_index_entry(
+                        &mut txn,
+                        &table_name,
+                        &indexed_columns,
+                        &row,
+                        &new_pk_value,
                     )?;
                 }
             }
@@ -2269,6 +2433,9 @@ impl SqlExecutor {
             };
             if !matches_row {
                 continue;
+            }
+            if let Some(message) = self.check_delete_foreign_key_constraints(&txn, &schema, &row)? {
+                return Ok(ExecuteResult::Error { message });
             }
             let pk_value = row
                 .get(&schema.columns[0].name)
@@ -2444,6 +2611,197 @@ impl SqlExecutor {
         Ok(columns)
     }
 
+    fn validate_foreign_keys_on_create(
+        &self,
+        txn: &Transaction,
+        table_name: &str,
+        columns: &[ColumnDef],
+        foreign_keys: &[ForeignKey],
+    ) -> Result<Option<String>> {
+        for fk in foreign_keys {
+            if fk.columns.len() != fk.ref_columns.len() {
+                return Ok(Some(format!(
+                    "foreign key on '{}' has {} local columns but {} referenced columns",
+                    table_name,
+                    fk.columns.len(),
+                    fk.ref_columns.len()
+                )));
+            }
+            for column in &fk.columns {
+                if !columns.iter().any(|item| &item.name == column) {
+                    return Ok(Some(format!("unknown column '{}' in foreign key", column)));
+                }
+            }
+            let Some(ref_schema) = self.catalog.get_table(txn, &fk.ref_table)? else {
+                return Ok(Some(format!(
+                    "referenced table '{}' does not exist",
+                    fk.ref_table
+                )));
+            };
+            for ref_column in &fk.ref_columns {
+                if !ref_schema.columns.iter().any(|item| &item.name == ref_column) {
+                    return Ok(Some(format!(
+                        "unknown referenced column '{}.{}'",
+                        fk.ref_table, ref_column
+                    )));
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    fn check_foreign_keys_for_row(
+        &self,
+        txn: &Transaction,
+        schema: &TableSchema,
+        row: &Row,
+    ) -> Result<Option<String>> {
+        for fk in &schema.foreign_keys {
+            // 中文註解：若 FK 任一欄位為 NULL，採常見資料庫行為直接略過這筆參照檢查。
+            let mut local_values = Vec::with_capacity(fk.columns.len());
+            let mut has_null = false;
+            for column in &fk.columns {
+                let value = row.get(column).cloned().unwrap_or(Value::Null);
+                if matches!(value, Value::Null) {
+                    has_null = true;
+                    break;
+                }
+                local_values.push(value);
+            }
+            if has_null {
+                continue;
+            }
+
+            let Some(ref_schema) = self.catalog.get_table(txn, &fk.ref_table)? else {
+                return Ok(Some(format!(
+                    "referenced table '{}' does not exist",
+                    fk.ref_table
+                )));
+            };
+            let ref_rows = self.scan_rows(txn, &ref_schema)?;
+            let exists = ref_rows
+                .iter()
+                .any(|(_, ref_row)| row_matches_columns(ref_row, &fk.ref_columns, &local_values));
+            if !exists {
+                return Ok(Some(format!(
+                    "foreign key constraint failed on '{}.{}' referencing '{}.{}'",
+                    schema.table_name,
+                    fk.columns.join(","),
+                    fk.ref_table,
+                    fk.ref_columns.join(",")
+                )));
+            }
+        }
+        Ok(None)
+    }
+
+    fn check_delete_foreign_key_constraints(
+        &self,
+        txn: &Transaction,
+        schema: &TableSchema,
+        row: &Row,
+    ) -> Result<Option<String>> {
+        let all_tables = self.catalog.list_tables(txn)?;
+        for table in all_tables {
+            for fk in &table.foreign_keys {
+                if fk.ref_table != schema.table_name {
+                    continue;
+                }
+                let target_values = fk
+                    .ref_columns
+                    .iter()
+                    .map(|column| row.get(column).cloned().unwrap_or(Value::Null))
+                    .collect::<Vec<_>>();
+                let ref_rows = self.scan_rows(txn, &table)?;
+                if ref_rows
+                    .iter()
+                    .any(|(_, ref_row)| row_matches_columns(ref_row, &fk.columns, &target_values))
+                {
+                    return Ok(Some(format!(
+                        "cannot delete row from '{}' because it is referenced by '{}.{}'",
+                        schema.table_name,
+                        table.table_name,
+                        fk.columns.join(",")
+                    )));
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    fn check_update_foreign_key_constraints(
+        &self,
+        txn: &Transaction,
+        schema: &TableSchema,
+        old_row: &Row,
+        new_row: &Row,
+    ) -> Result<Option<String>> {
+        if let Some(message) = self.check_foreign_keys_for_row(txn, schema, new_row)? {
+            return Ok(Some(message));
+        }
+
+        let all_tables = self.catalog.list_tables(txn)?;
+        for table in all_tables {
+            for fk in &table.foreign_keys {
+                if fk.ref_table != schema.table_name {
+                    continue;
+                }
+                let old_values = fk
+                    .ref_columns
+                    .iter()
+                    .map(|column| old_row.get(column).cloned().unwrap_or(Value::Null))
+                    .collect::<Vec<_>>();
+                let new_values = fk
+                    .ref_columns
+                    .iter()
+                    .map(|column| new_row.get(column).cloned().unwrap_or(Value::Null))
+                    .collect::<Vec<_>>();
+                if old_values == new_values {
+                    continue;
+                }
+
+                let ref_rows = self.scan_rows(txn, &table)?;
+                if ref_rows
+                    .iter()
+                    .any(|(_, ref_row)| row_matches_columns(ref_row, &fk.columns, &old_values))
+                {
+                    return Ok(Some(format!(
+                        "cannot update referenced key on '{}' because it is referenced by '{}.{}'",
+                        schema.table_name,
+                        table.table_name,
+                        fk.columns.join(",")
+                    )));
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    fn replace_materialized_view_rows(
+        &self,
+        txn: &mut Transaction,
+        view_name: &str,
+        columns: &[String],
+        rows: Vec<Vec<Value>>,
+    ) -> Result<()> {
+        let schema = TableSchema {
+            table_name: view_name.to_string(),
+            columns: materialized_schema(view_name, columns, &rows).columns,
+            foreign_keys: Vec::new(),
+        };
+        for (row_key, _) in self.scan_rows(txn, &schema)? {
+            txn.delete(&row_key)?;
+        }
+
+        for (index, values) in rows.into_iter().enumerate() {
+            let row = Row::new(columns.iter().cloned().zip(values.into_iter()).collect());
+            // 中文註解：物化視圖 row key 一律用內部流水號，避免第一欄重複時互相覆蓋。
+            let pk = Value::Text(format!("__mv_row_{}", index));
+            txn.put(encode_row_key(view_name, &pk), serde_json::to_vec(&row)?)?;
+        }
+        Ok(())
+    }
+
     fn insert_rows_into_table(
         &self,
         txn: &mut Transaction,
@@ -2477,6 +2835,9 @@ impl SqlExecutor {
                     .zip(row_values.into_iter())
                     .collect(),
             );
+            if let Some(message) = self.check_foreign_keys_for_row(txn, schema, &row)? {
+                return Ok(Err(message));
+            }
             txn.put(
                 encode_row_key(table_name, &pk_value),
                 serde_json::to_vec(&row)?,
@@ -3772,6 +4133,7 @@ fn materialized_schema(table_name: &str, columns: &[String], rows: &[Vec<Value>]
                 data_type: infer_materialized_type(rows, index),
             })
             .collect(),
+        foreign_keys: Vec::new(),
     }
 }
 
@@ -4448,6 +4810,14 @@ fn value_group_key(value: &Value) -> String {
         Value::Null => "n:null".to_string(),
         Value::Variable(name) => format!("v:{}", name),
     }
+}
+
+fn row_matches_columns(row: &Row, columns: &[String], expected: &[Value]) -> bool {
+    columns.len() == expected.len()
+        && columns
+            .iter()
+            .zip(expected.iter())
+            .all(|(column, value)| row.get(column).unwrap_or(&Value::Null) == value)
 }
 
 fn schema_with_removed_column(schema: &TableSchema, removed_column: &str) -> TableSchema {
