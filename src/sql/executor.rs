@@ -25,16 +25,16 @@
 //
 // 之後若要繼續演進，可以把 WHERE 下推、索引查找、型別檢查等能力逐步補上。
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use crate::error::Result;
-use crate::transaction::mvcc::{MvccEngine, Transaction};
+use crate::transaction::mvcc::{MvccEngine, PreparedStatement, Transaction};
 
 use super::ast::{
     AggregateFunc, Assignment, CTE, ColumnDef, DataType, Expr, GroupByClause, InsertSource,
-    JoinClause, JoinType, Operator, OrderByClause, OrderDirection, SelectColumns, SelectItem,
-    Statement, Value, WhereExpr, WindowFunc,
+    IsolationLevel, JoinClause, JoinType, Operator, OrderByClause, OrderDirection,
+    SelectColumns, SelectItem, Statement, Value, WhereExpr, WindowFunc,
 };
 use super::catalog::{Catalog, TableSchema, ViewDefinition};
 use super::index::IndexManager;
@@ -50,6 +50,15 @@ use super::statistics::StatisticsManager;
 pub enum ExecuteResult {
     Explain {
         plan: String,
+    },
+    Prepared {
+        name: String,
+    },
+    Deallocated {
+        name: String,
+    },
+    IsolationLevelSet {
+        level: IsolationLevel,
     },
     Analyzed {
         table_name: String,
@@ -125,6 +134,10 @@ impl SqlExecutor {
     pub fn execute(&self, stmt: Statement) -> Result<ExecuteResult> {
         match stmt {
             Statement::Explain { statement } => self.execute_explain(*statement),
+            Statement::Prepare { name, params, body } => self.execute_prepare(name, params, *body),
+            Statement::Execute { name, args } => self.execute_prepared(name, args),
+            Statement::Deallocate { name } => self.execute_deallocate(name),
+            Statement::SetIsolationLevel { level } => self.execute_set_isolation_level(level),
             Statement::AnalyzeTable { table_name } => self.execute_analyze_table(table_name),
             Statement::CreateView {
                 view_name,
@@ -477,6 +490,7 @@ impl SqlExecutor {
         }
         txn.commit()?;
         self.invalidate_plan_cache(&table_name);
+        self.engine.invalidate_prepared_statement_plans();
         Ok(ExecuteResult::Analyzed { table_name })
     }
 
@@ -485,6 +499,7 @@ impl SqlExecutor {
             .lock()
             .expect("plan cache lock")
             .invalidate_table(table_name);
+        self.engine.invalidate_prepared_statement_plans();
     }
 
     fn get_or_optimize_plan(&self, statement: &Statement) -> Result<QueryPlanNode> {
@@ -518,6 +533,67 @@ impl SqlExecutor {
                 message: format!("EXPLAIN does not support {:?}", other),
             }),
         }
+    }
+
+    fn execute_prepare(
+        &self,
+        name: String,
+        params: Vec<String>,
+        body: Statement,
+    ) -> Result<ExecuteResult> {
+        let prepared = PreparedStatement {
+            ast: body,
+            param_count: params.len(),
+            cached_plan: None,
+        };
+        self.engine.store_prepared_statement(name.clone(), prepared);
+        Ok(ExecuteResult::Prepared { name })
+    }
+
+    fn execute_prepared(&self, name: String, args: Vec<Value>) -> Result<ExecuteResult> {
+        let Some(prepared) = self.engine.get_prepared_statement(&name) else {
+            return Ok(ExecuteResult::Error {
+                message: format!("prepared statement '{}' does not exist", name),
+            });
+        };
+        if args.len() != prepared.param_count {
+            return Ok(ExecuteResult::Error {
+                message: format!(
+                    "prepared statement '{}' expects {} parameter(s), got {}",
+                    name,
+                    prepared.param_count,
+                    args.len()
+                ),
+            });
+        }
+
+        let mut params = HashMap::new();
+        for (index, value) in args.into_iter().enumerate() {
+            params.insert(index + 1, value);
+        }
+        let substituted = substitute_statement_placeholders(&prepared.ast, &params)?;
+
+        let result = self.execute(substituted.clone())?;
+        if let Statement::Select { .. } = substituted {
+            let plan = self.get_or_optimize_plan(&substituted)?;
+            self.engine
+                .update_prepared_statement_plan(&name, Some(plan));
+        }
+        Ok(result)
+    }
+
+    fn execute_deallocate(&self, name: String) -> Result<ExecuteResult> {
+        if !self.engine.remove_prepared_statement(&name) {
+            return Ok(ExecuteResult::Error {
+                message: format!("prepared statement '{}' does not exist", name),
+            });
+        }
+        Ok(ExecuteResult::Deallocated { name })
+    }
+
+    fn execute_set_isolation_level(&self, level: IsolationLevel) -> Result<ExecuteResult> {
+        self.engine.set_isolation_level(level.clone());
+        Ok(ExecuteResult::IsolationLevelSet { level })
     }
 
     fn execute_insert(&self, table_name: String, source: InsertSource) -> Result<ExecuteResult> {
@@ -1710,6 +1786,14 @@ impl SqlExecutor {
                 operator: operator.clone(),
                 value: value.clone(),
             }),
+            WhereExpr::PlaceholderComparison {
+                column,
+                operator,
+                placeholder,
+            } => Err(crate::error::FerrisDbError::InvalidCommand(format!(
+                "placeholder ${} in column '{}' was not bound before execution ({})",
+                placeholder, column, operator_to_str(operator)
+            ))),
             WhereExpr::ColumnComparison {
                 left,
                 operator,
@@ -1834,6 +1918,13 @@ impl SqlExecutor {
 pub fn format_execute_result(result: &ExecuteResult) -> String {
     match result {
         ExecuteResult::Explain { plan } => plan.clone(),
+        ExecuteResult::Prepared { name } => format!("Prepared statement '{}' created", name),
+        ExecuteResult::Deallocated { name } => {
+            format!("Prepared statement '{}' deallocated", name)
+        }
+        ExecuteResult::IsolationLevelSet { level } => {
+            format!("Transaction isolation level set to {}", isolation_level_name(level))
+        }
         ExecuteResult::Analyzed { table_name } => format!("Table '{}' analyzed", table_name),
         ExecuteResult::Created { table_name } => format!("Table '{}' created", table_name),
         ExecuteResult::Altered { table_name } => format!("Table '{}' altered", table_name),
@@ -1964,6 +2055,11 @@ fn render_where_expr(where_clause: &WhereExpr) -> String {
             operator_to_str(operator),
             render_value(value)
         ),
+        WhereExpr::PlaceholderComparison {
+            column,
+            operator,
+            placeholder,
+        } => format!("{} {} ${}", column, operator_to_str(operator), placeholder),
         WhereExpr::ColumnComparison {
             left,
             operator,
@@ -2059,6 +2155,7 @@ fn normalize_expr(expr: Expr, table_alias: Option<&str>, table_name: &str) -> Ex
         Expr::Column(column) => {
             Expr::Column(normalize_column_reference(column, table_alias, table_name))
         }
+        Expr::Placeholder(index) => Expr::Placeholder(index),
         Expr::CaseWhen {
             conditions,
             else_result,
@@ -2106,6 +2203,15 @@ fn normalize_where_expr(expr: WhereExpr, table_alias: Option<&str>, table_name: 
             column: normalize_column_reference(column, table_alias, table_name),
             operator,
             value,
+        },
+        WhereExpr::PlaceholderComparison {
+            column,
+            operator,
+            placeholder,
+        } => WhereExpr::PlaceholderComparison {
+            column: normalize_column_reference(column, table_alias, table_name),
+            operator,
+            placeholder,
         },
         WhereExpr::ColumnComparison {
             left,
@@ -2290,6 +2396,252 @@ fn parse_sql_to_statement(sql: &str) -> Result<Statement> {
     Ok(statements.remove(0))
 }
 
+fn substitute_statement_placeholders(
+    statement: &Statement,
+    params: &HashMap<usize, Value>,
+) -> Result<Statement> {
+    Ok(match statement {
+        Statement::Select {
+            ctes,
+            distinct,
+            table_name,
+            table_alias,
+            columns,
+            join,
+            where_clause,
+            group_by,
+            having,
+            order_by,
+            limit,
+        } => Statement::Select {
+            ctes: ctes
+                .iter()
+                .map(|cte| {
+                    Ok(CTE {
+                        name: cte.name.clone(),
+                        query: Box::new(substitute_statement_placeholders(&cte.query, params)?),
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?,
+            distinct: *distinct,
+            table_name: table_name.clone(),
+            table_alias: table_alias.clone(),
+            columns: substitute_select_columns(columns, params)?,
+            join: join.clone(),
+            where_clause: where_clause
+                .as_ref()
+                .map(|expr| substitute_where_expr(expr, params))
+                .transpose()?,
+            group_by: group_by.clone(),
+            having: having
+                .as_ref()
+                .map(|expr| substitute_where_expr(expr, params))
+                .transpose()?,
+            order_by: order_by
+                .as_ref()
+                .map(|order| -> Result<OrderByClause> {
+                    Ok(OrderByClause {
+                        column: order.column.clone(),
+                        expr: order
+                            .expr
+                            .as_ref()
+                            .map(|expr| substitute_expr(expr, params))
+                            .transpose()?,
+                        direction: order.direction.clone(),
+                    })
+                })
+                .transpose()?,
+            limit: *limit,
+        },
+        Statement::Update {
+            table_name,
+            assignments,
+            from_table,
+            join_condition,
+            where_clause,
+        } => Statement::Update {
+            table_name: table_name.clone(),
+            assignments: assignments.clone(),
+            from_table: from_table.clone(),
+            join_condition: join_condition
+                .as_ref()
+                .map(|expr| substitute_where_expr(expr, params))
+                .transpose()?,
+            where_clause: where_clause
+                .as_ref()
+                .map(|expr| substitute_where_expr(expr, params))
+                .transpose()?,
+        },
+        Statement::Delete {
+            table_name,
+            using_table,
+            join_condition,
+            where_clause,
+        } => Statement::Delete {
+            table_name: table_name.clone(),
+            using_table: using_table.clone(),
+            join_condition: join_condition
+                .as_ref()
+                .map(|expr| substitute_where_expr(expr, params))
+                .transpose()?,
+            where_clause: where_clause
+                .as_ref()
+                .map(|expr| substitute_where_expr(expr, params))
+                .transpose()?,
+        },
+        Statement::Union { left, right, all } => Statement::Union {
+            left: Box::new(substitute_statement_placeholders(left, params)?),
+            right: Box::new(substitute_statement_placeholders(right, params)?),
+            all: *all,
+        },
+        other => other.clone(),
+    })
+}
+
+fn substitute_select_columns(columns: &SelectColumns, params: &HashMap<usize, Value>) -> Result<SelectColumns> {
+    Ok(match columns {
+        SelectColumns::All => SelectColumns::All,
+        SelectColumns::Named(items) => SelectColumns::Named(
+            items.iter()
+                .map(|item| substitute_select_item(item, params))
+                .collect::<Result<Vec<_>>>()?,
+        ),
+        SelectColumns::Aggregate(items) => SelectColumns::Aggregate(
+            items.iter()
+                .map(|item| substitute_select_item(item, params))
+                .collect::<Result<Vec<_>>>()?,
+        ),
+    })
+}
+
+fn substitute_select_item(item: &SelectItem, params: &HashMap<usize, Value>) -> Result<SelectItem> {
+    Ok(match item {
+        SelectItem::Column { name, alias } => SelectItem::Column {
+            name: name.clone(),
+            alias: alias.clone(),
+        },
+        SelectItem::Expression { expr, alias } => SelectItem::Expression {
+            expr: substitute_expr(expr, params)?,
+            alias: alias.clone(),
+        },
+        SelectItem::Aggregate {
+            func,
+            column,
+            alias,
+        } => SelectItem::Aggregate {
+            func: func.clone(),
+            column: column.clone(),
+            alias: alias.clone(),
+        },
+    })
+}
+
+fn substitute_expr(expr: &Expr, params: &HashMap<usize, Value>) -> Result<Expr> {
+    Ok(match expr {
+        Expr::Value(value) => Expr::Value(value.clone()),
+        Expr::Column(column) => Expr::Column(column.clone()),
+        Expr::Placeholder(index) => Expr::Value(resolve_placeholder(*index, params)?),
+        Expr::CaseWhen {
+            conditions,
+            else_result,
+        } => Expr::CaseWhen {
+            conditions: conditions
+                .iter()
+                .map(|(condition, result)| {
+                    Ok((
+                        substitute_where_expr(condition, params)?,
+                        substitute_expr(result, params)?,
+                    ))
+                })
+                .collect::<Result<Vec<_>>>()?,
+            else_result: else_result
+                .as_ref()
+                .map(|expr| substitute_expr(expr, params).map(Box::new))
+                .transpose()?,
+        },
+        Expr::WindowFunction {
+            func,
+            target_column,
+            partition_by,
+            order_by,
+        } => Expr::WindowFunction {
+            func: func.clone(),
+            target_column: target_column.clone(),
+            partition_by: partition_by.clone(),
+            order_by: order_by.clone(),
+        },
+    })
+}
+
+fn substitute_where_expr(expr: &WhereExpr, params: &HashMap<usize, Value>) -> Result<WhereExpr> {
+    Ok(match expr {
+        WhereExpr::Comparison {
+            column,
+            operator,
+            value,
+        } => WhereExpr::Comparison {
+            column: column.clone(),
+            operator: operator.clone(),
+            value: value.clone(),
+        },
+        WhereExpr::PlaceholderComparison {
+            column,
+            operator,
+            placeholder,
+        } => WhereExpr::Comparison {
+            column: column.clone(),
+            operator: operator.clone(),
+            value: resolve_placeholder(*placeholder, params)?,
+        },
+        WhereExpr::ColumnComparison {
+            left,
+            operator,
+            right,
+        } => WhereExpr::ColumnComparison {
+            left: left.clone(),
+            operator: operator.clone(),
+            right: right.clone(),
+        },
+        WhereExpr::Between { column, low, high } => WhereExpr::Between {
+            column: column.clone(),
+            low: low.clone(),
+            high: high.clone(),
+        },
+        WhereExpr::Like { column, pattern } => WhereExpr::Like {
+            column: column.clone(),
+            pattern: pattern.clone(),
+        },
+        WhereExpr::IsNull { column, negated } => WhereExpr::IsNull {
+            column: column.clone(),
+            negated: *negated,
+        },
+        WhereExpr::InSubquery { column, subquery } => WhereExpr::InSubquery {
+            column: column.clone(),
+            subquery: Box::new(substitute_statement_placeholders(subquery, params)?),
+        },
+        WhereExpr::And(left, right) => WhereExpr::And(
+            Box::new(substitute_where_expr(left, params)?),
+            Box::new(substitute_where_expr(right, params)?),
+        ),
+        WhereExpr::Or(left, right) => WhereExpr::Or(
+            Box::new(substitute_where_expr(left, params)?),
+            Box::new(substitute_where_expr(right, params)?),
+        ),
+        WhereExpr::Not(inner) => {
+            WhereExpr::Not(Box::new(substitute_where_expr(inner, params)?))
+        }
+    })
+}
+
+fn resolve_placeholder(index: usize, params: &HashMap<usize, Value>) -> Result<Value> {
+    params.get(&index).cloned().ok_or_else(|| {
+        crate::error::FerrisDbError::InvalidCommand(format!(
+            "missing value for placeholder ${}",
+            index
+        ))
+    })
+}
+
 fn materialized_schema(table_name: &str, columns: &[String], rows: &[Vec<Value>]) -> TableSchema {
     TableSchema {
         table_name: table_name.to_string(),
@@ -2324,7 +2676,7 @@ fn materialized_rows(columns: &[String], rows: Vec<Vec<Value>>) -> Vec<Row> {
 
 fn validate_expr_columns(expr: &Expr, schema: &TableSchema) -> std::result::Result<(), String> {
     match expr {
-        Expr::Value(_) => Ok(()),
+        Expr::Value(_) | Expr::Placeholder(_) => Ok(()),
         Expr::Column(column) => {
             if schema.columns.iter().any(|item| item.name == *column) {
                 Ok(())
@@ -2371,6 +2723,7 @@ fn validate_where_expr_columns(
 ) -> std::result::Result<(), String> {
     match expr {
         WhereExpr::Comparison { column, .. }
+        | WhereExpr::PlaceholderComparison { column, .. }
         | WhereExpr::Between { column, .. }
         | WhereExpr::Like { column, .. }
         | WhereExpr::IsNull { column, .. }
@@ -2393,6 +2746,7 @@ fn render_expr(expr: &Expr) -> String {
     match expr {
         Expr::Value(value) => render_value(value),
         Expr::Column(column) => column.clone(),
+        Expr::Placeholder(index) => format!("${}", index),
         Expr::CaseWhen {
             conditions,
             else_result,
@@ -2466,6 +2820,7 @@ fn eval_expr_on_row(row: &Row, expr: &Expr) -> Value {
     match expr {
         Expr::Value(value) => value.clone(),
         Expr::Column(column) => row.get(column).cloned().unwrap_or(Value::Null),
+        Expr::Placeholder(_) => Value::Null,
         Expr::CaseWhen {
             conditions,
             else_result,
@@ -2493,6 +2848,7 @@ fn eval_where_expr_unresolved<T: ValueLookup>(row: &T, expr: &WhereExpr) -> bool
         } => row
             .lookup(column)
             .is_some_and(|left| compare_values(left, value, operator.clone())),
+        WhereExpr::PlaceholderComparison { .. } => false,
         WhereExpr::ColumnComparison {
             left,
             operator,
@@ -2713,6 +3069,14 @@ fn compare_order(left: &Value, right: &Value) -> Option<std::cmp::Ordering> {
         (Value::Text(a), Value::Text(b)) => Some(a.cmp(b)),
         (Value::Bool(a), Value::Bool(b)) => Some(a.cmp(b)),
         _ => None,
+    }
+}
+
+fn isolation_level_name(level: &IsolationLevel) -> &'static str {
+    match level {
+        IsolationLevel::ReadCommitted => "READ COMMITTED",
+        IsolationLevel::RepeatableRead => "REPEATABLE READ",
+        IsolationLevel::Serializable => "SERIALIZABLE",
     }
 }
 

@@ -6,9 +6,9 @@
 // - parser ?臬?賜???AST
 // - WHERE 撣????EFT JOIN?AVING 蝑?瘜?行迤蝣箏遣璅?
 use ferrisdb::sql::ast::{
-    AggregateFunc, Assignment, CTE, ColumnDef, DataType, GroupByClause, InsertSource, JoinClause,
-    JoinType, Operator, OrderByClause, OrderDirection, SelectColumns, SelectItem, Statement,
-    Value, WhereExpr,
+    AggregateFunc, Assignment, CTE, ColumnDef, DataType, GroupByClause, InsertSource,
+    IsolationLevel, JoinClause, JoinType, Operator, OrderByClause, OrderDirection,
+    SelectColumns, SelectItem, Statement, Value, WhereExpr,
 };
 use ferrisdb::sql::lexer::{Keyword, Lexer, Token};
 use ferrisdb::sql::parser::Parser;
@@ -374,7 +374,8 @@ fn test_invalid_sql_returns_meaningful_error() {
     assert!(
         format!("{}", err).contains("identifier")
             || format!("{}", err).contains("SQL")
-            || format!("{}", err).contains("token"),
+            || format!("{}", err).contains("token")
+            || format!("{}", err).contains("keyword"),
         "unexpected error: {}",
         err
     );
@@ -834,6 +835,77 @@ fn test_parse_create_drop_view_insert_select_and_union() {
                 limit: None,
             }),
             all: true,
+        }
+    );
+}
+
+#[test]
+fn test_parse_prepare_execute_deallocate_and_isolation_level() {
+    assert_eq!(
+        parse_sql(
+            "PREPARE dept_stmt AS SELECT * FROM employees WHERE department = $1 AND salary > $2;"
+        ),
+        Statement::Prepare {
+            name: "dept_stmt".to_string(),
+            params: vec!["$1".to_string(), "$2".to_string()],
+            body: Box::new(Statement::Select {
+                ctes: vec![],
+                distinct: false,
+                table_name: "employees".to_string(),
+                table_alias: None,
+                columns: SelectColumns::All,
+                join: None,
+                where_clause: Some(WhereExpr::And(
+                    Box::new(WhereExpr::PlaceholderComparison {
+                        column: "department".to_string(),
+                        operator: Operator::Eq,
+                        placeholder: 1,
+                    }),
+                    Box::new(WhereExpr::PlaceholderComparison {
+                        column: "salary".to_string(),
+                        operator: Operator::Gt,
+                        placeholder: 2,
+                    }),
+                )),
+                group_by: None,
+                having: None,
+                order_by: None,
+                limit: None,
+            }),
+        }
+    );
+
+    assert_eq!(
+        parse_sql("EXECUTE dept_stmt('Engineering', 80000);"),
+        Statement::Execute {
+            name: "dept_stmt".to_string(),
+            args: vec![Value::Text("Engineering".to_string()), Value::Int(80000)],
+        }
+    );
+
+    assert_eq!(
+        parse_sql("DEALLOCATE dept_stmt;"),
+        Statement::Deallocate {
+            name: "dept_stmt".to_string(),
+        }
+    );
+
+    assert_eq!(
+        parse_sql("SET TRANSACTION ISOLATION LEVEL READ COMMITTED;"),
+        Statement::SetIsolationLevel {
+            level: IsolationLevel::ReadCommitted,
+        }
+    );
+    assert_eq!(
+        parse_sql("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ;"),
+        Statement::SetIsolationLevel {
+            level: IsolationLevel::RepeatableRead,
+        }
+    );
+    assert_eq!(
+        parse_sql("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE;"),
+        Statement::SetIsolationLevel {
+            level: IsolationLevel::Serializable,
         }
     );
 }

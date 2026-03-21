@@ -25,6 +25,7 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 
 use crate::bench::{format_bench_results, run_basic_kv_benchmark};
+use crate::config::WalMode;
 use crate::error::Result;
 use crate::sql::executor::{format_execute_result, SqlExecutor};
 use crate::sql::parser::Parser;
@@ -159,6 +160,27 @@ fn handle_rollback(active_txn: &mut Option<Transaction>) {
 fn handle_set(engine: &Arc<MvccEngine>, active_txn: &mut Option<Transaction>, parts: &[&str]) {
     if parts.len() < 3 {
         println!("Usage: set <key> <value>");
+        return;
+    }
+
+    if parts[1].eq_ignore_ascii_case("wal_mode") {
+        if active_txn.is_some() {
+            println!("Error: cannot change wal_mode while a transaction is active");
+            return;
+        }
+        let wal_mode = match parts[2].to_ascii_lowercase().as_str() {
+            "wal" => WalMode::Wal,
+            "sync" => WalMode::Sync,
+            "disabled" => WalMode::WalDisabled,
+            other => {
+                println!("Error: unknown wal_mode '{}'", other);
+                return;
+            }
+        };
+        match engine.inner.set_wal_mode(wal_mode) {
+            Ok(()) => println!("OK"),
+            Err(err) => println!("Error: {}", err),
+        }
         return;
     }
 

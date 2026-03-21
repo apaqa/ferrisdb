@@ -16,6 +16,21 @@ pub enum Statement {
     AnalyzeTable {
         table_name: String,
     },
+    Prepare {
+        name: String,
+        params: Vec<String>,
+        body: Box<Statement>,
+    },
+    Execute {
+        name: String,
+        args: Vec<Value>,
+    },
+    Deallocate {
+        name: String,
+    },
+    SetIsolationLevel {
+        level: IsolationLevel,
+    },
     CreateView {
         view_name: String,
         query_sql: String,
@@ -153,6 +168,7 @@ pub enum SelectItem {
 pub enum Expr {
     Value(Value),
     Column(String),
+    Placeholder(usize),
     CaseWhen {
         conditions: Vec<(WhereExpr, Expr)>,
         else_result: Option<Box<Expr>>,
@@ -188,6 +204,11 @@ pub enum WhereExpr {
         operator: Operator,
         value: Value,
     },
+    PlaceholderComparison {
+        column: String,
+        operator: Operator,
+        placeholder: usize,
+    },
     // 中文註解：欄位對欄位比較供 UPDATE/DELETE JOIN 與進階條件共用。
     ColumnComparison {
         left: String,
@@ -214,6 +235,13 @@ pub enum WhereExpr {
     And(Box<WhereExpr>, Box<WhereExpr>),
     Or(Box<WhereExpr>, Box<WhereExpr>),
     Not(Box<WhereExpr>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum IsolationLevel {
+    ReadCommitted,
+    RepeatableRead,
+    Serializable,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

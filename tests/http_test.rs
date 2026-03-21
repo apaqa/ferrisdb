@@ -225,6 +225,65 @@ fn test_http_sql_table_and_storage_routes_used_by_studio() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+#[test]
+fn test_http_prepared_statement_endpoints() {
+    let dir = temp_dir("prepared-http");
+    let lsm = LsmEngine::open(&dir, 4096).expect("open lsm");
+    let engine = Arc::new(MvccEngine::new(lsm));
+    let addr = spawn_http_server(Arc::clone(&engine));
+
+    let _ = http_request(
+        addr,
+        "POST",
+        "/api/sql",
+        &[("Content-Type", "text/plain")],
+        "CREATE TABLE employees (id INT, department TEXT, salary INT);",
+    );
+    let _ = http_request(
+        addr,
+        "POST",
+        "/api/sql",
+        &[("Content-Type", "text/plain")],
+        "INSERT INTO employees VALUES (1, 'Engineering', 95000), (2, 'HR', 70000);",
+    );
+
+    let prepare = http_request(
+        addr,
+        "POST",
+        "/api/sql/prepare",
+        &[("Content-Type", "application/json")],
+        r#"{"name":"dept_stmt","sql":"SELECT id FROM employees WHERE department = $1"}"#,
+    );
+    let prepare_json = parse_json_body(&prepare);
+    assert_eq!(prepare_json["success"], true);
+    assert_eq!(prepare_json["type"], "prepared");
+
+    let execute = http_request(
+        addr,
+        "POST",
+        "/api/sql/execute",
+        &[("Content-Type", "application/json")],
+        r#"{"name":"dept_stmt","params":["Engineering"]}"#,
+    );
+    let execute_json = parse_json_body(&execute);
+    assert_eq!(execute_json["success"], true);
+    assert_eq!(execute_json["type"], "select");
+    assert_eq!(execute_json["rows"], json!([[1]]));
+
+    let deallocate = http_request(
+        addr,
+        "POST",
+        "/api/sql/deallocate",
+        &[("Content-Type", "application/json")],
+        r#"{"name":"dept_stmt"}"#,
+    );
+    let deallocate_json = parse_json_body(&deallocate);
+    assert_eq!(deallocate_json["success"], true);
+    assert_eq!(deallocate_json["type"], "deallocated");
+
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 // 中文註解：最小化 HTTP client，直接用 TCP 發 raw request 驗證 server 行為。
 fn http_request(
     addr: std::net::SocketAddr,

@@ -93,7 +93,7 @@ pub fn run_full_kv_benchmark(config: &FerrisDbConfig) -> Result<Vec<BenchResult>
         &data_dir,
         config.memtable_size_threshold,
         config.compaction_threshold,
-        config.wal_sync_on_write,
+        config.wal_mode.clone(),
     )?));
     let reopen_elapsed = reopen_start.elapsed();
     results.push(BenchResult {
@@ -286,7 +286,7 @@ fn open_engine_with_temp_dir(config: &FerrisDbConfig, data_dir: &std::path::Path
         data_dir,
         config.memtable_size_threshold,
         config.compaction_threshold,
-        config.wal_sync_on_write,
+        config.wal_mode.clone(),
     )?;
     Ok(Arc::new(MvccEngine::new(lsm)))
 }

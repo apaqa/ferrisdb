@@ -22,7 +22,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Instant;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 
 use crate::error::{FerrisDbError, Result};
@@ -143,6 +143,27 @@ fn route_request(request: &HttpRequest, engine: &Arc<MvccEngine>) -> HttpRespons
         "/api/sql" => {
             if request.method == "POST" {
                 handle_sql_api(request, engine)
+            } else {
+                method_not_allowed(&request.method, &request.path)
+            }
+        }
+        "/api/sql/prepare" => {
+            if request.method == "POST" {
+                handle_sql_prepare_api(request, engine)
+            } else {
+                method_not_allowed(&request.method, &request.path)
+            }
+        }
+        "/api/sql/execute" => {
+            if request.method == "POST" {
+                handle_sql_execute_api(request, engine)
+            } else {
+                method_not_allowed(&request.method, &request.path)
+            }
+        }
+        "/api/sql/deallocate" => {
+            if request.method == "POST" {
+                handle_sql_deallocate_api(request, engine)
             } else {
                 method_not_allowed(&request.method, &request.path)
             }
@@ -332,6 +353,68 @@ fn handle_sql_api(request: &HttpRequest, engine: &Arc<MvccEngine>) -> HttpRespon
     json_response(200, &response)
 }
 
+fn handle_sql_prepare_api(request: &HttpRequest, engine: &Arc<MvccEngine>) -> HttpResponse {
+    let payload: PrepareApiRequest = match parse_json_request(request) {
+        Ok(payload) => payload,
+        Err(response) => return response,
+    };
+    let sql = format!("PREPARE {} AS {}", payload.name, payload.sql.trim());
+    json_response(200, &execute_sql_text(engine, &sql))
+}
+
+fn handle_sql_execute_api(request: &HttpRequest, engine: &Arc<MvccEngine>) -> HttpResponse {
+    let payload: ExecutePreparedApiRequest = match parse_json_request(request) {
+        Ok(payload) => payload,
+        Err(response) => return response,
+    };
+    let executor = SqlExecutor::new(Arc::clone(engine));
+    let args = match payload
+        .params
+        .into_iter()
+        .map(json_to_sql_value)
+        .collect::<std::result::Result<Vec<_>, String>>()
+    {
+        Ok(args) => args,
+        Err(message) => {
+            return json_response(
+                400,
+                &SqlApiResponse::error(message, 0, 0, Vec::new()),
+            )
+        }
+    };
+    match executor.execute(crate::sql::ast::Statement::Execute {
+        name: payload.name,
+        args,
+    }) {
+        Ok(result) => json_response(
+            200,
+            &SqlApiResponse::from_execute_result(result, 0, 1, Vec::new()),
+        ),
+        Err(err) => json_response(
+            200,
+            &SqlApiResponse::error(err.to_string(), 0, 0, Vec::new()),
+        ),
+    }
+}
+
+fn handle_sql_deallocate_api(request: &HttpRequest, engine: &Arc<MvccEngine>) -> HttpResponse {
+    let payload: DeallocateApiRequest = match parse_json_request(request) {
+        Ok(payload) => payload,
+        Err(response) => return response,
+    };
+    let executor = SqlExecutor::new(Arc::clone(engine));
+    match executor.execute(crate::sql::ast::Statement::Deallocate { name: payload.name }) {
+        Ok(result) => json_response(
+            200,
+            &SqlApiResponse::from_execute_result(result, 0, 1, Vec::new()),
+        ),
+        Err(err) => json_response(
+            200,
+            &SqlApiResponse::error(err.to_string(), 0, 0, Vec::new()),
+        ),
+    }
+}
+
 // 中文註解：列出目前資料庫內所有資料表，供 Studio 左側導覽使用。
 fn handle_tables_api(engine: &Arc<MvccEngine>) -> HttpResponse {
     let catalog = Catalog::new(Arc::clone(engine));
@@ -502,6 +585,24 @@ fn read_http_request(reader: &mut BufReader<TcpStream>) -> Result<Option<HttpReq
     }))
 }
 
+fn parse_json_request<T: for<'de> Deserialize<'de>>(
+    request: &HttpRequest,
+) -> std::result::Result<T, HttpResponse> {
+    if let Some(content_type) = request.headers.get("content-type") {
+        if !content_type.starts_with("application/json") {
+            return Err(json_error_response(
+                415,
+                "unsupported_media_type",
+                "request Content-Type must be application/json".to_string(),
+            ));
+        }
+    }
+
+    serde_json::from_slice(&request.body).map_err(|err| {
+        json_error_response(400, "bad_json", format!("invalid JSON body: {}", err))
+    })
+}
+
 fn write_http_response(writer: &mut BufWriter<TcpStream>, response: HttpResponse) -> Result<()> {
     let body_bytes = response.body.as_bytes();
 
@@ -652,6 +753,19 @@ fn sql_value_to_json(value: SqlValue) -> JsonValue {
         SqlValue::Text(value) => JsonValue::from(value),
         SqlValue::Bool(value) => JsonValue::from(value),
         SqlValue::Null => JsonValue::Null,
+    }
+}
+
+fn json_to_sql_value(value: JsonValue) -> std::result::Result<SqlValue, String> {
+    match value {
+        JsonValue::Null => Ok(SqlValue::Null),
+        JsonValue::Bool(value) => Ok(SqlValue::Bool(value)),
+        JsonValue::Number(number) => number
+            .as_i64()
+            .map(SqlValue::Int)
+            .ok_or_else(|| "only i64 JSON numbers are supported".to_string()),
+        JsonValue::String(value) => Ok(SqlValue::Text(value)),
+        _ => Err("only scalar JSON values are supported as SQL parameters".to_string()),
     }
 }
 
@@ -918,6 +1032,39 @@ impl SqlApiResponse {
                 message: String::new(),
                 statement_results,
             },
+            ExecuteResult::Prepared { name } => Self {
+                success: true,
+                kind: "prepared".to_string(),
+                columns: Vec::new(),
+                rows: Vec::new(),
+                row_count: 0,
+                elapsed_ms,
+                executed_count,
+                message: format!("Prepared statement '{}' created", name),
+                statement_results,
+            },
+            ExecuteResult::Deallocated { name } => Self {
+                success: true,
+                kind: "deallocated".to_string(),
+                columns: Vec::new(),
+                rows: Vec::new(),
+                row_count: 0,
+                elapsed_ms,
+                executed_count,
+                message: format!("Prepared statement '{}' deallocated", name),
+                statement_results,
+            },
+            ExecuteResult::IsolationLevelSet { level } => Self {
+                success: true,
+                kind: "updated".to_string(),
+                columns: Vec::new(),
+                rows: Vec::new(),
+                row_count: 0,
+                elapsed_ms,
+                executed_count,
+                message: format!("Isolation level set to {}", isolation_level_label(&level)),
+                statement_results,
+            },
             ExecuteResult::Created { table_name } => Self {
                 success: true,
                 kind: "created".to_string(),
@@ -1081,6 +1228,36 @@ impl SqlStatementResult {
                 elapsed_ms,
                 message: String::new(),
             },
+            ExecuteResult::Prepared { name } => Self {
+                sql,
+                success: true,
+                kind: "prepared".to_string(),
+                columns: Vec::new(),
+                rows: Vec::new(),
+                row_count: 0,
+                elapsed_ms,
+                message: format!("Prepared statement '{}' created", name),
+            },
+            ExecuteResult::Deallocated { name } => Self {
+                sql,
+                success: true,
+                kind: "deallocated".to_string(),
+                columns: Vec::new(),
+                rows: Vec::new(),
+                row_count: 0,
+                elapsed_ms,
+                message: format!("Prepared statement '{}' deallocated", name),
+            },
+            ExecuteResult::IsolationLevelSet { level } => Self {
+                sql,
+                success: true,
+                kind: "updated".to_string(),
+                columns: Vec::new(),
+                rows: Vec::new(),
+                row_count: 0,
+                elapsed_ms,
+                message: format!("Isolation level set to {}", isolation_level_label(&level)),
+            },
             ExecuteResult::Created { table_name } => Self {
                 sql,
                 success: true,
@@ -1202,4 +1379,29 @@ impl SqlStatementResult {
             },
         }
     }
+}
+
+fn isolation_level_label(level: &crate::sql::ast::IsolationLevel) -> &'static str {
+    match level {
+        crate::sql::ast::IsolationLevel::ReadCommitted => "READ COMMITTED",
+        crate::sql::ast::IsolationLevel::RepeatableRead => "REPEATABLE READ",
+        crate::sql::ast::IsolationLevel::Serializable => "SERIALIZABLE",
+    }
+}
+
+#[derive(Deserialize)]
+struct PrepareApiRequest {
+    name: String,
+    sql: String,
+}
+
+#[derive(Deserialize)]
+struct ExecutePreparedApiRequest {
+    name: String,
+    params: Vec<JsonValue>,
+}
+
+#[derive(Deserialize)]
+struct DeallocateApiRequest {
+    name: String,
 }

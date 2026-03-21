@@ -20,6 +20,7 @@ pub enum Token {
     Ident(String),
     IntLit(i64),
     StringLit(String),
+    Placeholder(usize),
     Star,
     Comma,
     LParen,
@@ -38,6 +39,9 @@ pub enum Token {
 pub enum Keyword {
     Explain,
     Analyze,
+    Prepare,
+    Execute,
+    Deallocate,
     Alter,
     Select,
     From,
@@ -82,6 +86,13 @@ pub enum Keyword {
     Like,
     Update,
     Set,
+    Transaction,
+    Isolation,
+    Level,
+    Read,
+    Committed,
+    Repeatable,
+    Serializable,
     Delete,
     Using,
     Over,
@@ -191,6 +202,7 @@ impl<'a> Lexer<'a> {
                     }
                 }
                 '\'' => self.lex_string()?,
+                '$' => self.lex_placeholder()?,
                 '-' | '0'..='9' => self.lex_number()?,
                 _ if is_ident_start(ch) => self.lex_ident_or_keyword(),
                 _ => {
@@ -254,6 +266,36 @@ impl<'a> Lexer<'a> {
         Ok(Token::IntLit(value))
     }
 
+    fn lex_placeholder(&mut self) -> Result<Token> {
+        self.expect_char('$')?;
+        let mut digits = String::new();
+        while let Some(ch) = self.peek() {
+            if ch.is_ascii_digit() {
+                digits.push(ch);
+                self.bump();
+            } else {
+                break;
+            }
+        }
+
+        if digits.is_empty() {
+            return Err(FerrisDbError::InvalidCommand(
+                "placeholder must be followed by a number like $1".to_string(),
+            ));
+        }
+
+        let index = digits.parse::<usize>().map_err(|_| {
+            FerrisDbError::InvalidCommand(format!("invalid placeholder '${}'", digits))
+        })?;
+        if index == 0 {
+            return Err(FerrisDbError::InvalidCommand(
+                "placeholder numbering starts from $1".to_string(),
+            ));
+        }
+
+        Ok(Token::Placeholder(index))
+    }
+
     fn lex_ident_or_keyword(&mut self) -> Token {
         let mut buf = String::new();
         while let Some(ch) = self.peek() {
@@ -306,6 +348,9 @@ fn keyword_from_ident(ident: &str) -> Option<Keyword> {
         "SELECT" => Some(Keyword::Select),
         "EXPLAIN" => Some(Keyword::Explain),
         "ANALYZE" => Some(Keyword::Analyze),
+        "PREPARE" => Some(Keyword::Prepare),
+        "EXECUTE" => Some(Keyword::Execute),
+        "DEALLOCATE" => Some(Keyword::Deallocate),
         "ALTER" => Some(Keyword::Alter),
         "FROM" => Some(Keyword::From),
         "WHERE" => Some(Keyword::Where),
@@ -349,6 +394,13 @@ fn keyword_from_ident(ident: &str) -> Option<Keyword> {
         "LIKE" => Some(Keyword::Like),
         "UPDATE" => Some(Keyword::Update),
         "SET" => Some(Keyword::Set),
+        "TRANSACTION" => Some(Keyword::Transaction),
+        "ISOLATION" => Some(Keyword::Isolation),
+        "LEVEL" => Some(Keyword::Level),
+        "READ" => Some(Keyword::Read),
+        "COMMITTED" => Some(Keyword::Committed),
+        "REPEATABLE" => Some(Keyword::Repeatable),
+        "SERIALIZABLE" => Some(Keyword::Serializable),
         "DELETE" => Some(Keyword::Delete),
         "USING" => Some(Keyword::Using),
         "OVER" => Some(Keyword::Over),

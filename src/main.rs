@@ -80,7 +80,7 @@ fn build_engine(config: &FerrisDbConfig) -> Arc<MvccEngine> {
         &config.data_dir,
         config.memtable_size_threshold,
         config.compaction_threshold,
-        config.wal_sync_on_write,
+        config.wal_mode.clone(),
     ) {
         Ok(engine) => engine,
         Err(err) => {

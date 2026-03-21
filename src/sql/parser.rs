@@ -5,8 +5,8 @@ use crate::error::{FerrisDbError, Result};
 
 use super::ast::{
     AggregateFunc, Assignment, CTE, ColumnDef, DataType, Expr, GroupByClause, InsertSource,
-    JoinClause, JoinType, Operator, OrderByClause, OrderDirection, SelectColumns, SelectItem,
-    Statement, Value, WhereExpr, WindowFunc,
+    IsolationLevel, JoinClause, JoinType, Operator, OrderByClause, OrderDirection,
+    SelectColumns, SelectItem, Statement, Value, WhereExpr, WindowFunc,
 };
 use super::lexer::{Keyword, Token};
 
@@ -42,7 +42,11 @@ impl Parser {
         let stmt = match self.peek() {
             Some(Token::Keyword(Keyword::Explain)) => self.parse_explain()?,
             Some(Token::Keyword(Keyword::Analyze)) => self.parse_analyze()?,
+            Some(Token::Keyword(Keyword::Prepare)) => self.parse_prepare()?,
+            Some(Token::Keyword(Keyword::Execute)) => self.parse_execute()?,
+            Some(Token::Keyword(Keyword::Deallocate)) => self.parse_deallocate()?,
             Some(Token::Keyword(Keyword::Alter)) => self.parse_alter_table()?,
+            Some(Token::Keyword(Keyword::Set)) => self.parse_set_statement()?,
             Some(Token::Keyword(Keyword::Create)) => self.parse_create_statement()?,
             Some(Token::Keyword(Keyword::Drop)) => self.parse_drop_statement()?,
             Some(Token::Keyword(Keyword::Insert)) => self.parse_insert()?,
@@ -241,6 +245,75 @@ impl Parser {
         Ok(Statement::AnalyzeTable {
             table_name: self.expect_ident()?,
         })
+    }
+
+    fn parse_prepare(&mut self) -> Result<Statement> {
+        self.expect_keyword(Keyword::Prepare)?;
+        let name = self.expect_ident()?;
+        self.expect_keyword(Keyword::As)?;
+
+        // 中文註解：PREPARE 後面的 SQL 主體直接重用現有 parser，避免分叉兩套語法。
+        let body = self.parse()?;
+        let param_count = max_placeholder_in_statement(&body);
+        let params = (1..=param_count).map(|index| format!("${}", index)).collect();
+        Ok(Statement::Prepare {
+            name,
+            params,
+            body: Box::new(body),
+        })
+    }
+
+    fn parse_execute(&mut self) -> Result<Statement> {
+        self.expect_keyword(Keyword::Execute)?;
+        let name = self.expect_ident()?;
+        let mut args = Vec::new();
+        if matches!(self.peek(), Some(Token::LParen)) {
+            self.bump();
+            if !matches!(self.peek(), Some(Token::RParen)) {
+                loop {
+                    args.push(self.parse_value()?);
+                    if matches!(self.peek(), Some(Token::Comma)) {
+                        self.bump();
+                        continue;
+                    }
+                    break;
+                }
+            }
+            self.expect_token(Token::RParen)?;
+        }
+        Ok(Statement::Execute { name, args })
+    }
+
+    fn parse_deallocate(&mut self) -> Result<Statement> {
+        self.expect_keyword(Keyword::Deallocate)?;
+        Ok(Statement::Deallocate {
+            name: self.expect_ident()?,
+        })
+    }
+
+    fn parse_set_statement(&mut self) -> Result<Statement> {
+        self.expect_keyword(Keyword::Set)?;
+        self.expect_keyword(Keyword::Transaction)?;
+        self.expect_keyword(Keyword::Isolation)?;
+        self.expect_keyword(Keyword::Level)?;
+        let level = match self.bump() {
+            Some(Token::Keyword(Keyword::Read)) => {
+                self.expect_keyword(Keyword::Committed)?;
+                IsolationLevel::ReadCommitted
+            }
+            Some(Token::Keyword(Keyword::Repeatable)) => {
+                self.expect_keyword(Keyword::Read)?;
+                IsolationLevel::RepeatableRead
+            }
+            Some(Token::Keyword(Keyword::Serializable)) => IsolationLevel::Serializable,
+            other => {
+                return Err(FerrisDbError::InvalidCommand(format!(
+                    "expected isolation level, got {:?}",
+                    other
+                )))
+            }
+        };
+        Ok(Statement::SetIsolationLevel { level })
     }
 
     fn parse_insert(&mut self) -> Result<Statement> {
@@ -572,6 +645,15 @@ impl Parser {
 
         let operator = self.parse_operator()?;
         match self.peek() {
+            Some(Token::Placeholder(index)) => {
+                let placeholder = *index;
+                self.bump();
+                Ok(WhereExpr::PlaceholderComparison {
+                    column,
+                    operator,
+                    placeholder,
+                })
+            }
             Some(Token::Ident(_)) => Ok(WhereExpr::ColumnComparison {
                 left: column,
                 operator,
@@ -793,6 +875,11 @@ impl Parser {
         match self.peek() {
             Some(Token::Keyword(Keyword::Case)) => self.parse_case_when_expr(),
             Some(Token::Ident(_)) => Ok(Expr::Column(self.parse_identifier_path()?)),
+            Some(Token::Placeholder(index)) => {
+                let placeholder = *index;
+                self.bump();
+                Ok(Expr::Placeholder(placeholder))
+            }
             _ => Ok(Expr::Value(self.parse_value()?)),
         }
     }
@@ -981,6 +1068,7 @@ impl Parser {
     fn expect_ident(&mut self) -> Result<String> {
         match self.bump() {
             Some(Token::Ident(name)) => Ok(name),
+            Some(Token::Keyword(keyword)) => Ok(keyword_to_sql(&keyword).to_ascii_lowercase()),
             other => Err(FerrisDbError::InvalidCommand(format!(
                 "expected identifier, got {:?}",
                 other
@@ -1127,6 +1215,7 @@ fn token_to_sql(token: &Token) -> String {
         Token::Ident(value) => value.clone(),
         Token::IntLit(value) => value.to_string(),
         Token::StringLit(value) => format!("'{}'", value.replace('\'', "''")),
+        Token::Placeholder(index) => format!("${}", index),
         Token::Star => "*".to_string(),
         Token::Comma => ",".to_string(),
         Token::LParen => "(".to_string(),
@@ -1146,6 +1235,9 @@ fn keyword_to_sql(keyword: &Keyword) -> &'static str {
     match keyword {
         Keyword::Explain => "EXPLAIN",
         Keyword::Analyze => "ANALYZE",
+        Keyword::Prepare => "PREPARE",
+        Keyword::Execute => "EXECUTE",
+        Keyword::Deallocate => "DEALLOCATE",
         Keyword::Alter => "ALTER",
         Keyword::Select => "SELECT",
         Keyword::From => "FROM",
@@ -1189,6 +1281,13 @@ fn keyword_to_sql(keyword: &Keyword) -> &'static str {
         Keyword::Like => "LIKE",
         Keyword::Update => "UPDATE",
         Keyword::Set => "SET",
+        Keyword::Transaction => "TRANSACTION",
+        Keyword::Isolation => "ISOLATION",
+        Keyword::Level => "LEVEL",
+        Keyword::Read => "READ",
+        Keyword::Committed => "COMMITTED",
+        Keyword::Repeatable => "REPEATABLE",
+        Keyword::Serializable => "SERIALIZABLE",
         Keyword::Delete => "DELETE",
         Keyword::Using => "USING",
         Keyword::Over => "OVER",
@@ -1209,6 +1308,124 @@ fn keyword_to_sql(keyword: &Keyword) -> &'static str {
         Keyword::True => "TRUE",
         Keyword::False => "FALSE",
         Keyword::All => "ALL",
+    }
+}
+
+fn max_placeholder_in_statement(statement: &Statement) -> usize {
+    match statement {
+        Statement::Explain { statement } => max_placeholder_in_statement(statement),
+        Statement::AnalyzeTable { .. }
+        | Statement::CreateTable { .. }
+        | Statement::AlterTableAdd { .. }
+        | Statement::AlterTableDropColumn { .. }
+        | Statement::DropTable { .. }
+        | Statement::DropView { .. }
+        | Statement::CreateView { .. }
+        | Statement::CreateIndex { .. }
+        | Statement::DropIndex { .. }
+        | Statement::Insert { .. }
+        | Statement::Deallocate { .. }
+        | Statement::Execute { .. }
+        | Statement::SetIsolationLevel { .. } => 0,
+        Statement::Prepare { body, .. } => max_placeholder_in_statement(body),
+        Statement::Select {
+            ctes,
+            columns,
+            where_clause,
+            having,
+            order_by,
+            ..
+        } => {
+            let cte_max = ctes
+                .iter()
+                .map(|cte| max_placeholder_in_statement(&cte.query))
+                .max()
+                .unwrap_or(0);
+            cte_max
+                .max(max_placeholder_in_columns(columns))
+                .max(max_placeholder_in_where_opt(where_clause.as_ref()))
+                .max(max_placeholder_in_where_opt(having.as_ref()))
+                .max(
+                    order_by
+                        .as_ref()
+                        .and_then(|order| order.expr.as_ref().map(max_placeholder_in_expr))
+                        .unwrap_or(0),
+                )
+        }
+        Statement::Update {
+            join_condition,
+            where_clause,
+            ..
+        }
+        | Statement::Delete {
+            join_condition,
+            where_clause,
+            ..
+        } => max_placeholder_in_where_opt(join_condition.as_ref())
+            .max(max_placeholder_in_where_opt(where_clause.as_ref())),
+        Statement::Union { left, right, .. } => max_placeholder_in_statement(left)
+            .max(max_placeholder_in_statement(right)),
+    }
+}
+
+fn max_placeholder_in_columns(columns: &SelectColumns) -> usize {
+    match columns {
+        SelectColumns::All => 0,
+        SelectColumns::Named(items) | SelectColumns::Aggregate(items) => items
+            .iter()
+            .map(|item| match item {
+                SelectItem::Column { .. } => 0,
+                SelectItem::Expression { expr, .. } => max_placeholder_in_expr(expr),
+                SelectItem::Aggregate { .. } => 0,
+            })
+            .max()
+            .unwrap_or(0),
+    }
+}
+
+fn max_placeholder_in_expr(expr: &Expr) -> usize {
+    match expr {
+        Expr::Value(_) | Expr::Column(_) => 0,
+        Expr::Placeholder(index) => *index,
+        Expr::CaseWhen {
+            conditions,
+            else_result,
+        } => {
+            let conditions_max = conditions
+                .iter()
+                .map(|(condition, result)| {
+                    max_placeholder_in_where(condition).max(max_placeholder_in_expr(result))
+                })
+                .max()
+                .unwrap_or(0);
+            conditions_max.max(
+                else_result
+                    .as_ref()
+                    .map(|expr| max_placeholder_in_expr(expr))
+                    .unwrap_or(0),
+            )
+        }
+        Expr::WindowFunction { .. } => 0,
+    }
+}
+
+fn max_placeholder_in_where_opt(where_clause: Option<&WhereExpr>) -> usize {
+    where_clause.map(max_placeholder_in_where).unwrap_or(0)
+}
+
+fn max_placeholder_in_where(where_clause: &WhereExpr) -> usize {
+    match where_clause {
+        WhereExpr::Comparison { .. }
+        | WhereExpr::ColumnComparison { .. }
+        | WhereExpr::Between { .. }
+        | WhereExpr::Like { .. }
+        | WhereExpr::IsNull { .. } => 0,
+        WhereExpr::PlaceholderComparison { placeholder, .. } => *placeholder,
+        WhereExpr::InSubquery { subquery, .. } => max_placeholder_in_statement(subquery),
+        WhereExpr::And(left, right) | WhereExpr::Or(left, right) => {
+            max_placeholder_in_where(left).max(max_placeholder_in_where(right))
+        }
+        WhereExpr::Not(expr) => max_placeholder_in_where(expr),
     }
 }
 

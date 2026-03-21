@@ -38,8 +38,16 @@ fn default_server_port() -> u16 {
     6379
 }
 
-fn default_wal_sync_on_write() -> bool {
-    true
+fn default_wal_mode() -> WalMode {
+    WalMode::Wal
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WalMode {
+    Wal,
+    WalDisabled,
+    Sync,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -50,7 +58,7 @@ pub struct FerrisDbConfig {
     pub compaction_threshold: usize,
     pub server_host: String,
     pub server_port: u16,
-    pub wal_sync_on_write: bool,
+    pub wal_mode: WalMode,
 }
 
 impl Default for FerrisDbConfig {
@@ -61,7 +69,7 @@ impl Default for FerrisDbConfig {
             compaction_threshold: default_compaction_threshold(),
             server_host: default_server_host(),
             server_port: default_server_port(),
-            wal_sync_on_write: default_wal_sync_on_write(),
+            wal_mode: default_wal_mode(),
         }
     }
 }

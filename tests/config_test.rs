@@ -10,7 +10,7 @@
 use std::fs;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use ferrisdb::config::FerrisDbConfig;
+use ferrisdb::config::{FerrisDbConfig, WalMode};
 
 fn temp_file(name: &str) -> std::path::PathBuf {
     let nanos = SystemTime::now()
@@ -28,7 +28,7 @@ fn test_default_values_are_correct() {
     assert_eq!(config.compaction_threshold, 4);
     assert_eq!(config.server_host, "127.0.0.1");
     assert_eq!(config.server_port, 6379);
-    assert!(config.wal_sync_on_write);
+    assert_eq!(config.wal_mode, WalMode::Wal);
 }
 
 #[test]
@@ -42,7 +42,7 @@ memtable_size_threshold = 8192
 compaction_threshold = 8
 server_host = "0.0.0.0"
 server_port = 7000
-wal_sync_on_write = false
+wal_mode = "wal_disabled"
 "#,
     )
     .expect("write config");
@@ -53,7 +53,7 @@ wal_sync_on_write = false
     assert_eq!(config.compaction_threshold, 8);
     assert_eq!(config.server_host, "0.0.0.0");
     assert_eq!(config.server_port, 7000);
-    assert!(!config.wal_sync_on_write);
+    assert_eq!(config.wal_mode, WalMode::WalDisabled);
 
     let _ = fs::remove_file(path);
 }
@@ -75,7 +75,7 @@ server_port = 7777
     assert_eq!(config.memtable_size_threshold, 4096);
     assert_eq!(config.compaction_threshold, 4);
     assert_eq!(config.server_host, "127.0.0.1");
-    assert!(config.wal_sync_on_write);
+    assert_eq!(config.wal_mode, WalMode::Wal);
 
     let _ = fs::remove_file(path);
 }

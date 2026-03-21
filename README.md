@@ -1,15 +1,16 @@
 # FerrisDB — A database engine built from scratch in Rust
 
-FerrisDB is a database engine implemented from scratch in Rust, featuring LSM-Tree storage, WAL-based crash recovery, MVCC concurrency control, and a small SQL layer.
+FerrisDB is a database engine implemented from scratch in Rust, featuring LSM-Tree storage, configurable WAL durability, MVCC concurrency control, and a small SQL layer.
 
 ## Features
 
 - LSM-Tree storage engine (MemTable + SSTable + Compaction)
-- Write-Ahead Log with CRC32 checksum and crash recovery
+- Write-Ahead Log with CRC32 checksum, crash recovery, and runtime mode switching
 - Bloom Filter for read optimization
-- MVCC with snapshot isolation and transactions
+- MVCC with `READ COMMITTED`, `REPEATABLE READ`, and `SERIALIZABLE`
 - SQL support (`CREATE TABLE`, `INSERT`, `SELECT`, `UPDATE`, `DELETE`)
 - SQL Common Table Expressions (`WITH`)
+- SQL prepared statements (`PREPARE`, `EXECUTE`, `DEALLOCATE`)
 - SQL INNER JOIN with nested loop
 - SQL `UPDATE ... FROM` and `DELETE ... USING`
 - SQL `ANALYZE TABLE` statistics collection
@@ -32,14 +33,14 @@ FerrisDB is a database engine implemented from scratch in Rust, featuring LSM-Tr
 - CREATE TABLE IF NOT EXISTS
 - WHERE IN (subquery)
 - TCP server with multi-threaded connections
-- HTTP Admin API (`/health`, `/stats`, `/sstables`, `/compact`, `/flush`)
+- HTTP Admin API (`/health`, `/stats`, `/sstables`, `/compact`, `/flush`, `/api/sql/prepare`, `/api/sql/execute`, `/api/sql/deallocate`)
 - Interactive REPL with KV and SQL modes
 - MANIFEST metadata management
 - Configurable via `ferrisdb.toml`
 - Built-in benchmark framework
 - Background compaction worker
 - Failure injection and stress tests
-- 161+ automated tests
+- 172+ automated tests
 
 ## Architecture
 
@@ -153,11 +154,11 @@ FerrisDB uses an LSM-style write path: updates land in a MemTable first and are 
 
 ### WAL + Recovery
 
-Every write is appended to a Write-Ahead Log before it reaches the MemTable. This allows the engine to recover unflushed state after crashes, and the WAL format includes CRC32 checksums so corruption can be detected instead of silently accepted.
+Every write can be appended to a Write-Ahead Log before it reaches the MemTable. FerrisDB now supports three WAL modes: `wal` (default batched durability), `sync` (fsync every write), and `wal_disabled` (fastest but crash-unsafe). The WAL format includes CRC32 checksums so corruption can be detected instead of silently accepted.
 
-### MVCC and Snapshot Isolation
+### MVCC and Isolation Levels
 
-The MVCC layer assigns timestamps to versions and gives each transaction a stable snapshot. Readers do not block writers, and a transaction only sees versions that were committed before its `read_ts`.
+The MVCC layer assigns timestamps to versions and supports `READ COMMITTED`, `REPEATABLE READ`, and `SERIALIZABLE`. Readers do not block writers, and `REPEATABLE READ` / `SERIALIZABLE` transactions see a stable snapshot while `READ COMMITTED` refreshes visibility per statement.
 
 ### SSTables + Bloom Filters
 

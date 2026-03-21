@@ -378,6 +378,11 @@ fn render_where_expr(where_clause: &WhereExpr) -> String {
             operator,
             value,
         } => format!("{} {} {}", column, operator_to_str(operator), render_value(value)),
+        WhereExpr::PlaceholderComparison {
+            column,
+            operator,
+            placeholder,
+        } => format!("{} {} ${}", column, operator_to_str(operator), placeholder),
         WhereExpr::ColumnComparison {
             left,
             operator,

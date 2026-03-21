@@ -9,4 +9,5 @@ memtable_size_threshold = 4096
 compaction_threshold = 4
 server_host = "127.0.0.1"
 server_port = 6379
-wal_sync_on_write = true
+# 中文註解：可選 wal / sync / wal_disabled
+wal_mode = "wal"

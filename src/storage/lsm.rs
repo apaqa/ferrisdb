@@ -33,6 +33,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
 
+use crate::config::WalMode;
 use crate::error::Result;
 use crate::storage::compaction;
 use crate::storage::manifest::{Manifest, ManifestRecord, ManifestState, MANIFEST_FILENAME};
@@ -78,7 +79,7 @@ struct LsmState {
     data_dir: PathBuf,
     memtable_size_threshold: usize,
     compaction_threshold: usize,
-    wal_sync_on_write: bool,
+    wal_mode: WalMode,
     next_sstable_id: u64,
 }
 
@@ -92,14 +93,19 @@ struct CompactionRuntime {
 
 impl LsmEngine {
     pub fn open(data_dir: impl AsRef<Path>, threshold: usize) -> Result<Self> {
-        Self::open_with_options(data_dir, threshold, AUTO_COMPACTION_SSTABLE_LIMIT, true)
+        Self::open_with_options(
+            data_dir,
+            threshold,
+            AUTO_COMPACTION_SSTABLE_LIMIT,
+            WalMode::Wal,
+        )
     }
 
     pub fn open_with_options(
         data_dir: impl AsRef<Path>,
         threshold: usize,
         compaction_threshold: usize,
-        wal_sync_on_write: bool,
+        wal_mode: WalMode,
     ) -> Result<Self> {
         let data_dir = data_dir.as_ref().to_path_buf();
         fs::create_dir_all(&data_dir)?;
@@ -138,12 +144,15 @@ impl LsmEngine {
         };
 
         let wal_path = data_dir.join(WAL_FILENAME);
-        let active_memtable = if wal_path.exists() && wal_path.metadata()?.len() > 0 {
+        let active_memtable = if !matches!(wal_mode, WalMode::WalDisabled)
+            && wal_path.exists()
+            && wal_path.metadata()?.len() > 0
+        {
             WalReader::open(&wal_path)?.recover_to_memtable()?
         } else {
             MemTable::new()
         };
-        let active_wal = Some(WalWriter::new_with_options(&wal_path, wal_sync_on_write)?);
+        let active_wal = open_wal_writer(&wal_path, &wal_mode)?;
 
         manifest.set_state(manifest.state());
         let next_sstable_id = manifest.next_sstable_id;
@@ -156,7 +165,7 @@ impl LsmEngine {
             data_dir,
             memtable_size_threshold,
             compaction_threshold: compaction_threshold.max(1),
-            wal_sync_on_write,
+            wal_mode,
             next_sstable_id,
         }));
         let compaction_runtime = Arc::new((
@@ -364,6 +373,30 @@ impl LsmEngine {
             .collect()
     }
 
+    pub fn wal_mode(&self) -> WalMode {
+        self.state
+            .lock()
+            .expect("lsm state mutex poisoned")
+            .wal_mode
+            .clone()
+    }
+
+    pub fn set_wal_mode(&self, wal_mode: WalMode) -> Result<()> {
+        let mut state = self.state.lock().expect("lsm state mutex poisoned");
+        state.wal_mode = wal_mode.clone();
+        let wal_path = state.data_dir.join(WAL_FILENAME);
+        let old_wal = state.active_wal.take();
+        drop(old_wal);
+        if matches!(wal_mode, WalMode::WalDisabled) {
+            if wal_path.exists() {
+                fs::remove_file(&wal_path)?;
+            }
+        } else {
+            state.active_wal = open_wal_writer(&wal_path, &wal_mode)?;
+        }
+        Ok(())
+    }
+
     fn mark_compaction_finished(&self) {
         let (runtime_lock, _) = &*self.compaction_runtime;
         let mut runtime = runtime_lock
@@ -474,10 +507,7 @@ impl LsmEngine {
         state.next_sstable_id = state.manifest.next_sstable_id;
 
         if recreate_wal {
-            state.active_wal = Some(WalWriter::new_with_options(
-                &wal_path,
-                state.wal_sync_on_write,
-            )?);
+            state.active_wal = open_wal_writer(&wal_path, &state.wal_mode)?;
         }
 
         Ok(())
@@ -683,6 +713,14 @@ fn cleanup_temporary_files(data_dir: &Path) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn open_wal_writer(path: &Path, wal_mode: &WalMode) -> Result<Option<WalWriter>> {
+    match wal_mode {
+        WalMode::Wal => Ok(Some(WalWriter::new_with_options(path, false)?)),
+        WalMode::WalDisabled => Ok(None),
+        WalMode::Sync => Ok(Some(WalWriter::new_with_options(path, true)?)),
+    }
 }
 
 fn now_unix_ts() -> u64 {
