@@ -4,9 +4,9 @@
 use crate::error::{FerrisDbError, Result};
 
 use super::ast::{
-    AggregateFunc, Assignment, ColumnDef, DataType, GroupByClause, InsertSource, JoinClause,
+    AggregateFunc, Assignment, ColumnDef, DataType, Expr, GroupByClause, InsertSource, JoinClause,
     JoinType, Operator, OrderByClause, OrderDirection, SelectColumns, SelectItem, Statement, Value,
-    WhereExpr,
+    WhereExpr, WindowFunc,
 };
 use super::lexer::{Keyword, Token};
 
@@ -560,7 +560,14 @@ impl Parser {
 
         self.expect_keyword(Keyword::Order)?;
         self.expect_keyword(Keyword::By)?;
-        let column = self.parse_identifier_path()?;
+        let (column, expr) = if matches!(self.peek(), Some(Token::Keyword(Keyword::Case))) {
+            (
+                "__case_when__".to_string(),
+                Some(self.parse_case_when_expr()?),
+            )
+        } else {
+            (self.parse_identifier_path()?, None)
+        };
         let direction = match self.peek() {
             Some(Token::Keyword(Keyword::Asc)) => {
                 self.bump();
@@ -573,7 +580,11 @@ impl Parser {
             _ => OrderDirection::Asc,
         };
 
-        Ok(Some(OrderByClause { column, direction }))
+        Ok(Some(OrderByClause {
+            column,
+            expr,
+            direction,
+        }))
     }
 
     fn parse_optional_group_by(&mut self) -> Result<Option<GroupByClause>> {
@@ -646,15 +657,64 @@ impl Parser {
 
     fn parse_select_item(&mut self) -> Result<SelectItem> {
         match self.peek() {
+            Some(Token::Keyword(Keyword::Case)) => {
+                let expr = self.parse_case_when_expr()?;
+                let alias = self.parse_optional_alias()?;
+                Ok(SelectItem::Expression { expr, alias })
+            }
+            Some(Token::Keyword(Keyword::RowNumber)) | Some(Token::Keyword(Keyword::Rank)) => {
+                let expr = self.parse_window_function_expr()?;
+                let alias = self.parse_optional_alias()?;
+                Ok(SelectItem::Expression { expr, alias })
+            }
             Some(Token::Keyword(Keyword::Count))
             | Some(Token::Keyword(Keyword::Sum))
             | Some(Token::Keyword(Keyword::Min))
-            | Some(Token::Keyword(Keyword::Max)) => self.parse_aggregate_item(),
+            | Some(Token::Keyword(Keyword::Max)) => {
+                if self.is_window_aggregate_start() {
+                    let expr = self.parse_window_function_expr()?;
+                    let alias = self.parse_optional_alias()?;
+                    Ok(SelectItem::Expression { expr, alias })
+                } else {
+                    self.parse_aggregate_item()
+                }
+            }
             _ => {
                 let name = self.parse_identifier_path()?;
                 let alias = self.parse_optional_alias()?;
                 Ok(SelectItem::Column { name, alias })
             }
+        }
+    }
+
+    fn parse_case_when_expr(&mut self) -> Result<Expr> {
+        self.expect_keyword(Keyword::Case)?;
+        let mut conditions = Vec::new();
+        while matches!(self.peek(), Some(Token::Keyword(Keyword::When))) {
+            self.bump();
+            let condition = self.parse_where_expr()?;
+            self.expect_keyword(Keyword::Then)?;
+            let result = self.parse_case_result_expr()?;
+            conditions.push((condition, result));
+        }
+        let else_result = if matches!(self.peek(), Some(Token::Keyword(Keyword::Else))) {
+            self.bump();
+            Some(Box::new(self.parse_case_result_expr()?))
+        } else {
+            None
+        };
+        self.expect_keyword(Keyword::End)?;
+        Ok(Expr::CaseWhen {
+            conditions,
+            else_result,
+        })
+    }
+
+    fn parse_case_result_expr(&mut self) -> Result<Expr> {
+        match self.peek() {
+            Some(Token::Keyword(Keyword::Case)) => self.parse_case_when_expr(),
+            Some(Token::Ident(_)) => Ok(Expr::Column(self.parse_identifier_path()?)),
+            _ => Ok(Expr::Value(self.parse_value()?)),
         }
     }
 
@@ -692,6 +752,76 @@ impl Parser {
             func,
             column,
             alias,
+        })
+    }
+
+    fn parse_window_function_expr(&mut self) -> Result<Expr> {
+        let (func, target_column) = match self.bump() {
+            Some(Token::Keyword(Keyword::RowNumber)) => {
+                self.expect_token(Token::LParen)?;
+                self.expect_token(Token::RParen)?;
+                (WindowFunc::RowNumber, None)
+            }
+            Some(Token::Keyword(Keyword::Rank)) => {
+                self.expect_token(Token::LParen)?;
+                self.expect_token(Token::RParen)?;
+                (WindowFunc::Rank, None)
+            }
+            Some(Token::Keyword(Keyword::Count)) => {
+                self.expect_token(Token::LParen)?;
+                let target = if matches!(self.peek(), Some(Token::Star)) {
+                    self.bump();
+                    None
+                } else {
+                    Some(self.parse_identifier_path()?)
+                };
+                self.expect_token(Token::RParen)?;
+                (WindowFunc::WinCount, target)
+            }
+            Some(Token::Keyword(Keyword::Sum)) => {
+                self.expect_token(Token::LParen)?;
+                let target = Some(self.parse_identifier_path()?);
+                self.expect_token(Token::RParen)?;
+                (WindowFunc::WinSum, target)
+            }
+            other => {
+                return Err(FerrisDbError::InvalidCommand(format!(
+                    "expected window function, got {:?}",
+                    other
+                )));
+            }
+        };
+        self.expect_keyword(Keyword::Over)?;
+        self.expect_token(Token::LParen)?;
+        let partition_by = if matches!(self.peek(), Some(Token::Keyword(Keyword::Partition))) {
+            self.bump();
+            self.expect_keyword(Keyword::By)?;
+            Some(self.parse_identifier_path()?)
+        } else {
+            None
+        };
+        let order_by = if matches!(self.peek(), Some(Token::Keyword(Keyword::Order))) {
+            self.bump();
+            self.expect_keyword(Keyword::By)?;
+            let column = self.parse_identifier_path()?;
+            let asc = !matches!(self.peek(), Some(Token::Keyword(Keyword::Desc)));
+            if matches!(
+                self.peek(),
+                Some(Token::Keyword(Keyword::Asc)) | Some(Token::Keyword(Keyword::Desc))
+            ) {
+                self.bump();
+            }
+            Some((column, asc))
+        } else {
+            None
+        };
+        self.expect_token(Token::RParen)?;
+
+        Ok(Expr::WindowFunction {
+            func,
+            target_column,
+            partition_by,
+            order_by,
         })
     }
 
@@ -764,6 +894,10 @@ impl Parser {
         self.tokens.get(self.pos)
     }
 
+    fn peek_n(&self, offset: usize) -> Option<&Token> {
+        self.tokens.get(self.pos + offset)
+    }
+
     fn parse_identifier_path(&mut self) -> Result<String> {
         let mut parts = vec![self.expect_ident()?];
         while matches!(self.peek(), Some(Token::Dot)) {
@@ -780,11 +914,37 @@ impl Parser {
         }
         token
     }
+
+    fn is_window_aggregate_start(&self) -> bool {
+        let mut depth = 0;
+        let mut index = self.pos + 1;
+        if !matches!(self.peek_n(1), Some(Token::LParen)) {
+            return false;
+        }
+        while let Some(token) = self.tokens.get(index) {
+            match token {
+                Token::LParen => depth += 1,
+                Token::RParen => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return matches!(
+                            self.tokens.get(index + 1),
+                            Some(Token::Keyword(Keyword::Over))
+                        );
+                    }
+                }
+                _ => {}
+            }
+            index += 1;
+        }
+        false
+    }
 }
 
 fn render_condition_item(item: &SelectItem) -> String {
     match item {
         SelectItem::Column { name, .. } => name.clone(),
+        SelectItem::Expression { .. } => "EXPR".to_string(),
         SelectItem::Aggregate { func, column, .. } => match (func, column.as_deref()) {
             (AggregateFunc::Count, None) => "COUNT(*)".to_string(),
             (AggregateFunc::Count, Some(column)) => format!("COUNT({})", column),
@@ -871,6 +1031,11 @@ fn keyword_to_sql(keyword: &Keyword) -> &'static str {
         Keyword::Select => "SELECT",
         Keyword::From => "FROM",
         Keyword::Where => "WHERE",
+        Keyword::Case => "CASE",
+        Keyword::When => "WHEN",
+        Keyword::Then => "THEN",
+        Keyword::Else => "ELSE",
+        Keyword::End => "END",
         Keyword::Count => "COUNT",
         Keyword::Sum => "SUM",
         Keyword::Min => "MIN",
@@ -904,6 +1069,10 @@ fn keyword_to_sql(keyword: &Keyword) -> &'static str {
         Keyword::Update => "UPDATE",
         Keyword::Set => "SET",
         Keyword::Delete => "DELETE",
+        Keyword::Over => "OVER",
+        Keyword::Partition => "PARTITION",
+        Keyword::RowNumber => "ROW_NUMBER",
+        Keyword::Rank => "RANK",
         Keyword::Join => "JOIN",
         Keyword::On => "ON",
         Keyword::Union => "UNION",

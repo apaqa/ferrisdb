@@ -32,9 +32,9 @@ use crate::error::Result;
 use crate::transaction::mvcc::{MvccEngine, Transaction};
 
 use super::ast::{
-    AggregateFunc, Assignment, ColumnDef, DataType, GroupByClause, InsertSource, JoinClause,
+    AggregateFunc, Assignment, ColumnDef, DataType, Expr, GroupByClause, InsertSource, JoinClause,
     JoinType, Operator, OrderByClause, OrderDirection, SelectColumns, SelectItem, Statement, Value,
-    WhereExpr,
+    WhereExpr, WindowFunc,
 };
 use super::catalog::{Catalog, TableSchema, ViewDefinition};
 use super::index::IndexManager;
@@ -746,6 +746,9 @@ impl SqlExecutor {
             having.map(|expr| normalize_where_expr(expr, table_alias.as_deref(), &table_name));
         let order_by = order_by.map(|order| OrderByClause {
             column: normalize_column_reference(order.column, table_alias.as_deref(), &table_name),
+            expr: order
+                .expr
+                .map(|expr| normalize_expr(expr, table_alias.as_deref(), &table_name)),
             direction: order.direction,
         });
 
@@ -789,21 +792,36 @@ impl SqlExecutor {
             Err(message) => return Ok(ExecuteResult::Error { message }),
         };
 
-        let rows: Vec<Row> = self
+        let mut rows: Vec<Row> = self
             .fetch_rows_for_select(&txn, &schema, where_clause.as_ref())?
             .into_iter()
             .map(|(_, row)| row)
             .collect();
+        if let Some(order_by) = order_by.as_ref() {
+            if order_by.expr.is_some() {
+                sort_plain_rows_by_order_expr(&mut rows, order_by);
+            }
+        }
         let output_columns = projection
             .iter()
             .map(|item| item.header.clone())
             .collect::<Vec<_>>();
+        let window_values = build_window_projection_values(&rows, &projection)?;
         let mut selected = rows
-            .into_iter()
-            .map(|row| {
+            .iter()
+            .enumerate()
+            .map(|(row_index, row)| {
                 projection
                     .iter()
-                    .map(|column| row.get(&column.lookup).cloned().unwrap_or(Value::Null))
+                    .enumerate()
+                    .map(|(projection_index, column)| {
+                        evaluate_projection_value(
+                            row,
+                            column,
+                            window_values.get(projection_index),
+                            row_index,
+                        )
+                    })
                     .collect::<Vec<_>>()
             })
             .collect::<Vec<_>>();
@@ -811,10 +829,12 @@ impl SqlExecutor {
             dedup_selected_rows(&mut selected);
         }
         if let Some(order_by) = order_by.as_ref() {
-            if let Err(message) =
-                sort_result_rows_by_order(&mut selected, &output_columns, order_by)
-            {
-                return Ok(ExecuteResult::Error { message });
+            if order_by.expr.is_none() {
+                if let Err(message) =
+                    sort_result_rows_by_order(&mut selected, &output_columns, order_by)
+                {
+                    return Ok(ExecuteResult::Error { message });
+                }
             }
         }
         if let Some(limit) = limit {
@@ -973,12 +993,22 @@ impl SqlExecutor {
         for joined in matched_rows {
             let mut row = Vec::with_capacity(projection.len());
             for column in &projection {
-                let Some(value) = joined.get(&column.lookup) else {
-                    return Ok(ExecuteResult::Error {
-                        message: format!("unknown column '{}'", column.lookup),
-                    });
-                };
-                row.push(value.clone());
+                match &column.kind {
+                    ProjectionKind::Column(name) => {
+                        let Some(value) = joined.get(name) else {
+                            return Ok(ExecuteResult::Error {
+                                message: format!("unknown column '{}'", name),
+                            });
+                        };
+                        row.push(value.clone());
+                    }
+                    ProjectionKind::Expression(_) => {
+                        return Ok(ExecuteResult::Error {
+                            message: "expression projection is not supported for JOIN queries"
+                                .to_string(),
+                        });
+                    }
+                }
             }
             selected.push(row);
         }
@@ -1019,6 +1049,9 @@ impl SqlExecutor {
             having.map(|expr| normalize_where_expr(expr, table_alias.as_deref(), &table_name));
         let order_by = order_by.map(|order| OrderByClause {
             column: normalize_column_reference(order.column, table_alias.as_deref(), &table_name),
+            expr: order
+                .expr
+                .map(|expr| normalize_expr(expr, table_alias.as_deref(), &table_name)),
             direction: order.direction,
         });
         let resolved_where = self.resolve_where_expr(where_clause.as_ref())?;
@@ -1094,12 +1127,28 @@ impl SqlExecutor {
             .iter()
             .map(|item| item.header.clone())
             .collect::<Vec<_>>();
-        let mut selected = filtered_rows(source_rows, resolved_where.as_ref())
-            .into_iter()
-            .map(|row| {
+        let mut filtered = filtered_rows(source_rows, resolved_where.as_ref());
+        if let Some(order_by) = order_by.as_ref() {
+            if order_by.expr.is_some() {
+                sort_plain_rows_by_order_expr(&mut filtered, order_by);
+            }
+        }
+        let window_values = build_window_projection_values(&filtered, &projection)?;
+        let mut selected = filtered
+            .iter()
+            .enumerate()
+            .map(|(row_index, row)| {
                 projection
                     .iter()
-                    .map(|column| row.get(&column.lookup).cloned().unwrap_or(Value::Null))
+                    .enumerate()
+                    .map(|(projection_index, column)| {
+                        evaluate_projection_value(
+                            row,
+                            column,
+                            window_values.get(projection_index),
+                            row_index,
+                        )
+                    })
                     .collect::<Vec<_>>()
             })
             .collect::<Vec<_>>();
@@ -1107,10 +1156,12 @@ impl SqlExecutor {
             dedup_selected_rows(&mut selected);
         }
         if let Some(order_by) = order_by.as_ref() {
-            if let Err(message) =
-                sort_result_rows_by_order(&mut selected, &output_columns, order_by)
-            {
-                return Ok(ExecuteResult::Error { message });
+            if order_by.expr.is_none() {
+                if let Err(message) =
+                    sort_result_rows_by_order(&mut selected, &output_columns, order_by)
+                {
+                    return Ok(ExecuteResult::Error { message });
+                }
             }
         }
         if let Some(limit) = limit {
@@ -1199,12 +1250,22 @@ impl SqlExecutor {
         for joined in matched_rows {
             let mut row = Vec::new();
             for column in &projection {
-                let Some(value) = joined.get(&column.lookup) else {
-                    return Ok(ExecuteResult::Error {
-                        message: format!("unknown column '{}'", column.lookup),
-                    });
-                };
-                row.push(value.clone());
+                match &column.kind {
+                    ProjectionKind::Column(name) => {
+                        let Some(value) = joined.get(name) else {
+                            return Ok(ExecuteResult::Error {
+                                message: format!("unknown column '{}'", name),
+                            });
+                        };
+                        row.push(value.clone());
+                    }
+                    ProjectionKind::Expression(_) => {
+                        return Ok(ExecuteResult::Error {
+                            message: "expression projection is not supported for JOIN queries"
+                                .to_string(),
+                        });
+                    }
+                }
             }
             selected.push(row);
         }
@@ -1352,25 +1413,36 @@ impl SqlExecutor {
                 .columns
                 .iter()
                 .map(|column| ProjectionColumn {
-                    lookup: column.name.clone(),
+                    kind: ProjectionKind::Column(column.name.clone()),
                     header: column.name.clone(),
                 })
                 .collect()),
             SelectColumns::Named(items) => {
                 let mut projection = Vec::with_capacity(items.len());
                 for item in items {
-                    let SelectItem::Column { name, alias } = item else {
-                        return Err(
-                            "aggregate columns require aggregate execution path".to_string()
-                        );
-                    };
-                    if !schema.columns.iter().any(|column| column.name == *name) {
-                        return Err(format!("unknown column '{}'", name));
+                    match item {
+                        SelectItem::Column { name, alias } => {
+                            if !schema.columns.iter().any(|column| column.name == *name) {
+                                return Err(format!("unknown column '{}'", name));
+                            }
+                            projection.push(ProjectionColumn {
+                                kind: ProjectionKind::Column(name.clone()),
+                                header: alias.clone().unwrap_or_else(|| name.clone()),
+                            });
+                        }
+                        SelectItem::Expression { expr, alias } => {
+                            validate_expr_columns(expr, schema)?;
+                            projection.push(ProjectionColumn {
+                                kind: ProjectionKind::Expression(expr.clone()),
+                                header: alias.clone().unwrap_or_else(|| render_expr(expr)),
+                            });
+                        }
+                        SelectItem::Aggregate { .. } => {
+                            return Err(
+                                "aggregate columns require aggregate execution path".to_string()
+                            );
+                        }
                     }
-                    projection.push(ProjectionColumn {
-                        lookup: name.clone(),
-                        header: alias.clone().unwrap_or_else(|| name.clone()),
-                    });
                 }
                 Ok(projection)
             }
@@ -1400,6 +1472,9 @@ impl SqlExecutor {
                         ));
                     }
                     columns.push(alias.clone().unwrap_or_else(|| name.clone()));
+                }
+                SelectItem::Expression { .. } => {
+                    return Err("expressions are not supported in aggregate SELECT yet".to_string());
                 }
                 SelectItem::Aggregate {
                     func,
@@ -1622,45 +1697,50 @@ impl SqlExecutor {
             SelectColumns::All => Ok(all_columns
                 .into_iter()
                 .map(|column| ProjectionColumn {
-                    lookup: column.clone(),
+                    kind: ProjectionKind::Column(column.clone()),
                     header: column,
                 })
                 .collect()),
             SelectColumns::Named(items) => {
                 let mut projection = Vec::with_capacity(items.len());
                 for item in items {
-                    let SelectItem::Column { name, alias } = item else {
-                        return Err(
-                            "aggregate projection is not supported for JOIN queries".to_string()
-                        );
-                    };
-                    if !all_columns.iter().any(|column| column == name) {
-                        let left_matches = left_schema
-                            .columns
-                            .iter()
-                            .filter(|column| {
-                                column.name == *name
-                                    || format!("{}.{}", left_schema.table_name, column.name)
-                                        == *name
-                            })
-                            .count();
-                        let right_matches = right_schema
-                            .columns
-                            .iter()
-                            .filter(|column| {
-                                column.name == *name
-                                    || format!("{}.{}", right_schema.table_name, column.name)
-                                        == *name
-                            })
-                            .count();
-                        if left_matches + right_matches != 1 {
-                            return Err(format!("unknown or ambiguous column '{}'", name));
+                    match item {
+                        SelectItem::Column { name, alias } => {
+                            if !all_columns.iter().any(|column| column == name) {
+                                let left_matches = left_schema
+                                    .columns
+                                    .iter()
+                                    .filter(|column| {
+                                        column.name == *name
+                                            || format!("{}.{}", left_schema.table_name, column.name)
+                                                == *name
+                                    })
+                                    .count();
+                                let right_matches = right_schema
+                                    .columns
+                                    .iter()
+                                    .filter(|column| {
+                                        column.name == *name
+                                            || format!(
+                                                "{}.{}",
+                                                right_schema.table_name, column.name
+                                            ) == *name
+                                    })
+                                    .count();
+                                if left_matches + right_matches != 1 {
+                                    return Err(format!("unknown or ambiguous column '{}'", name));
+                                }
+                            }
+                            projection.push(ProjectionColumn {
+                                kind: ProjectionKind::Column(name.clone()),
+                                header: alias.clone().unwrap_or_else(|| name.clone()),
+                            });
+                        }
+                        _ => {
+                            return Err("expression projection is not supported for JOIN queries"
+                                .to_string());
                         }
                     }
-                    projection.push(ProjectionColumn {
-                        lookup: name.clone(),
-                        header: alias.clone().unwrap_or_else(|| name.clone()),
-                    });
                 }
                 Ok(projection)
             }
@@ -1776,8 +1856,14 @@ trait ValueLookup {
 
 #[derive(Debug, Clone)]
 struct ProjectionColumn {
-    lookup: String,
+    kind: ProjectionKind,
     header: String,
+}
+
+#[derive(Debug, Clone)]
+enum ProjectionKind {
+    Column(String),
+    Expression(Expr),
 }
 
 fn where_eq_comparison_parts(where_clause: &WhereExpr) -> Option<(&str, &Value)> {
@@ -1870,6 +1956,10 @@ fn normalize_select_item(
             name: normalize_column_reference(name, table_alias, table_name),
             alias,
         },
+        SelectItem::Expression { expr, alias } => SelectItem::Expression {
+            expr: normalize_expr(expr, table_alias, table_name),
+            alias,
+        },
         SelectItem::Aggregate {
             func,
             column,
@@ -1879,6 +1969,49 @@ fn normalize_select_item(
             column: column
                 .map(|column| normalize_column_reference(column, table_alias, table_name)),
             alias,
+        },
+    }
+}
+
+fn normalize_expr(expr: Expr, table_alias: Option<&str>, table_name: &str) -> Expr {
+    match expr {
+        Expr::Value(value) => Expr::Value(value),
+        Expr::Column(column) => {
+            Expr::Column(normalize_column_reference(column, table_alias, table_name))
+        }
+        Expr::CaseWhen {
+            conditions,
+            else_result,
+        } => Expr::CaseWhen {
+            conditions: conditions
+                .into_iter()
+                .map(|(condition, result)| {
+                    (
+                        normalize_where_expr(condition, table_alias, table_name),
+                        normalize_expr(result, table_alias, table_name),
+                    )
+                })
+                .collect(),
+            else_result: else_result
+                .map(|expr| Box::new(normalize_expr(*expr, table_alias, table_name))),
+        },
+        Expr::WindowFunction {
+            func,
+            target_column,
+            partition_by,
+            order_by,
+        } => Expr::WindowFunction {
+            func,
+            target_column: target_column
+                .map(|column| normalize_column_reference(column, table_alias, table_name)),
+            partition_by: partition_by
+                .map(|column| normalize_column_reference(column, table_alias, table_name)),
+            order_by: order_by.map(|(column, asc)| {
+                (
+                    normalize_column_reference(column, table_alias, table_name),
+                    asc,
+                )
+            }),
         },
     }
 }
@@ -1995,6 +2128,314 @@ fn materialized_rows(columns: &[String], rows: Vec<Vec<Value>>) -> Vec<Row> {
     rows.into_iter()
         .map(|values| Row::new(columns.iter().cloned().zip(values).collect()))
         .collect()
+}
+
+fn validate_expr_columns(expr: &Expr, schema: &TableSchema) -> std::result::Result<(), String> {
+    match expr {
+        Expr::Value(_) => Ok(()),
+        Expr::Column(column) => {
+            if schema.columns.iter().any(|item| item.name == *column) {
+                Ok(())
+            } else {
+                Err(format!("unknown column '{}'", column))
+            }
+        }
+        Expr::CaseWhen {
+            conditions,
+            else_result,
+        } => {
+            for (condition, result) in conditions {
+                validate_where_expr_columns(condition, schema)?;
+                validate_expr_columns(result, schema)?;
+            }
+            if let Some(result) = else_result {
+                validate_expr_columns(result, schema)?;
+            }
+            Ok(())
+        }
+        Expr::WindowFunction {
+            func: _,
+            target_column,
+            partition_by,
+            order_by,
+        } => {
+            if let Some(column) = target_column {
+                validate_expr_columns(&Expr::Column(column.clone()), schema)?;
+            }
+            if let Some(column) = partition_by {
+                validate_expr_columns(&Expr::Column(column.clone()), schema)?;
+            }
+            if let Some((column, _)) = order_by {
+                validate_expr_columns(&Expr::Column(column.clone()), schema)?;
+            }
+            Ok(())
+        }
+    }
+}
+
+fn validate_where_expr_columns(
+    expr: &WhereExpr,
+    schema: &TableSchema,
+) -> std::result::Result<(), String> {
+    match expr {
+        WhereExpr::Comparison { column, .. }
+        | WhereExpr::Between { column, .. }
+        | WhereExpr::Like { column, .. }
+        | WhereExpr::IsNull { column, .. }
+        | WhereExpr::InSubquery { column, .. } => {
+            validate_expr_columns(&Expr::Column(column.clone()), schema)
+        }
+        WhereExpr::And(left, right) | WhereExpr::Or(left, right) => {
+            validate_where_expr_columns(left, schema)?;
+            validate_where_expr_columns(right, schema)
+        }
+        WhereExpr::Not(inner) => validate_where_expr_columns(inner, schema),
+    }
+}
+
+fn render_expr(expr: &Expr) -> String {
+    match expr {
+        Expr::Value(value) => render_value(value),
+        Expr::Column(column) => column.clone(),
+        Expr::CaseWhen {
+            conditions,
+            else_result,
+        } => {
+            let mut parts = vec!["CASE".to_string()];
+            for (condition, result) in conditions {
+                parts.push(format!(
+                    "WHEN {} THEN {}",
+                    render_where_expr(condition),
+                    render_expr(result)
+                ));
+            }
+            if let Some(result) = else_result {
+                parts.push(format!("ELSE {}", render_expr(result)));
+            }
+            parts.push("END".to_string());
+            parts.join(" ")
+        }
+        Expr::WindowFunction {
+            func,
+            target_column,
+            partition_by,
+            order_by,
+        } => {
+            let func_str = match func {
+                WindowFunc::RowNumber => "ROW_NUMBER()".to_string(),
+                WindowFunc::Rank => "RANK()".to_string(),
+                WindowFunc::WinCount => format!(
+                    "COUNT({})",
+                    target_column.clone().unwrap_or_else(|| "*".to_string())
+                ),
+                WindowFunc::WinSum => format!(
+                    "SUM({})",
+                    target_column.clone().unwrap_or_else(|| "?".to_string())
+                ),
+            };
+            let mut over_parts = Vec::new();
+            if let Some(column) = partition_by {
+                over_parts.push(format!("PARTITION BY {}", column));
+            }
+            if let Some((column, asc)) = order_by {
+                over_parts.push(format!(
+                    "ORDER BY {} {}",
+                    column,
+                    if *asc { "ASC" } else { "DESC" }
+                ));
+            }
+            format!("{} OVER ({})", func_str, over_parts.join(" "))
+        }
+    }
+}
+
+fn evaluate_projection_value(
+    row: &Row,
+    projection: &ProjectionColumn,
+    window_values: Option<&Vec<Value>>,
+    row_index: usize,
+) -> Value {
+    match &projection.kind {
+        ProjectionKind::Column(name) => row.get(name).cloned().unwrap_or(Value::Null),
+        ProjectionKind::Expression(expr) => match expr {
+            Expr::WindowFunction { .. } => window_values
+                .and_then(|values| values.get(row_index).cloned())
+                .unwrap_or(Value::Null),
+            _ => eval_expr_on_row(row, expr),
+        },
+    }
+}
+
+fn eval_expr_on_row(row: &Row, expr: &Expr) -> Value {
+    match expr {
+        Expr::Value(value) => value.clone(),
+        Expr::Column(column) => row.get(column).cloned().unwrap_or(Value::Null),
+        Expr::CaseWhen {
+            conditions,
+            else_result,
+        } => {
+            for (condition, result) in conditions {
+                if eval_where_expr_unresolved(row, condition) {
+                    return eval_expr_on_row(row, result);
+                }
+            }
+            else_result
+                .as_ref()
+                .map(|result| eval_expr_on_row(row, result))
+                .unwrap_or(Value::Null)
+        }
+        Expr::WindowFunction { .. } => Value::Null,
+    }
+}
+
+fn eval_where_expr_unresolved<T: ValueLookup>(row: &T, expr: &WhereExpr) -> bool {
+    match expr {
+        WhereExpr::Comparison {
+            column,
+            operator,
+            value,
+        } => row
+            .lookup(column)
+            .is_some_and(|left| compare_values(left, value, operator.clone())),
+        WhereExpr::Between { column, low, high } => row.lookup(column).is_some_and(|value| {
+            compare_values(value, low, Operator::Ge) && compare_values(value, high, Operator::Le)
+        }),
+        WhereExpr::Like { column, pattern } => row
+            .lookup(column)
+            .is_some_and(|value| matches_like_pattern(value, pattern)),
+        WhereExpr::IsNull { column, negated } => {
+            let is_null = row
+                .lookup(column)
+                .is_none_or(|value| matches!(value, Value::Null));
+            if *negated {
+                !is_null
+            } else {
+                is_null
+            }
+        }
+        WhereExpr::InSubquery { .. } => false,
+        WhereExpr::And(left, right) => {
+            eval_where_expr_unresolved(row, left) && eval_where_expr_unresolved(row, right)
+        }
+        WhereExpr::Or(left, right) => {
+            eval_where_expr_unresolved(row, left) || eval_where_expr_unresolved(row, right)
+        }
+        WhereExpr::Not(inner) => !eval_where_expr_unresolved(row, inner),
+    }
+}
+
+fn build_window_projection_values(
+    rows: &[Row],
+    projection: &[ProjectionColumn],
+) -> Result<Vec<Vec<Value>>> {
+    let mut values = Vec::with_capacity(projection.len());
+    for column in projection {
+        match &column.kind {
+            ProjectionKind::Column(_) => values.push(Vec::new()),
+            ProjectionKind::Expression(expr) => {
+                values.push(compute_window_expr_values(rows, expr)?);
+            }
+        }
+    }
+    Ok(values)
+}
+
+fn compute_window_expr_values(rows: &[Row], expr: &Expr) -> Result<Vec<Value>> {
+    let Expr::WindowFunction {
+        func,
+        target_column,
+        partition_by,
+        order_by,
+    } = expr
+    else {
+        return Ok(Vec::new());
+    };
+
+    let mut result = vec![Value::Null; rows.len()];
+    let mut partitions: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+    for (index, row) in rows.iter().enumerate() {
+        let key = partition_by
+            .as_ref()
+            .and_then(|column| row.get(column))
+            .map(value_group_key)
+            .unwrap_or_else(|| "__all__".to_string());
+        partitions.entry(key).or_default().push(index);
+    }
+
+    for indices in partitions.values() {
+        let mut ordered = indices.clone();
+        if let Some((column, asc)) = order_by {
+            ordered.sort_by(|left, right| {
+                let left_value = rows[*left].get(column).unwrap_or(&Value::Null);
+                let right_value = rows[*right].get(column).unwrap_or(&Value::Null);
+                let order = compare_sort_order(left_value, right_value);
+                if *asc {
+                    order
+                } else {
+                    order.reverse()
+                }
+            });
+        }
+
+        match func {
+            WindowFunc::RowNumber => {
+                for (position, row_index) in ordered.iter().enumerate() {
+                    result[*row_index] = Value::Int((position + 1) as i64);
+                }
+            }
+            WindowFunc::Rank => {
+                let mut last_value: Option<Value> = None;
+                let mut current_rank = 1_i64;
+                for (position, row_index) in ordered.iter().enumerate() {
+                    let current_value = order_by
+                        .as_ref()
+                        .and_then(|(column, _)| rows[*row_index].get(column))
+                        .cloned()
+                        .unwrap_or(Value::Null);
+                    if position > 0 && Some(current_value.clone()) != last_value {
+                        current_rank = (position + 1) as i64;
+                    }
+                    result[*row_index] = Value::Int(current_rank);
+                    last_value = Some(current_value);
+                }
+            }
+            WindowFunc::WinCount => {
+                let count = match target_column {
+                    Some(column) => indices
+                        .iter()
+                        .filter(|index| {
+                            !matches!(
+                                rows[**index].get(column).unwrap_or(&Value::Null),
+                                Value::Null
+                            )
+                        })
+                        .count() as i64,
+                    None => indices.len() as i64,
+                };
+                for row_index in indices {
+                    result[*row_index] = Value::Int(count);
+                }
+            }
+            WindowFunc::WinSum => {
+                let Some(column) = target_column else {
+                    return Ok(result);
+                };
+                let mut sum = 0_i64;
+                for row_index in indices {
+                    match rows[*row_index].get(column).unwrap_or(&Value::Null) {
+                        Value::Int(value) => sum += value,
+                        Value::Null => {}
+                        _ => return Ok(result),
+                    }
+                }
+                for row_index in indices {
+                    result[*row_index] = Value::Int(sum);
+                }
+            }
+        }
+    }
+
+    Ok(result)
 }
 
 // 中文註解：遞迴執行布林 WHERE/HAVING 條件，讓 Row、JOIN 結果與聚合列共用同一套邏輯。
@@ -2114,6 +2555,9 @@ fn order_direction_to_str(direction: &OrderDirection) -> &'static str {
 fn render_select_item(item: &SelectItem) -> String {
     match item {
         SelectItem::Column { name, alias } => alias.clone().unwrap_or_else(|| name.clone()),
+        SelectItem::Expression { expr, alias } => {
+            alias.clone().unwrap_or_else(|| render_expr(expr))
+        }
         SelectItem::Aggregate {
             func,
             column,
@@ -2150,6 +2594,21 @@ fn sort_result_rows_by_order(
         }
     });
     Ok(())
+}
+
+fn sort_plain_rows_by_order_expr(rows: &mut [Row], order_by: &OrderByClause) {
+    let Some(expr) = order_by.expr.as_ref() else {
+        return;
+    };
+    rows.sort_by(|left, right| {
+        let left_value = eval_expr_on_row(left, expr);
+        let right_value = eval_expr_on_row(right, expr);
+        let order = compare_sort_order(&left_value, &right_value);
+        match order_by.direction {
+            OrderDirection::Asc => order,
+            OrderDirection::Desc => order.reverse(),
+        }
+    });
 }
 
 fn sort_joined_rows_by_order(
@@ -2242,6 +2701,9 @@ fn evaluate_select_item(item: &SelectItem, rows: &[Row]) -> std::result::Result<
             .and_then(|row| row.get(name))
             .cloned()
             .unwrap_or(Value::Null)),
+        SelectItem::Expression { .. } => {
+            Err("expressions are not supported in aggregate SELECT yet".to_string())
+        }
         SelectItem::Aggregate { func, column, .. } => {
             evaluate_aggregate(func, column.as_deref(), rows)
         }

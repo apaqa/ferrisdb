@@ -119,11 +119,39 @@ pub enum SelectItem {
         name: String,
         alias: Option<String>,
     },
+    Expression {
+        expr: Expr,
+        alias: Option<String>,
+    },
     Aggregate {
         func: AggregateFunc,
         column: Option<String>,
         alias: Option<String>,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Expr {
+    Value(Value),
+    Column(String),
+    CaseWhen {
+        conditions: Vec<(WhereExpr, Expr)>,
+        else_result: Option<Box<Expr>>,
+    },
+    WindowFunction {
+        func: WindowFunc,
+        target_column: Option<String>,
+        partition_by: Option<String>,
+        order_by: Option<(String, bool)>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum WindowFunc {
+    RowNumber,
+    Rank,
+    WinCount,
+    WinSum,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -186,6 +214,7 @@ pub struct GroupByClause {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OrderByClause {
     pub column: String,
+    pub expr: Option<Expr>,
     pub direction: OrderDirection,
 }
 

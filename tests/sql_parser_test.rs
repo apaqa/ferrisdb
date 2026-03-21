@@ -355,6 +355,7 @@ fn test_parse_select_with_order_by_and_limit() {
             having: None,
             order_by: Some(OrderByClause {
                 column: "age".to_string(),
+                expr: None,
                 direction: OrderDirection::Desc,
             }),
             limit: Some(5),
@@ -400,6 +401,7 @@ fn test_parse_select_with_count_group_by_and_having() {
             }),
             order_by: Some(OrderByClause {
                 column: "age".to_string(),
+                expr: None,
                 direction: OrderDirection::Desc,
             }),
             limit: Some(3),
