@@ -37,7 +37,7 @@ use super::ast::{
     Statement, Value, WhereExpr, WindowFunc,
 };
 use super::catalog::{Catalog, TableSchema, ViewDefinition};
-use super::index::{IndexLookupPlan, IndexManager};
+use super::index::IndexManager;
 use super::parser::Parser;
 use super::row::{
     decode_row_key, encode_row_key, encode_row_prefix_end, encode_row_prefix_start, Row,

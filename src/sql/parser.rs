@@ -340,10 +340,6 @@ impl Parser {
         Ok(statement)
     }
 
-    fn parse_select(&mut self) -> Result<Statement> {
-        self.parse_select_with_ctes(Vec::new())
-    }
-
     fn parse_select_with_ctes(&mut self, ctes: Vec<CTE>) -> Result<Statement> {
         self.expect_keyword(Keyword::Select)?;
         let distinct = if matches!(self.peek(), Some(Token::Keyword(Keyword::Distinct))) {

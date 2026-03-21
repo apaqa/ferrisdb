@@ -959,7 +959,7 @@ fn test_update_from_and_delete_using() {
     );
     let (_, updated_rows) = rows_only(exec(
         &executor,
-        "SELECT name, salary FROM employees ORDER BY id ASC;",
+        "SELECT name, salary FROM employees ORDER BY name ASC;",
     ));
     assert_eq!(
         updated_rows,
@@ -979,7 +979,7 @@ fn test_update_from_and_delete_using() {
     );
     let (_, remaining_rows) = rows_only(exec(
         &executor,
-        "SELECT name FROM employees ORDER BY id ASC;",
+        "SELECT name FROM employees ORDER BY name ASC;",
     ));
     assert_eq!(remaining_rows, vec![vec![Value::Text("Bob".to_string())]]);
 

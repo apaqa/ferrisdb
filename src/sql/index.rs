@@ -34,14 +34,13 @@ pub struct IndexLookupPlan {
 
 #[derive(Debug, Clone)]
 pub struct IndexManager {
-    engine: Arc<MvccEngine>,
     catalog: Catalog,
 }
 
 impl IndexManager {
     pub fn new(engine: Arc<MvccEngine>) -> Self {
         let catalog = Catalog::new(Arc::clone(&engine));
-        Self { engine, catalog }
+        Self { catalog }
     }
 
     pub fn create_index_in_txn(
