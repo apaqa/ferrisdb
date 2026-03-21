@@ -13,6 +13,11 @@ pub enum Statement {
     Explain {
         statement: Box<Statement>,
     },
+    CreateView {
+        view_name: String,
+        query_sql: String,
+        query: Box<Statement>,
+    },
     CreateTable {
         table_name: String,
         if_not_exists: bool,
@@ -30,6 +35,10 @@ pub enum Statement {
         table_name: String,
         if_exists: bool,
     },
+    DropView {
+        view_name: String,
+        if_exists: bool,
+    },
     CreateIndex {
         table_name: String,
         column_name: String,
@@ -40,7 +49,7 @@ pub enum Statement {
     },
     Insert {
         table_name: String,
-        values: Vec<Vec<Value>>,
+        source: InsertSource,
     },
     Select {
         distinct: bool,
@@ -63,6 +72,11 @@ pub enum Statement {
         table_name: String,
         where_clause: Option<WhereExpr>,
     },
+    Union {
+        left: Box<Statement>,
+        right: Box<Statement>,
+        all: bool,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -84,6 +98,12 @@ pub enum Value {
     Text(String),
     Bool(bool),
     Null,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum InsertSource {
+    Values(Vec<Vec<Value>>),
+    Select(Box<Statement>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

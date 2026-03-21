@@ -24,11 +24,18 @@ use crate::transaction::mvcc::{MvccEngine, Transaction};
 use super::ast::ColumnDef;
 
 pub const TABLE_META_PREFIX: &str = "__meta:table:";
+pub const VIEW_META_PREFIX: &str = "__meta:view:";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TableSchema {
     pub table_name: String,
     pub columns: Vec<ColumnDef>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ViewDefinition {
+    pub view_name: String,
+    pub query_sql: String,
 }
 
 #[derive(Debug, Clone)]
@@ -82,6 +89,35 @@ impl Catalog {
         Ok(true)
     }
 
+    // 中文註解：View 定義會和 table schema 一樣放在系統 metadata 區，方便重啟後直接讀回。
+    pub fn create_view(&self, txn: &mut Transaction, view: &ViewDefinition) -> Result<bool> {
+        let key = encode_view_key(&view.view_name);
+        if txn.get(&key)?.is_some() {
+            return Ok(false);
+        }
+
+        txn.put(key, serde_json::to_vec(view)?)?;
+        Ok(true)
+    }
+
+    pub fn get_view(&self, txn: &Transaction, view_name: &str) -> Result<Option<ViewDefinition>> {
+        let key = encode_view_key(view_name);
+        let Some(raw) = txn.get(&key)? else {
+            return Ok(None);
+        };
+        Ok(Some(serde_json::from_slice(&raw)?))
+    }
+
+    pub fn drop_view(&self, txn: &mut Transaction, view_name: &str) -> Result<bool> {
+        let key = encode_view_key(view_name);
+        if txn.get(&key)?.is_none() {
+            return Ok(false);
+        }
+
+        txn.delete(&key)?;
+        Ok(true)
+    }
+
     pub fn engine(&self) -> &Arc<MvccEngine> {
         &self.engine
     }
@@ -89,4 +125,8 @@ impl Catalog {
 
 pub fn encode_schema_key(table_name: &str) -> Vec<u8> {
     format!("{}{}", TABLE_META_PREFIX, table_name).into_bytes()
+}
+
+pub fn encode_view_key(view_name: &str) -> Vec<u8> {
+    format!("{}{}", VIEW_META_PREFIX, view_name).into_bytes()
 }

@@ -32,11 +32,13 @@ use crate::error::Result;
 use crate::transaction::mvcc::{MvccEngine, Transaction};
 
 use super::ast::{
-    AggregateFunc, Assignment, ColumnDef, GroupByClause, JoinClause, JoinType, Operator,
-    OrderByClause, OrderDirection, SelectColumns, SelectItem, Statement, Value, WhereExpr,
+    AggregateFunc, Assignment, ColumnDef, DataType, GroupByClause, InsertSource, JoinClause,
+    JoinType, Operator, OrderByClause, OrderDirection, SelectColumns, SelectItem, Statement, Value,
+    WhereExpr,
 };
-use super::catalog::{Catalog, TableSchema};
+use super::catalog::{Catalog, TableSchema, ViewDefinition};
 use super::index::IndexManager;
+use super::parser::Parser;
 use super::row::{
     decode_row_key, encode_row_key, encode_row_prefix_end, encode_row_prefix_start, Row,
 };
@@ -102,6 +104,11 @@ impl SqlExecutor {
     pub fn execute(&self, stmt: Statement) -> Result<ExecuteResult> {
         match stmt {
             Statement::Explain { statement } => self.execute_explain(*statement),
+            Statement::CreateView {
+                view_name,
+                query_sql,
+                query: _,
+            } => self.execute_create_view(view_name, query_sql),
             Statement::CreateTable {
                 table_name,
                 if_not_exists,
@@ -118,6 +125,10 @@ impl SqlExecutor {
                 table_name,
                 if_exists,
             } => self.execute_drop_table(table_name, if_exists),
+            Statement::DropView {
+                view_name,
+                if_exists,
+            } => self.execute_drop_view(view_name, if_exists),
             Statement::CreateIndex {
                 table_name,
                 column_name,
@@ -126,7 +137,7 @@ impl SqlExecutor {
                 table_name,
                 column_name,
             } => self.execute_drop_index(table_name, column_name),
-            Statement::Insert { table_name, values } => self.execute_insert(table_name, values),
+            Statement::Insert { table_name, source } => self.execute_insert(table_name, source),
             Statement::Select {
                 distinct,
                 table_name,
@@ -159,6 +170,7 @@ impl SqlExecutor {
                 table_name,
                 where_clause,
             } => self.execute_delete(table_name, where_clause),
+            Statement::Union { left, right, all } => self.execute_union(*left, *right, all),
         }
     }
 
@@ -191,6 +203,25 @@ impl SqlExecutor {
 
         txn.commit()?;
         Ok(ExecuteResult::Created { table_name })
+    }
+
+    fn execute_create_view(&self, view_name: String, query_sql: String) -> Result<ExecuteResult> {
+        let mut txn = self.engine.begin_transaction();
+        let view = ViewDefinition {
+            view_name: view_name.clone(),
+            query_sql,
+        };
+
+        if !self.catalog.create_view(&mut txn, &view)? {
+            return Ok(ExecuteResult::Error {
+                message: format!("view '{}' already exists", view_name),
+            });
+        }
+
+        txn.commit()?;
+        Ok(ExecuteResult::Created {
+            table_name: view_name,
+        })
     }
 
     fn execute_alter_table_add(
@@ -307,6 +338,25 @@ impl SqlExecutor {
 
         txn.commit()?;
         Ok(ExecuteResult::Dropped { table_name })
+    }
+
+    fn execute_drop_view(&self, view_name: String, if_exists: bool) -> Result<ExecuteResult> {
+        let mut txn = self.engine.begin_transaction();
+        if !self.catalog.drop_view(&mut txn, &view_name)? {
+            if if_exists {
+                return Ok(ExecuteResult::Dropped {
+                    table_name: view_name,
+                });
+            }
+            return Ok(ExecuteResult::Error {
+                message: format!("view '{}' does not exist", view_name),
+            });
+        }
+
+        txn.commit()?;
+        Ok(ExecuteResult::Dropped {
+            table_name: view_name,
+        })
     }
 
     fn execute_create_index(
@@ -530,7 +580,7 @@ impl SqlExecutor {
         }
     }
 
-    fn execute_insert(&self, table_name: String, values: Vec<Vec<Value>>) -> Result<ExecuteResult> {
+    fn execute_insert(&self, table_name: String, source: InsertSource) -> Result<ExecuteResult> {
         let mut txn = self.engine.begin_transaction();
         let Some(schema) = self.catalog.get_table(&txn, &table_name)? else {
             return Ok(ExecuteResult::Error {
@@ -538,57 +588,115 @@ impl SqlExecutor {
             });
         };
 
-        let mut inserted = 0;
-        for row_values in values {
-            if row_values.len() != schema.columns.len() {
-                return Ok(ExecuteResult::Error {
-                    message: format!(
-                        "INSERT expected {} values for table '{}', got {}",
-                        schema.columns.len(),
-                        table_name,
-                        row_values.len()
-                    ),
-                });
+        let rows = match source {
+            InsertSource::Values(rows) => rows,
+            InsertSource::Select(statement) => {
+                let result = self.execute(*statement)?;
+                let ExecuteResult::Selected { rows, .. } = result else {
+                    return Ok(ExecuteResult::Error {
+                        message: "INSERT INTO SELECT requires a SELECT-compatible source"
+                            .to_string(),
+                    });
+                };
+                rows
             }
+        };
 
-            let Some(pk_value) = row_values.first().cloned() else {
-                return Ok(ExecuteResult::Error {
-                    message: "INSERT row cannot be empty".to_string(),
-                });
-            };
-            if matches!(pk_value, Value::Null) {
-                return Ok(ExecuteResult::Error {
-                    message: "primary key cannot be NULL".to_string(),
-                });
-            }
-
-            let row = Row::new(
-                schema
-                    .columns
-                    .iter()
-                    .map(|column| column.name.clone())
-                    .zip(row_values.into_iter())
-                    .collect(),
-            );
-            let key = encode_row_key(&table_name, &pk_value);
-            let value = serde_json::to_vec(&row)?;
-            txn.put(key, value)?;
-            for indexed_column in self.index_manager.list_indexes(&txn, &table_name)? {
-                if let Some(index_value) = row.get(&indexed_column) {
-                    self.index_manager.insert_index_entry(
-                        &mut txn,
-                        &table_name,
-                        &indexed_column,
-                        index_value,
-                        &pk_value,
-                    )?;
-                }
-            }
-            inserted += 1;
-        }
+        let inserted = match self.insert_rows_into_table(&mut txn, &schema, &table_name, rows)? {
+            Ok(count) => count,
+            Err(message) => return Ok(ExecuteResult::Error { message }),
+        };
 
         txn.commit()?;
         Ok(ExecuteResult::Inserted { count: inserted })
+    }
+
+    fn execute_union(&self, left: Statement, right: Statement, all: bool) -> Result<ExecuteResult> {
+        let left_result = self.execute(left)?;
+        let right_result = self.execute(right)?;
+        let ExecuteResult::Selected {
+            columns: left_columns,
+            mut rows,
+        } = left_result
+        else {
+            return Ok(ExecuteResult::Error {
+                message: "UNION only supports SELECT-compatible queries".to_string(),
+            });
+        };
+        let ExecuteResult::Selected {
+            columns: right_columns,
+            rows: right_rows,
+        } = right_result
+        else {
+            return Ok(ExecuteResult::Error {
+                message: "UNION only supports SELECT-compatible queries".to_string(),
+            });
+        };
+
+        if left_columns.len() != right_columns.len() {
+            return Ok(ExecuteResult::Error {
+                message: format!(
+                    "UNION expected {} columns on right side, got {}",
+                    left_columns.len(),
+                    right_columns.len()
+                ),
+            });
+        }
+
+        rows.extend(right_rows);
+        if !all {
+            dedup_selected_rows(&mut rows);
+        }
+
+        Ok(ExecuteResult::Selected {
+            columns: left_columns,
+            rows,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn execute_select_from_view(
+        &self,
+        txn: &Transaction,
+        view: ViewDefinition,
+        distinct: bool,
+        view_name: String,
+        table_alias: Option<String>,
+        columns: SelectColumns,
+        join: Option<JoinClause>,
+        where_clause: Option<WhereExpr>,
+        group_by: Option<GroupByClause>,
+        having: Option<WhereExpr>,
+        order_by: Option<OrderByClause>,
+        limit: Option<usize>,
+    ) -> Result<ExecuteResult> {
+        let statement = parse_sql_to_statement(&view.query_sql)?;
+        let ExecuteResult::Selected {
+            columns: source_columns,
+            rows: source_rows,
+        } = self.execute(statement)?
+        else {
+            return Ok(ExecuteResult::Error {
+                message: format!("view '{}' does not produce tabular rows", view.view_name),
+            });
+        };
+
+        let schema = materialized_schema(&view_name, &source_columns, &source_rows);
+        let rows = materialized_rows(&source_columns, source_rows);
+        self.execute_select_from_materialized_rows(
+            txn,
+            schema,
+            rows,
+            distinct,
+            table_alias,
+            columns,
+            join,
+            where_clause,
+            group_by,
+            having,
+            order_by,
+            limit,
+        )
     }
 
     fn execute_select(
@@ -605,6 +713,24 @@ impl SqlExecutor {
         limit: Option<usize>,
     ) -> Result<ExecuteResult> {
         let txn = self.engine.begin_transaction();
+        if self.catalog.get_table(&txn, &table_name)?.is_none() {
+            if let Some(view) = self.catalog.get_view(&txn, &table_name)? {
+                return self.execute_select_from_view(
+                    &txn,
+                    view,
+                    distinct,
+                    table_name,
+                    table_alias,
+                    columns,
+                    join,
+                    where_clause,
+                    group_by,
+                    having,
+                    order_by,
+                    limit,
+                );
+            }
+        }
         let Some(schema) = self.catalog.get_table(&txn, &table_name)? else {
             return Ok(ExecuteResult::Error {
                 message: format!("table '{}' does not exist", table_name),
@@ -866,6 +992,232 @@ impl SqlExecutor {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn execute_select_from_materialized_rows(
+        &self,
+        txn: &Transaction,
+        schema: TableSchema,
+        source_rows: Vec<Row>,
+        distinct: bool,
+        table_alias: Option<String>,
+        columns: SelectColumns,
+        join: Option<JoinClause>,
+        where_clause: Option<WhereExpr>,
+        group_by: Option<GroupByClause>,
+        having: Option<WhereExpr>,
+        order_by: Option<OrderByClause>,
+        limit: Option<usize>,
+    ) -> Result<ExecuteResult> {
+        let table_name = schema.table_name.clone();
+        let columns = normalize_select_columns(columns, table_alias.as_deref(), &table_name);
+        let where_clause = where_clause
+            .map(|expr| normalize_where_expr(expr, table_alias.as_deref(), &table_name));
+        let group_by = group_by.map(|group| GroupByClause {
+            column: normalize_column_reference(group.column, table_alias.as_deref(), &table_name),
+        });
+        let having =
+            having.map(|expr| normalize_where_expr(expr, table_alias.as_deref(), &table_name));
+        let order_by = order_by.map(|order| OrderByClause {
+            column: normalize_column_reference(order.column, table_alias.as_deref(), &table_name),
+            direction: order.direction,
+        });
+        let resolved_where = self.resolve_where_expr(where_clause.as_ref())?;
+
+        if let Some(join_clause) = join {
+            return self.execute_join_select_from_rows(
+                txn,
+                &schema,
+                &source_rows,
+                distinct,
+                columns,
+                join_clause,
+                where_clause,
+                order_by,
+                limit,
+            );
+        }
+
+        if matches!(columns, SelectColumns::Aggregate(_)) || group_by.is_some() {
+            let resolved_having = self.resolve_where_expr(having.as_ref())?;
+            let SelectColumns::Aggregate(items) = columns else {
+                return Ok(ExecuteResult::Error {
+                    message: "GROUP BY requires aggregate expressions in SELECT".to_string(),
+                });
+            };
+            let output_columns =
+                match self.resolve_aggregate_projection(&schema, &items, group_by.as_ref()) {
+                    Ok(columns) => columns,
+                    Err(message) => return Ok(ExecuteResult::Error { message }),
+                };
+            let mut selected = Vec::new();
+            for (_, group_rows) in group_rows(
+                filtered_rows(source_rows, resolved_where.as_ref()),
+                group_by.as_ref(),
+            ) {
+                let mut output_row = Vec::with_capacity(items.len());
+                for item in &items {
+                    match evaluate_select_item(item, &group_rows) {
+                        Ok(value) => output_row.push(value),
+                        Err(message) => return Ok(ExecuteResult::Error { message }),
+                    }
+                }
+                let projected_row = ProjectedRow::new(&output_columns, &output_row);
+                if !eval_where_expr(&projected_row, resolved_having.as_ref()) {
+                    continue;
+                }
+                selected.push(output_row);
+            }
+            if let Some(order_by) = order_by.as_ref() {
+                if let Err(message) =
+                    sort_result_rows_by_order(&mut selected, &output_columns, order_by)
+                {
+                    return Ok(ExecuteResult::Error { message });
+                }
+            }
+            if let Some(limit) = limit {
+                selected.truncate(limit);
+            }
+            if distinct {
+                dedup_selected_rows(&mut selected);
+            }
+            return Ok(ExecuteResult::Selected {
+                columns: output_columns,
+                rows: selected,
+            });
+        }
+
+        let projection = match self.resolve_projection(&schema, &columns) {
+            Ok(columns) => columns,
+            Err(message) => return Ok(ExecuteResult::Error { message }),
+        };
+        let output_columns = projection
+            .iter()
+            .map(|item| item.header.clone())
+            .collect::<Vec<_>>();
+        let mut selected = filtered_rows(source_rows, resolved_where.as_ref())
+            .into_iter()
+            .map(|row| {
+                projection
+                    .iter()
+                    .map(|column| row.get(&column.lookup).cloned().unwrap_or(Value::Null))
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        if distinct {
+            dedup_selected_rows(&mut selected);
+        }
+        if let Some(order_by) = order_by.as_ref() {
+            if let Err(message) =
+                sort_result_rows_by_order(&mut selected, &output_columns, order_by)
+            {
+                return Ok(ExecuteResult::Error { message });
+            }
+        }
+        if let Some(limit) = limit {
+            selected.truncate(limit);
+        }
+
+        Ok(ExecuteResult::Selected {
+            columns: output_columns,
+            rows: selected,
+        })
+    }
+
+    fn execute_join_select_from_rows(
+        &self,
+        txn: &Transaction,
+        left_schema: &TableSchema,
+        left_rows: &[Row],
+        distinct: bool,
+        columns: SelectColumns,
+        join: JoinClause,
+        where_clause: Option<WhereExpr>,
+        order_by: Option<OrderByClause>,
+        limit: Option<usize>,
+    ) -> Result<ExecuteResult> {
+        let Some(right_schema) = self.catalog.get_table(txn, &join.right_table)? else {
+            return Ok(ExecuteResult::Error {
+                message: format!("table '{}' does not exist", join.right_table),
+            });
+        };
+
+        let right_rows = self.scan_rows(txn, &right_schema)?;
+        let resolved_where = self.resolve_where_expr(where_clause.as_ref())?;
+        let projection = match self.resolve_join_projection(left_schema, &right_schema, &columns) {
+            Ok(columns) => columns,
+            Err(message) => return Ok(ExecuteResult::Error { message }),
+        };
+
+        let mut matched_rows = Vec::new();
+        for left_row in left_rows {
+            let Some(left_value) =
+                resolve_join_value(left_row, &left_schema.table_name, &join.left_column)
+            else {
+                return Ok(ExecuteResult::Error {
+                    message: format!("unknown join column '{}'", join.left_column),
+                });
+            };
+
+            let mut found_match = false;
+            for (_, right_row) in &right_rows {
+                let Some(right_value) =
+                    resolve_join_value(right_row, &right_schema.table_name, &join.right_column)
+                else {
+                    return Ok(ExecuteResult::Error {
+                        message: format!("unknown join column '{}'", join.right_column),
+                    });
+                };
+
+                if left_value != right_value {
+                    continue;
+                }
+
+                found_match = true;
+                let joined = JoinedRow::new(left_schema, left_row, &right_schema, Some(right_row));
+                if eval_where_expr(&joined, resolved_where.as_ref()) {
+                    matched_rows.push(joined);
+                }
+            }
+
+            if !found_match && matches!(join.join_type, JoinType::Left) {
+                let joined = JoinedRow::new(left_schema, left_row, &right_schema, None);
+                if eval_where_expr(&joined, resolved_where.as_ref()) {
+                    matched_rows.push(joined);
+                }
+            }
+        }
+
+        if let Some(order_by) = order_by.as_ref() {
+            if let Err(message) = sort_joined_rows_by_order(&mut matched_rows, order_by) {
+                return Ok(ExecuteResult::Error { message });
+            }
+        }
+        if let Some(limit) = limit {
+            matched_rows.truncate(limit);
+        }
+        let mut selected = Vec::new();
+        for joined in matched_rows {
+            let mut row = Vec::new();
+            for column in &projection {
+                let Some(value) = joined.get(&column.lookup) else {
+                    return Ok(ExecuteResult::Error {
+                        message: format!("unknown column '{}'", column.lookup),
+                    });
+                };
+                row.push(value.clone());
+            }
+            selected.push(row);
+        }
+        if distinct {
+            dedup_selected_rows(&mut selected);
+        }
+
+        Ok(ExecuteResult::Selected {
+            columns: projection.into_iter().map(|item| item.header).collect(),
+            rows: selected,
+        })
+    }
+
     // 中文註解：UPDATE 會對每一列套用遞迴 WHERE 判斷，再同步維護索引內容。
     fn execute_update(
         &self,
@@ -1067,6 +1419,60 @@ impl SqlExecutor {
             }
         }
         Ok(columns)
+    }
+
+    fn insert_rows_into_table(
+        &self,
+        txn: &mut Transaction,
+        schema: &TableSchema,
+        table_name: &str,
+        rows: Vec<Vec<Value>>,
+    ) -> Result<std::result::Result<usize, String>> {
+        let mut inserted = 0;
+        for row_values in rows {
+            if row_values.len() != schema.columns.len() {
+                return Ok(Err(format!(
+                    "INSERT expected {} values for table '{}', got {}",
+                    schema.columns.len(),
+                    table_name,
+                    row_values.len()
+                )));
+            }
+
+            let Some(pk_value) = row_values.first().cloned() else {
+                return Ok(Err("INSERT row cannot be empty".to_string()));
+            };
+            if matches!(pk_value, Value::Null) {
+                return Ok(Err("primary key cannot be NULL".to_string()));
+            }
+
+            let row = Row::new(
+                schema
+                    .columns
+                    .iter()
+                    .map(|column| column.name.clone())
+                    .zip(row_values.into_iter())
+                    .collect(),
+            );
+            txn.put(
+                encode_row_key(table_name, &pk_value),
+                serde_json::to_vec(&row)?,
+            )?;
+            for indexed_column in self.index_manager.list_indexes(txn, table_name)? {
+                if let Some(index_value) = row.get(&indexed_column) {
+                    self.index_manager.insert_index_entry(
+                        txn,
+                        table_name,
+                        &indexed_column,
+                        index_value,
+                        &pk_value,
+                    )?;
+                }
+            }
+            inserted += 1;
+        }
+
+        Ok(Ok(inserted))
     }
 
     fn scan_rows(&self, txn: &Transaction, schema: &TableSchema) -> Result<Vec<(Vec<u8>, Row)>> {
@@ -1546,6 +1952,49 @@ fn dedup_selected_rows(rows: &mut Vec<Vec<Value>>) {
         let key = format!("{:?}", row);
         seen.insert(key, ()).is_none()
     });
+}
+
+fn filtered_rows(rows: Vec<Row>, where_clause: Option<&ResolvedWhereExpr>) -> Vec<Row> {
+    rows.into_iter()
+        .filter(|row| eval_where_expr(row, where_clause))
+        .collect()
+}
+
+fn parse_sql_to_statement(sql: &str) -> Result<Statement> {
+    let mut statements = Parser::parse_multiple(sql)?;
+    Ok(statements.remove(0))
+}
+
+fn materialized_schema(table_name: &str, columns: &[String], rows: &[Vec<Value>]) -> TableSchema {
+    TableSchema {
+        table_name: table_name.to_string(),
+        columns: columns
+            .iter()
+            .enumerate()
+            .map(|(index, name)| ColumnDef {
+                name: name.clone(),
+                data_type: infer_materialized_type(rows, index),
+            })
+            .collect(),
+    }
+}
+
+fn infer_materialized_type(rows: &[Vec<Value>], index: usize) -> DataType {
+    for row in rows {
+        match row.get(index) {
+            Some(Value::Int(_)) => return DataType::Int,
+            Some(Value::Text(_)) => return DataType::Text,
+            Some(Value::Bool(_)) => return DataType::Bool,
+            Some(Value::Null) | None => {}
+        }
+    }
+    DataType::Text
+}
+
+fn materialized_rows(columns: &[String], rows: Vec<Vec<Value>>) -> Vec<Row> {
+    rows.into_iter()
+        .map(|values| Row::new(columns.iter().cloned().zip(values).collect()))
+        .collect()
 }
 
 // 中文註解：遞迴執行布林 WHERE/HAVING 條件，讓 Row、JOIN 結果與聚合列共用同一套邏輯。

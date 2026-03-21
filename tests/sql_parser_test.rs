@@ -8,8 +8,9 @@
 // - WHERE 布林運算、LEFT JOIN、HAVING 等語法是否正確建模
 
 use ferrisdb::sql::ast::{
-    AggregateFunc, Assignment, ColumnDef, DataType, GroupByClause, JoinClause, JoinType, Operator,
-    OrderByClause, OrderDirection, SelectColumns, SelectItem, Statement, Value, WhereExpr,
+    AggregateFunc, Assignment, ColumnDef, DataType, GroupByClause, InsertSource, JoinClause,
+    JoinType, Operator, OrderByClause, OrderDirection, SelectColumns, SelectItem, Statement, Value,
+    WhereExpr,
 };
 use ferrisdb::sql::lexer::{Keyword, Lexer, Token};
 use ferrisdb::sql::parser::Parser;
@@ -89,7 +90,7 @@ fn test_parse_insert_single_and_multi_rows() {
         stmt,
         Statement::Insert {
             table_name: "users".to_string(),
-            values: vec![
+            source: InsertSource::Values(vec![
                 vec![
                     Value::Int(1),
                     Value::Text("Alice".to_string()),
@@ -100,7 +101,7 @@ fn test_parse_insert_single_and_multi_rows() {
                     Value::Text("Bob".to_string()),
                     Value::Bool(false),
                 ],
-            ],
+            ]),
         }
     );
 }
@@ -560,6 +561,110 @@ fn test_parse_multiple_skips_empty_statements() {
     .expect("parse multiple");
 
     assert_eq!(statements.len(), 2);
+}
+
+#[test]
+fn test_parse_create_drop_view_insert_select_and_union() {
+    assert_eq!(
+        parse_sql("CREATE VIEW high_earners AS SELECT * FROM employees WHERE salary > 80000;"),
+        Statement::CreateView {
+            view_name: "high_earners".to_string(),
+            query_sql: "SELECT * FROM employees WHERE salary > 80000".to_string(),
+            query: Box::new(Statement::Select {
+                distinct: false,
+                table_name: "employees".to_string(),
+                table_alias: None,
+                columns: SelectColumns::All,
+                join: None,
+                where_clause: Some(WhereExpr::Comparison {
+                    column: "salary".to_string(),
+                    operator: Operator::Gt,
+                    value: Value::Int(80000),
+                }),
+                group_by: None,
+                having: None,
+                order_by: None,
+                limit: None,
+            }),
+        }
+    );
+
+    assert_eq!(
+        parse_sql("DROP VIEW IF EXISTS high_earners;"),
+        Statement::DropView {
+            view_name: "high_earners".to_string(),
+            if_exists: true,
+        }
+    );
+
+    assert_eq!(
+        parse_sql("INSERT INTO archived_users SELECT name, age FROM users WHERE age > 25;"),
+        Statement::Insert {
+            table_name: "archived_users".to_string(),
+            source: InsertSource::Select(Box::new(Statement::Select {
+                distinct: false,
+                table_name: "users".to_string(),
+                table_alias: None,
+                columns: SelectColumns::Named(vec![
+                    SelectItem::Column {
+                        name: "name".to_string(),
+                        alias: None,
+                    },
+                    SelectItem::Column {
+                        name: "age".to_string(),
+                        alias: None,
+                    },
+                ]),
+                join: None,
+                where_clause: Some(WhereExpr::Comparison {
+                    column: "age".to_string(),
+                    operator: Operator::Gt,
+                    value: Value::Int(25),
+                }),
+                group_by: None,
+                having: None,
+                order_by: None,
+                limit: None,
+            })),
+        }
+    );
+
+    assert_eq!(
+        parse_sql("SELECT name FROM employees UNION ALL SELECT dept_name FROM departments;"),
+        Statement::Union {
+            left: Box::new(Statement::Select {
+                distinct: false,
+                table_name: "employees".to_string(),
+                table_alias: None,
+                columns: SelectColumns::Named(vec![SelectItem::Column {
+                    name: "name".to_string(),
+                    alias: None,
+                }]),
+                join: None,
+                where_clause: None,
+                group_by: None,
+                having: None,
+                order_by: None,
+                limit: None,
+            }),
+            right: Box::new(Statement::Select {
+                distinct: false,
+                table_name: "departments".to_string(),
+                table_alias: None,
+                columns: SelectColumns::Named(vec![SelectItem::Column {
+                    name: "dept_name".to_string(),
+                    alias: None,
+                }]),
+                join: None,
+                where_clause: None,
+                group_by: None,
+                having: None,
+                order_by: None,
+                limit: None,
+            }),
+            all: true,
+        }
+    );
 }
 
 // 中文註解：測試內統一走 lexer + parser，避免每個案例重複樣板。

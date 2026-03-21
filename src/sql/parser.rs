@@ -1,16 +1,12 @@
 // =============================================================================
 // sql/parser.rs -- SQL Parser
 // =============================================================================
-//
-// Parser 會把 lexer 產生的 token 串轉成 AST。
-// 這裡採用 hand-written recursive descent parser，讓 SQL 語法的擴充
-// 可以直接透過函式呼叫順序表達優先級與結構。
-
 use crate::error::{FerrisDbError, Result};
 
 use super::ast::{
-    AggregateFunc, Assignment, ColumnDef, DataType, GroupByClause, JoinClause, JoinType, Operator,
-    OrderByClause, OrderDirection, SelectColumns, SelectItem, Statement, Value, WhereExpr,
+    AggregateFunc, Assignment, ColumnDef, DataType, GroupByClause, InsertSource, JoinClause,
+    JoinType, Operator, OrderByClause, OrderDirection, SelectColumns, SelectItem, Statement, Value,
+    WhereExpr,
 };
 use super::lexer::{Keyword, Token};
 
@@ -24,7 +20,7 @@ impl Parser {
         Parser { tokens, pos: 0 }
     }
 
-    // 中文註解：把整段輸入拆成多條 SQL，逐條使用既有 lexer/parser 解析。
+    // 中文註解：多語句 parser 會先按分號切開，再逐段做 lexer/parser，空語句直接略過。
     pub fn parse_multiple(input: &str) -> Result<Vec<Statement>> {
         let mut statements = Vec::new();
         for sql in split_sql_statements(input) {
@@ -36,7 +32,6 @@ impl Parser {
         Ok(statements)
     }
 
-    // 中文註解：解析整條 SQL，並檢查結尾是否還殘留未消耗的 token。
     pub fn parse(&mut self) -> Result<Statement> {
         if self.tokens.is_empty() {
             return Err(FerrisDbError::InvalidCommand(
@@ -50,7 +45,7 @@ impl Parser {
             Some(Token::Keyword(Keyword::Create)) => self.parse_create_statement()?,
             Some(Token::Keyword(Keyword::Drop)) => self.parse_drop_statement()?,
             Some(Token::Keyword(Keyword::Insert)) => self.parse_insert()?,
-            Some(Token::Keyword(Keyword::Select)) => self.parse_select()?,
+            Some(Token::Keyword(Keyword::Select)) => self.parse_query_expression()?,
             Some(Token::Keyword(Keyword::Update)) => self.parse_update()?,
             Some(Token::Keyword(Keyword::Delete)) => self.parse_delete()?,
             other => {
@@ -77,13 +72,36 @@ impl Parser {
     fn parse_create_statement(&mut self) -> Result<Statement> {
         self.expect_keyword(Keyword::Create)?;
         match self.peek() {
+            Some(Token::Keyword(Keyword::View)) => self.parse_create_view_after_create(),
             Some(Token::Keyword(Keyword::Table)) => self.parse_create_table_after_create(),
             Some(Token::Keyword(Keyword::Index)) => self.parse_create_index_after_create(),
             other => Err(FerrisDbError::InvalidCommand(format!(
-                "expected TABLE or INDEX after CREATE, got {:?}",
+                "expected VIEW, TABLE or INDEX after CREATE, got {:?}",
                 other
             ))),
         }
+    }
+
+    fn parse_create_view_after_create(&mut self) -> Result<Statement> {
+        self.expect_keyword(Keyword::View)?;
+        let view_name = self.expect_ident()?;
+        self.expect_keyword(Keyword::As)?;
+
+        // 中文註解：View 要保留定義 SQL 字串，executor 之後才能重新展開並執行。
+        let mut query_tokens = self.tokens[self.pos..].to_vec();
+        if matches!(query_tokens.last(), Some(Token::Semicolon)) {
+            query_tokens.pop();
+        }
+        let query_sql = tokens_to_sql(&query_tokens);
+        let mut query_parser = Parser::new(query_tokens);
+        let query = query_parser.parse_query_expression()?;
+        self.pos = self.tokens.len();
+
+        Ok(Statement::CreateView {
+            view_name,
+            query_sql,
+            query: Box::new(query),
+        })
     }
 
     fn parse_create_table_after_create(&mut self) -> Result<Statement> {
@@ -129,6 +147,15 @@ impl Parser {
     fn parse_drop_statement(&mut self) -> Result<Statement> {
         self.expect_keyword(Keyword::Drop)?;
         match self.peek() {
+            Some(Token::Keyword(Keyword::View)) => {
+                self.expect_keyword(Keyword::View)?;
+                let if_exists = self.parse_optional_if_exists()?;
+                let view_name = self.expect_ident()?;
+                Ok(Statement::DropView {
+                    view_name,
+                    if_exists,
+                })
+            }
             Some(Token::Keyword(Keyword::Index)) => {
                 self.expect_keyword(Keyword::Index)?;
                 self.expect_keyword(Keyword::On)?;
@@ -151,7 +178,7 @@ impl Parser {
                 })
             }
             other => Err(FerrisDbError::InvalidCommand(format!(
-                "expected INDEX or TABLE after DROP, got {:?}",
+                "expected VIEW, INDEX or TABLE after DROP, got {:?}",
                 other
             ))),
         }
@@ -191,7 +218,7 @@ impl Parser {
     fn parse_explain(&mut self) -> Result<Statement> {
         self.expect_keyword(Keyword::Explain)?;
         let statement = match self.peek() {
-            Some(Token::Keyword(Keyword::Select)) => self.parse_select()?,
+            Some(Token::Keyword(Keyword::Select)) => self.parse_query_expression()?,
             other => {
                 return Err(FerrisDbError::InvalidCommand(format!(
                     "EXPLAIN currently only supports SELECT, got {:?}",
@@ -209,8 +236,27 @@ impl Parser {
         self.expect_keyword(Keyword::Insert)?;
         self.expect_keyword(Keyword::Into)?;
         let table_name = self.expect_ident()?;
-        self.expect_keyword(Keyword::Values)?;
 
+        let source = match self.peek() {
+            Some(Token::Keyword(Keyword::Values)) => {
+                self.bump();
+                InsertSource::Values(self.parse_insert_values()?)
+            }
+            Some(Token::Keyword(Keyword::Select)) => {
+                InsertSource::Select(Box::new(self.parse_query_expression()?))
+            }
+            other => {
+                return Err(FerrisDbError::InvalidCommand(format!(
+                    "expected VALUES or SELECT after INSERT INTO, got {:?}",
+                    other
+                )));
+            }
+        };
+
+        Ok(Statement::Insert { table_name, source })
+    }
+
+    fn parse_insert_values(&mut self) -> Result<Vec<Vec<Value>>> {
         let mut rows = Vec::new();
         loop {
             self.expect_token(Token::LParen)?;
@@ -232,14 +278,30 @@ impl Parser {
             }
             break;
         }
-
-        Ok(Statement::Insert {
-            table_name,
-            values: rows,
-        })
+        Ok(rows)
     }
 
-    // 中文註解：解析 SELECT 主體，包含 JOIN、WHERE、GROUP BY、HAVING、ORDER BY、LIMIT。
+    // 中文註解：查詢表達式允許 `SELECT ... UNION [ALL] SELECT ...` 的鏈式結構。
+    fn parse_query_expression(&mut self) -> Result<Statement> {
+        let mut statement = self.parse_select()?;
+        while matches!(self.peek(), Some(Token::Keyword(Keyword::Union))) {
+            self.bump();
+            let all = if matches!(self.peek(), Some(Token::Keyword(Keyword::All))) {
+                self.bump();
+                true
+            } else {
+                false
+            };
+            let right = self.parse_select()?;
+            statement = Statement::Union {
+                left: Box::new(statement),
+                right: Box::new(right),
+                all,
+            };
+        }
+        Ok(statement)
+    }
+
     fn parse_select(&mut self) -> Result<Statement> {
         self.expect_keyword(Keyword::Select)?;
         let distinct = if matches!(self.peek(), Some(Token::Keyword(Keyword::Distinct))) {
@@ -333,7 +395,6 @@ impl Parser {
         })
     }
 
-    // 中文註解：WHERE 使用布林運算式樹狀結構，因此這裡只負責判斷有無 WHERE，實際遞迴解析交給 parse_where_expr。
     fn parse_optional_where(&mut self) -> Result<Option<WhereExpr>> {
         if !matches!(self.peek(), Some(Token::Keyword(Keyword::Where))) {
             return Ok(None);
@@ -343,7 +404,6 @@ impl Parser {
         Ok(Some(self.parse_where_expr()?))
     }
 
-    // 中文註解：HAVING 也沿用 WhereExpr，讓聚合後條件與一般 WHERE 共用同一套布林語法。
     fn parse_optional_having(&mut self) -> Result<Option<WhereExpr>> {
         if !matches!(self.peek(), Some(Token::Keyword(Keyword::Having))) {
             return Ok(None);
@@ -353,12 +413,10 @@ impl Parser {
         Ok(Some(self.parse_where_expr()?))
     }
 
-    // 中文註解：WHERE/HAVING 的入口，最低優先級是 OR。
     fn parse_where_expr(&mut self) -> Result<WhereExpr> {
         self.parse_or_expr()
     }
 
-    // 中文註解：OR 是最低優先級，所以先吃完整個 AND 鏈再組成 OR 節點。
     fn parse_or_expr(&mut self) -> Result<WhereExpr> {
         let mut expr = self.parse_and_expr()?;
         while matches!(self.peek(), Some(Token::Keyword(Keyword::Or))) {
@@ -369,7 +427,6 @@ impl Parser {
         Ok(expr)
     }
 
-    // 中文註解：AND 優先級高於 OR，因此在這一層連續吃掉多個 NOT/primary 子句。
     fn parse_and_expr(&mut self) -> Result<WhereExpr> {
         let mut expr = self.parse_not_expr()?;
         while matches!(self.peek(), Some(Token::Keyword(Keyword::And))) {
@@ -380,7 +437,6 @@ impl Parser {
         Ok(expr)
     }
 
-    // 中文註解：NOT 只套用到右邊的單一運算式，並支援連續巢狀 NOT。
     fn parse_not_expr(&mut self) -> Result<WhereExpr> {
         if matches!(self.peek(), Some(Token::Keyword(Keyword::Not))) {
             self.bump();
@@ -389,7 +445,6 @@ impl Parser {
         self.parse_where_primary()
     }
 
-    // 中文註解：primary 可以是括號包起來的子運算式，或一個實際比較/IN predicate。
     fn parse_where_primary(&mut self) -> Result<WhereExpr> {
         if matches!(self.peek(), Some(Token::LParen)) {
             self.bump();
@@ -401,7 +456,6 @@ impl Parser {
         self.parse_predicate_expr()
     }
 
-    // 中文註解：解析最底層條件，支援 `column op value` 與 `column IN (SELECT ...)`。
     fn parse_predicate_expr(&mut self) -> Result<WhereExpr> {
         let column = self.parse_condition_column()?;
         if matches!(self.peek(), Some(Token::Keyword(Keyword::Between))) {
@@ -438,7 +492,7 @@ impl Parser {
         if matches!(self.peek(), Some(Token::Keyword(Keyword::In))) {
             self.bump();
             self.expect_token(Token::LParen)?;
-            let subquery = self.parse_select()?;
+            let subquery = self.parse_query_expression()?;
             self.expect_token(Token::RParen)?;
             return Ok(WhereExpr::InSubquery {
                 column,
@@ -455,7 +509,6 @@ impl Parser {
         })
     }
 
-    // 中文註解：條件左側除了普通欄位，也允許 HAVING 使用聚合函式結果，例如 `COUNT(*) > 2`。
     fn parse_condition_column(&mut self) -> Result<String> {
         match self.peek() {
             Some(Token::Keyword(Keyword::Count))
@@ -469,7 +522,6 @@ impl Parser {
         }
     }
 
-    // 中文註解：JOIN 目前支援 `JOIN`/`INNER JOIN` 與 `LEFT JOIN`。
     fn parse_optional_join(&mut self) -> Result<Option<JoinClause>> {
         let join_type = match self.peek() {
             Some(Token::Keyword(Keyword::Inner)) => {
@@ -524,7 +576,6 @@ impl Parser {
         Ok(Some(OrderByClause { column, direction }))
     }
 
-    // 中文註解：GROUP BY 目前仍維持單欄位群組，但可以搭配 HAVING 做聚合後過濾。
     fn parse_optional_group_by(&mut self) -> Result<Option<GroupByClause>> {
         if !matches!(self.peek(), Some(Token::Keyword(Keyword::Group))) {
             return Ok(None);
@@ -671,7 +722,6 @@ impl Parser {
         Ok(true)
     }
 
-    // 中文註解：支援 `FROM table AS t` 與 `JOIN table AS t` 的別名語法。
     fn parse_optional_table_alias(&mut self) -> Result<Option<String>> {
         if matches!(self.peek(), Some(Token::Keyword(Keyword::As))) {
             self.bump();
@@ -732,7 +782,6 @@ impl Parser {
     }
 }
 
-// 中文註解：把聚合函式 token 重新轉回固定字串，讓 HAVING 可以用欄位名稱比對聚合結果。
 fn render_condition_item(item: &SelectItem) -> String {
     match item {
         SelectItem::Column { name, .. } => name.clone(),
@@ -747,7 +796,6 @@ fn render_condition_item(item: &SelectItem) -> String {
     }
 }
 
-// 中文註解：以簡單狀態機處理單引號字串，避免字串中的分號被誤判成語句分隔。
 fn split_sql_statements(input: &str) -> Vec<String> {
     let mut statements = Vec::new();
     let mut current = String::new();
@@ -781,4 +829,112 @@ fn split_sql_statements(input: &str) -> Vec<String> {
     }
 
     statements
+}
+
+fn tokens_to_sql(tokens: &[Token]) -> String {
+    let mut sql = String::new();
+    for (index, token) in tokens.iter().enumerate() {
+        let piece = token_to_sql(token);
+        if should_insert_space(sql.chars().last(), token, index > 0) {
+            sql.push(' ');
+        }
+        sql.push_str(&piece);
+    }
+    sql
+}
+
+fn token_to_sql(token: &Token) -> String {
+    match token {
+        Token::Keyword(keyword) => keyword_to_sql(keyword).to_string(),
+        Token::Ident(value) => value.clone(),
+        Token::IntLit(value) => value.to_string(),
+        Token::StringLit(value) => format!("'{}'", value.replace('\'', "''")),
+        Token::Star => "*".to_string(),
+        Token::Comma => ",".to_string(),
+        Token::LParen => "(".to_string(),
+        Token::RParen => ")".to_string(),
+        Token::Eq => "=".to_string(),
+        Token::Dot => ".".to_string(),
+        Token::Ne => "!=".to_string(),
+        Token::Lt => "<".to_string(),
+        Token::Gt => ">".to_string(),
+        Token::Le => "<=".to_string(),
+        Token::Ge => ">=".to_string(),
+        Token::Semicolon => ";".to_string(),
+    }
+}
+
+fn keyword_to_sql(keyword: &Keyword) -> &'static str {
+    match keyword {
+        Keyword::Explain => "EXPLAIN",
+        Keyword::Alter => "ALTER",
+        Keyword::Select => "SELECT",
+        Keyword::From => "FROM",
+        Keyword::Where => "WHERE",
+        Keyword::Count => "COUNT",
+        Keyword::Sum => "SUM",
+        Keyword::Min => "MIN",
+        Keyword::Max => "MAX",
+        Keyword::Group => "GROUP",
+        Keyword::Having => "HAVING",
+        Keyword::Order => "ORDER",
+        Keyword::By => "BY",
+        Keyword::Asc => "ASC",
+        Keyword::As => "AS",
+        Keyword::Desc => "DESC",
+        Keyword::Distinct => "DISTINCT",
+        Keyword::Limit => "LIMIT",
+        Keyword::Insert => "INSERT",
+        Keyword::Into => "INTO",
+        Keyword::Values => "VALUES",
+        Keyword::Create => "CREATE",
+        Keyword::View => "VIEW",
+        Keyword::Index => "INDEX",
+        Keyword::Table => "TABLE",
+        Keyword::Add => "ADD",
+        Keyword::Column => "COLUMN",
+        Keyword::Drop => "DROP",
+        Keyword::If => "IF",
+        Keyword::Exists => "EXISTS",
+        Keyword::Not => "NOT",
+        Keyword::Is => "IS",
+        Keyword::In => "IN",
+        Keyword::Between => "BETWEEN",
+        Keyword::Like => "LIKE",
+        Keyword::Update => "UPDATE",
+        Keyword::Set => "SET",
+        Keyword::Delete => "DELETE",
+        Keyword::Join => "JOIN",
+        Keyword::On => "ON",
+        Keyword::Union => "UNION",
+        Keyword::Inner => "INNER",
+        Keyword::Left => "LEFT",
+        Keyword::And => "AND",
+        Keyword::Or => "OR",
+        Keyword::Int => "INT",
+        Keyword::Text => "TEXT",
+        Keyword::Bool => "BOOL",
+        Keyword::Null => "NULL",
+        Keyword::True => "TRUE",
+        Keyword::False => "FALSE",
+        Keyword::All => "ALL",
+    }
+}
+
+fn should_insert_space(previous: Option<char>, token: &Token, has_previous: bool) -> bool {
+    if !has_previous {
+        return false;
+    }
+
+    let Some(previous) = previous else {
+        return false;
+    };
+
+    if matches!(token, Token::Comma | Token::RParen | Token::Dot) {
+        return false;
+    }
+    if matches!(token, Token::LParen) && previous.is_ascii_alphanumeric() {
+        return false;
+    }
+    !matches!(previous, '(' | '.' | ' ')
 }
