@@ -26,7 +26,7 @@
 // 之後若要繼續演進，可以把 WHERE 下推、索引查找、型別檢查等能力逐步補上。
 
 use std::collections::{BTreeMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use crate::error::Result;
 use crate::transaction::mvcc::{MvccEngine, Transaction};
@@ -38,15 +38,21 @@ use super::ast::{
 };
 use super::catalog::{Catalog, TableSchema, ViewDefinition};
 use super::index::IndexManager;
+use super::optimizer::{Optimizer, Plan, QueryPlanNode};
 use super::parser::Parser;
+use super::plan_cache::{PlanCache, PlanCacheStats};
 use super::row::{
     decode_row_key, encode_row_key, encode_row_prefix_end, encode_row_prefix_start, Row,
 };
+use super::statistics::StatisticsManager;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExecuteResult {
     Explain {
         plan: String,
+    },
+    Analyzed {
+        table_name: String,
     },
     Created {
         table_name: String,
@@ -83,27 +89,43 @@ pub enum ExecuteResult {
     },
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct SqlExecutor {
     engine: Arc<MvccEngine>,
     catalog: Catalog,
     index_manager: IndexManager,
+    statistics: StatisticsManager,
+    optimizer: Optimizer,
+    plan_cache: Mutex<PlanCache>,
 }
 
 impl SqlExecutor {
     pub fn new(engine: Arc<MvccEngine>) -> Self {
         let catalog = Catalog::new(Arc::clone(&engine));
         let index_manager = IndexManager::new(Arc::clone(&engine));
+        let statistics = StatisticsManager::new(Arc::clone(&engine));
+        let optimizer = Optimizer::new(catalog.clone(), statistics.clone(), index_manager.clone());
         Self {
             engine,
             catalog,
             index_manager,
+            statistics,
+            optimizer,
+            plan_cache: Mutex::new(PlanCache::new(100)),
         }
+    }
+
+    pub fn plan_cache_stats(&self) -> PlanCacheStats {
+        self.plan_cache
+            .lock()
+            .expect("plan cache lock")
+            .stats()
     }
 
     pub fn execute(&self, stmt: Statement) -> Result<ExecuteResult> {
         match stmt {
             Statement::Explain { statement } => self.execute_explain(*statement),
+            Statement::AnalyzeTable { table_name } => self.execute_analyze_table(table_name),
             Statement::CreateView {
                 view_name,
                 query_sql,
@@ -214,6 +236,7 @@ impl SqlExecutor {
         }
 
         txn.commit()?;
+        self.invalidate_plan_cache(&table_name);
         Ok(ExecuteResult::Created { table_name })
     }
 
@@ -270,6 +293,7 @@ impl SqlExecutor {
         }
 
         txn.commit()?;
+        self.invalidate_plan_cache(&table_name);
         Ok(ExecuteResult::Altered { table_name })
     }
 
@@ -323,6 +347,7 @@ impl SqlExecutor {
         )?;
 
         txn.commit()?;
+        self.invalidate_plan_cache(&table_name);
         Ok(ExecuteResult::Altered { table_name })
     }
 
@@ -348,6 +373,7 @@ impl SqlExecutor {
         self.catalog.drop_table(&mut txn, &table_name)?;
 
         txn.commit()?;
+        self.invalidate_plan_cache(&table_name);
         Ok(ExecuteResult::Dropped { table_name })
     }
 
@@ -407,6 +433,7 @@ impl SqlExecutor {
         }
 
         txn.commit()?;
+        self.invalidate_plan_cache(&table_name);
         Ok(ExecuteResult::IndexCreated {
             table_name,
             column_names,
@@ -433,174 +460,60 @@ impl SqlExecutor {
         }
 
         txn.commit()?;
+        self.invalidate_plan_cache(&table_name);
         Ok(ExecuteResult::IndexDropped {
             table_name,
             column_names,
         })
     }
 
+    fn execute_analyze_table(&self, table_name: String) -> Result<ExecuteResult> {
+        let mut txn = self.engine.begin_transaction();
+        let analyzed = self.statistics.analyze_table(&mut txn, &table_name)?;
+        if analyzed.is_none() {
+            return Ok(ExecuteResult::Error {
+                message: format!("table '{}' does not exist", table_name),
+            });
+        }
+        txn.commit()?;
+        self.invalidate_plan_cache(&table_name);
+        Ok(ExecuteResult::Analyzed { table_name })
+    }
+
+    fn invalidate_plan_cache(&self, table_name: &str) {
+        self.plan_cache
+            .lock()
+            .expect("plan cache lock")
+            .invalidate_table(table_name);
+    }
+
+    fn get_or_optimize_plan(&self, statement: &Statement) -> Result<QueryPlanNode> {
+        let key_sql = serde_json::to_string(statement)?;
+        let key = PlanCache::compute_key(&key_sql);
+        if let Some(plan) = self
+            .plan_cache
+            .lock()
+            .expect("plan cache lock")
+            .get(key)
+        {
+            return Ok(plan);
+        }
+
+        let txn = self.engine.begin_transaction();
+        let plan = self.optimizer.optimize_select(&txn, statement)?;
+        let tables = tables_in_statement(statement);
+        self.plan_cache
+            .lock()
+            .expect("plan cache lock")
+            .put(key, tables, plan.clone());
+        Ok(plan)
+    }
+
     fn execute_explain(&self, statement: Statement) -> Result<ExecuteResult> {
         match statement {
-            Statement::Select {
-                ctes: _,
-                distinct: _,
-                table_name,
-                table_alias: _,
-                columns,
-                join,
-                where_clause,
-                group_by,
-                having,
-                order_by,
-                limit,
-            } => {
-                let txn = self.engine.begin_transaction();
-                let Some(schema) = self.catalog.get_table(&txn, &table_name)? else {
-                    return Ok(ExecuteResult::Error {
-                        message: format!("table '{}' does not exist", table_name),
-                    });
-                };
-
-                if join.is_some() {
-                    return Ok(ExecuteResult::Error {
-                        message: "EXPLAIN for JOIN is not implemented yet".to_string(),
-                    });
-                }
-
-                let use_index = self.can_use_index(&txn, &table_name, where_clause.as_ref())?;
-                let index_lookup = if use_index {
-                    self.index_manager
-                        .find_best_index(&txn, &table_name, where_clause.as_ref())?
-                } else {
-                    None
-                };
-                let total_rows = self.scan_rows(&txn, &schema)?.len();
-                let scan_rows = if use_index {
-                    estimate_filtered_rows(total_rows, where_clause.as_ref())
-                } else {
-                    total_rows
-                };
-                let scan_cost = if use_index {
-                    (scan_rows.max(1)) as f64 * 0.35
-                } else {
-                    total_rows as f64
-                };
-                let has_filter = where_clause.is_some();
-                let filtered_rows = estimate_filtered_rows(total_rows, where_clause.as_ref());
-                let filter_cost = if has_filter {
-                    (total_rows as f64) * 0.25
-                } else {
-                    0.0
-                };
-                let project_cost = estimate_project_cost(filtered_rows, &columns);
-
-                let mut lines = Vec::new();
-                if let Some(plan) = index_lookup {
-                    lines.push(format!(
-                        "CompositeIndexScan(table={}, columns={}, rows={}, cost={:.2})",
-                        table_name,
-                        plan.scan_columns.join(","),
-                        scan_rows,
-                        scan_cost
-                    ));
-                } else {
-                    lines.push(format!(
-                        "SeqScan(table={}, rows={}, cost={:.2})",
-                        table_name, total_rows, scan_cost
-                    ));
-                }
-                if let Some(where_clause) = where_clause {
-                    if use_index && where_eq_comparison_parts(&where_clause).is_some() {
-                        let (column, value) =
-                            where_eq_comparison_parts(&where_clause).expect("comparison");
-                        lines.push(format!(
-                            "  -> IndexFilter(predicate=\"{} = {}\", rows={}, cost={:.2})",
-                            column,
-                            render_value(value),
-                            filtered_rows,
-                            filter_cost * 0.25
-                        ));
-                    } else {
-                        lines.push(format!(
-                            "  -> Filter(predicate=\"{}\", rows={}, cost={:.2})",
-                            render_where_expr(&where_clause),
-                            filtered_rows,
-                            filter_cost
-                        ));
-                    }
-                }
-                if let Some(group_by) = group_by {
-                    lines.push(format!(
-                        "  -> GroupBy(column={}, rows={}, cost={:.2})",
-                        group_by.column,
-                        filtered_rows.max(1),
-                        (filtered_rows.max(1)) as f64 * 0.35
-                    ));
-                }
-                if let Some(having) = having {
-                    lines.push(format!(
-                        "  -> Having(predicate=\"{}\", rows={}, cost={:.2})",
-                        render_where_expr(&having),
-                        filtered_rows.max(1),
-                        (filtered_rows.max(1)) as f64 * 0.15
-                    ));
-                }
-                if let Some(order_by) = order_by {
-                    lines.push(format!(
-                        "  -> OrderBy(column={}, direction={}, rows={}, cost={:.2})",
-                        order_by.column,
-                        order_direction_to_str(&order_by.direction),
-                        if has_filter {
-                            filtered_rows
-                        } else {
-                            total_rows
-                        },
-                        (if has_filter {
-                            filtered_rows
-                        } else {
-                            total_rows
-                        }) as f64
-                            * 0.2
-                    ));
-                }
-                if let Some(limit) = limit {
-                    lines.push(format!(
-                        "  -> Limit(limit={}, rows={}, cost={:.2})",
-                        limit,
-                        limit.min(if has_filter {
-                            filtered_rows
-                        } else {
-                            total_rows
-                        }),
-                        0.05
-                    ));
-                }
-
-                let project_rows = if has_filter {
-                    filtered_rows
-                } else {
-                    total_rows
-                };
-                let project_rows = limit
-                    .map(|value| value.min(project_rows))
-                    .unwrap_or(project_rows);
-                let project_desc = match columns {
-                    SelectColumns::All => "*".to_string(),
-                    SelectColumns::Named(items) | SelectColumns::Aggregate(items) => items
-                        .iter()
-                        .map(render_select_item)
-                        .collect::<Vec<_>>()
-                        .join(", "),
-                };
-                lines.push(format!(
-                    "  -> Project(columns=[{}], rows={}, cost={:.2})",
-                    project_desc, project_rows, project_cost
-                ));
-
-                Ok(ExecuteResult::Explain {
-                    plan: lines.join("\n"),
-                })
-            }
+            Statement::Select { .. } => Ok(ExecuteResult::Explain {
+                plan: Optimizer::format_plan_tree(&self.get_or_optimize_plan(&statement)?),
+            }),
             other => Ok(ExecuteResult::Error {
                 message: format!("EXPLAIN does not support {:?}", other),
             }),
@@ -634,6 +547,7 @@ impl SqlExecutor {
             Err(message) => return Ok(ExecuteResult::Error { message }),
         };
 
+        self.statistics.mark_stale(&mut txn, &table_name)?;
         txn.commit()?;
         Ok(ExecuteResult::Inserted { count: inserted })
     }
@@ -740,6 +654,19 @@ impl SqlExecutor {
         order_by: Option<OrderByClause>,
         limit: Option<usize>,
     ) -> Result<ExecuteResult> {
+        let statement_for_plan = Statement::Select {
+            ctes: ctes.clone(),
+            distinct,
+            table_name: table_name.clone(),
+            table_alias: table_alias.clone(),
+            columns: columns.clone(),
+            join: join.clone(),
+            where_clause: where_clause.clone(),
+            group_by: group_by.clone(),
+            having: having.clone(),
+            order_by: order_by.clone(),
+            limit,
+        };
         let txn = self.engine.begin_transaction();
         let cte_scope = self.materialize_ctes(&ctes)?;
         if let Some(relation) = cte_scope.get(&table_name) {
@@ -781,6 +708,11 @@ impl SqlExecutor {
                 message: format!("table '{}' does not exist", table_name),
             });
         };
+        let optimized_plan = if ctes.is_empty() {
+            Some(self.get_or_optimize_plan(&statement_for_plan)?)
+        } else {
+            None
+        };
         let columns = normalize_select_columns(columns, table_alias.as_deref(), &table_name);
         let where_clause = where_clause
             .map(|expr| normalize_where_expr(expr, table_alias.as_deref(), &table_name));
@@ -815,6 +747,7 @@ impl SqlExecutor {
                 where_clause,
                 order_by,
                 limit,
+                optimized_plan.as_ref(),
             );
         }
 
@@ -838,7 +771,7 @@ impl SqlExecutor {
         };
 
         let mut rows: Vec<Row> = self
-            .fetch_rows_for_select(&txn, &schema, where_clause.as_ref())?
+            .fetch_rows_for_select(&txn, &schema, where_clause.as_ref(), optimized_plan.as_ref())?
             .into_iter()
             .map(|(_, row)| row)
             .collect();
@@ -919,7 +852,7 @@ impl SqlExecutor {
         let resolved_having = self.resolve_where_expr(having.as_ref())?;
 
         let rows: Vec<Row> = self
-            .fetch_rows_for_select(txn, schema, where_clause.as_ref())?
+            .fetch_rows_for_select(txn, schema, where_clause.as_ref(), None)?
             .into_iter()
             .map(|(_, row)| row)
             .collect();
@@ -972,6 +905,7 @@ impl SqlExecutor {
         where_clause: Option<WhereExpr>,
         order_by: Option<OrderByClause>,
         limit: Option<usize>,
+        optimized_plan: Option<&QueryPlanNode>,
     ) -> Result<ExecuteResult> {
         let Some(right_schema) = self.catalog.get_table(txn, &join.right_table)? else {
             return Ok(ExecuteResult::Error {
@@ -988,7 +922,25 @@ impl SqlExecutor {
         };
 
         let mut matched_rows = Vec::new();
-        for (_, left_row) in &left_rows {
+        let use_hash_join = optimized_plan.is_some_and(plan_uses_hash_join);
+        if use_hash_join {
+            let hash_rows = match build_hash_join_rows(
+                left_schema,
+                &left_rows,
+                &right_schema,
+                &right_rows,
+                &join,
+            ) {
+                Ok(rows) => rows,
+                Err(message) => return Ok(ExecuteResult::Error { message }),
+            };
+            for joined in hash_rows {
+                if eval_where_expr(&joined, resolved_where.as_ref()) {
+                    matched_rows.push(joined);
+                }
+            }
+        } else {
+            for (_, left_row) in &left_rows {
             let Some(left_value) =
                 resolve_join_value(left_row, &left_schema.table_name, &join.left_column)
             else {
@@ -1025,6 +977,7 @@ impl SqlExecutor {
                     matched_rows.push(joined);
                 }
             }
+        }
         }
         if let Some(order_by) = order_by.as_ref() {
             if let Err(message) = sort_joined_rows_by_order(&mut matched_rows, order_by) {
@@ -1425,6 +1378,7 @@ impl SqlExecutor {
             updated += 1;
         }
 
+        self.statistics.mark_stale(&mut txn, &table_name)?;
         txn.commit()?;
         Ok(ExecuteResult::Updated { count: updated })
     }
@@ -1484,6 +1438,7 @@ impl SqlExecutor {
             deleted += 1;
         }
 
+        self.statistics.mark_stale(&mut txn, &table_name)?;
         txn.commit()?;
         Ok(ExecuteResult::Deleted { count: deleted })
     }
@@ -1697,15 +1652,21 @@ impl SqlExecutor {
         txn: &Transaction,
         schema: &TableSchema,
         where_clause: Option<&WhereExpr>,
+        optimized_plan: Option<&QueryPlanNode>,
     ) -> Result<Vec<(Vec<u8>, Row)>> {
         let resolved_where = self.resolve_where_expr(where_clause)?;
-        if let Some(plan) = self
+        let planned_lookup = optimized_plan
+            .and_then(find_scan_lookup)
+            .filter(|(table, _, _)| table == &schema.table_name)
+            .map(|(_, columns, values)| (columns, values));
+        let fallback_lookup = self
             .index_manager
             .find_best_index(txn, &schema.table_name, where_clause)?
-        {
+            .map(|plan| (plan.scan_columns, plan.prefix_values));
+        if let Some((scan_columns, prefix_values)) = planned_lookup.or(fallback_lookup) {
             let pks = self
                 .index_manager
-                .lookup_prefix(txn, &schema.table_name, &plan.scan_columns, &plan.prefix_values)?;
+                .lookup_prefix(txn, &schema.table_name, &scan_columns, &prefix_values)?;
             let mut rows = Vec::new();
             for pk in pks {
                 let row_key = encode_row_key(&schema.table_name, &pk);
@@ -1725,18 +1686,6 @@ impl SqlExecutor {
     }
 
     // 中文註解：只要 WHERE 樹中存在可索引的等值比較，就允許 explain/scan 走 index scan 路徑。
-    fn can_use_index(
-        &self,
-        txn: &Transaction,
-        table_name: &str,
-        where_clause: Option<&WhereExpr>,
-    ) -> Result<bool> {
-        Ok(self
-            .index_manager
-            .find_best_index(txn, table_name, where_clause)?
-            .is_some())
-    }
-
     // 中文註解：先把子查詢解析成值集合，之後 Row / JoinedRow / 聚合列都能共用同一套 evaluator。
     fn resolve_where_expr(
         &self,
@@ -1885,6 +1834,7 @@ impl SqlExecutor {
 pub fn format_execute_result(result: &ExecuteResult) -> String {
     match result {
         ExecuteResult::Explain { plan } => plan.clone(),
+        ExecuteResult::Analyzed { table_name } => format!("Table '{}' analyzed", table_name),
         ExecuteResult::Created { table_name } => format!("Table '{}' created", table_name),
         ExecuteResult::Altered { table_name } => format!("Table '{}' altered", table_name),
         ExecuteResult::Dropped { table_name } => format!("Table '{}' dropped", table_name),
@@ -2000,17 +1950,6 @@ struct ProjectionColumn {
 enum ProjectionKind {
     Column(String),
     Expression(Expr),
-}
-
-fn where_eq_comparison_parts(where_clause: &WhereExpr) -> Option<(&str, &Value)> {
-    match where_clause {
-        WhereExpr::Comparison {
-            column,
-            operator: Operator::Eq,
-            value,
-        } => Some((column, value)),
-        _ => None,
-    }
 }
 
 fn render_where_expr(where_clause: &WhereExpr) -> String {
@@ -2235,6 +2174,103 @@ fn dedup_selected_rows(rows: &mut Vec<Vec<Value>>) {
         let key = format!("{:?}", row);
         seen.insert(key, ()).is_none()
     });
+}
+
+fn tables_in_statement(statement: &Statement) -> Vec<String> {
+    match statement {
+        Statement::Select {
+            table_name,
+            join,
+            ctes: _,
+            ..
+        } => {
+            let mut tables = vec![table_name.clone()];
+            if let Some(join) = join {
+                tables.push(join.right_table.clone());
+            }
+            tables
+        }
+        _ => Vec::new(),
+    }
+}
+
+fn plan_uses_hash_join(plan: &QueryPlanNode) -> bool {
+    match &plan.plan {
+        Plan::HashJoin { .. } => true,
+        Plan::NestedLoopJoin { left, right, .. } => plan_uses_hash_join(left) || plan_uses_hash_join(right),
+        Plan::Sort { input, .. }
+        | Plan::Limit { input, .. }
+        | Plan::Project { input, .. }
+        | Plan::Aggregate { input, .. } => plan_uses_hash_join(input),
+        Plan::SeqScan { .. } | Plan::IndexScan { .. } | Plan::CompositeIndexScan { .. } => false,
+    }
+}
+
+fn find_scan_lookup(plan: &QueryPlanNode) -> Option<(String, Vec<String>, Vec<Value>)> {
+    match &plan.plan {
+        Plan::IndexScan {
+            table,
+            index_columns,
+            lookup_value,
+            ..
+        } => Some((
+            table.clone(),
+            index_columns.clone(),
+            lookup_value.iter().cloned().collect::<Vec<_>>(),
+        )),
+        Plan::CompositeIndexScan {
+            table,
+            index_columns,
+            prefix_values,
+            ..
+        } => Some((table.clone(), index_columns.clone(), prefix_values.clone())),
+        Plan::Sort { input, .. }
+        | Plan::Limit { input, .. }
+        | Plan::Project { input, .. }
+        | Plan::Aggregate { input, .. } => find_scan_lookup(input),
+        Plan::NestedLoopJoin { left, .. } | Plan::HashJoin { left, .. } => find_scan_lookup(left),
+        Plan::SeqScan { .. } => None,
+    }
+}
+
+fn build_hash_join_rows(
+    left_schema: &TableSchema,
+    left_rows: &[(Vec<u8>, Row)],
+    right_schema: &TableSchema,
+    right_rows: &[(Vec<u8>, Row)],
+    join: &JoinClause,
+) -> std::result::Result<Vec<JoinedRow>, String> {
+    let mut hash = BTreeMap::<String, Vec<Row>>::new();
+    for (_, right_row) in right_rows {
+        let Some(value) = resolve_join_value(right_row, &right_schema.table_name, &join.right_column)
+        else {
+            return Err(format!("unknown join column '{}'", join.right_column));
+        };
+        hash.entry(format!("{:?}", value))
+            .or_default()
+            .push(right_row.clone());
+    }
+
+    let mut joined_rows = Vec::new();
+    for (_, left_row) in left_rows {
+        let Some(value) = resolve_join_value(left_row, &left_schema.table_name, &join.left_column)
+        else {
+            return Err(format!("unknown join column '{}'", join.left_column));
+        };
+        if let Some(matches) = hash.get(&format!("{:?}", value)) {
+            for right_row in matches {
+                joined_rows.push(JoinedRow::new(
+                    left_schema,
+                    left_row,
+                    right_schema,
+                    Some(right_row),
+                ));
+            }
+        } else if matches!(join.join_type, JoinType::Left) {
+            joined_rows.push(JoinedRow::new(left_schema, left_row, right_schema, None));
+        }
+    }
+    Ok(joined_rows)
 }
 
 #[derive(Debug, Clone)]
@@ -2689,27 +2725,6 @@ fn render_value(value: &Value) -> String {
     }
 }
 
-fn estimate_filtered_rows(total_rows: usize, where_clause: Option<&WhereExpr>) -> usize {
-    if where_clause.is_none() {
-        return total_rows;
-    }
-
-    if total_rows == 0 {
-        return 0;
-    }
-
-    total_rows.div_ceil(4)
-}
-
-fn estimate_project_cost(rows: usize, columns: &SelectColumns) -> f64 {
-    let column_factor = match columns {
-        SelectColumns::All => 1.0,
-        SelectColumns::Named(names) => (names.len().max(1)) as f64 / 4.0,
-        SelectColumns::Aggregate(items) => (items.len().max(1)) as f64 / 3.0,
-    };
-    (rows as f64) * 0.1 * column_factor.max(0.25)
-}
-
 fn operator_to_str(operator: &Operator) -> &'static str {
     match operator {
         Operator::Eq => "=",
@@ -2718,13 +2733,6 @@ fn operator_to_str(operator: &Operator) -> &'static str {
         Operator::Gt => ">",
         Operator::Le => "<=",
         Operator::Ge => ">=",
-    }
-}
-
-fn order_direction_to_str(direction: &OrderDirection) -> &'static str {
-    match direction {
-        OrderDirection::Asc => "ASC",
-        OrderDirection::Desc => "DESC",
     }
 }
 

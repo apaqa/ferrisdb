@@ -41,6 +41,7 @@ impl Parser {
 
         let stmt = match self.peek() {
             Some(Token::Keyword(Keyword::Explain)) => self.parse_explain()?,
+            Some(Token::Keyword(Keyword::Analyze)) => self.parse_analyze()?,
             Some(Token::Keyword(Keyword::Alter)) => self.parse_alter_table()?,
             Some(Token::Keyword(Keyword::Create)) => self.parse_create_statement()?,
             Some(Token::Keyword(Keyword::Drop)) => self.parse_drop_statement()?,
@@ -231,6 +232,14 @@ impl Parser {
 
         Ok(Statement::Explain {
             statement: Box::new(statement),
+        })
+    }
+
+    fn parse_analyze(&mut self) -> Result<Statement> {
+        self.expect_keyword(Keyword::Analyze)?;
+        self.expect_keyword(Keyword::Table)?;
+        Ok(Statement::AnalyzeTable {
+            table_name: self.expect_ident()?,
         })
     }
 
@@ -1136,6 +1145,7 @@ fn token_to_sql(token: &Token) -> String {
 fn keyword_to_sql(keyword: &Keyword) -> &'static str {
     match keyword {
         Keyword::Explain => "EXPLAIN",
+        Keyword::Analyze => "ANALYZE",
         Keyword::Alter => "ALTER",
         Keyword::Select => "SELECT",
         Keyword::From => "FROM",

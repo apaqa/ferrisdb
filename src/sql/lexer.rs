@@ -37,6 +37,7 @@ pub enum Token {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Keyword {
     Explain,
+    Analyze,
     Alter,
     Select,
     From,
@@ -304,6 +305,7 @@ fn keyword_from_ident(ident: &str) -> Option<Keyword> {
     match ident.to_ascii_uppercase().as_str() {
         "SELECT" => Some(Keyword::Select),
         "EXPLAIN" => Some(Keyword::Explain),
+        "ANALYZE" => Some(Keyword::Analyze),
         "ALTER" => Some(Keyword::Alter),
         "FROM" => Some(Keyword::From),
         "WHERE" => Some(Keyword::Where),

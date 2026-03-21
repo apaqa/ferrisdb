@@ -12,6 +12,7 @@ FerrisDB is a database engine implemented from scratch in Rust, featuring LSM-Tr
 - SQL Common Table Expressions (`WITH`)
 - SQL INNER JOIN with nested loop
 - SQL `UPDATE ... FROM` and `DELETE ... USING`
+- SQL `ANALYZE TABLE` statistics collection
 - SQL aggregate functions: COUNT, SUM, MIN, MAX
 - SQL GROUP BY
 - SQL DISTINCT
@@ -19,6 +20,8 @@ FerrisDB is a database engine implemented from scratch in Rust, featuring LSM-Tr
 - SQL ORDER BY ASC/DESC
 - SQL LIMIT
 - SQL EXPLAIN with query plan
+- Cost-Based Query Optimizer with scan / join strategy selection
+- Query Plan Cache (LRU)
 - SQL `WHERE` with comparison operators (`=`, `!=`, `<`, `>`, `<=`, `>=`)
 - SQL `BETWEEN`, `LIKE`, `IS NULL`, `IS NOT NULL`
 - SQL NULL-aware behavior for sorting and aggregates
@@ -36,7 +39,7 @@ FerrisDB is a database engine implemented from scratch in Rust, featuring LSM-Tr
 - Built-in benchmark framework
 - Background compaction worker
 - Failure injection and stress tests
-- 157+ automated tests
+- 161+ automated tests
 
 ## Architecture
 

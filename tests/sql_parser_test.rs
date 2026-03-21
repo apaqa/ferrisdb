@@ -93,6 +93,16 @@ fn test_parse_create_composite_index() {
 }
 
 #[test]
+fn test_parse_analyze_table() {
+    assert_eq!(
+        parse_sql("ANALYZE TABLE employees;"),
+        Statement::AnalyzeTable {
+            table_name: "employees".to_string(),
+        }
+    );
+}
+
+#[test]
 fn test_parse_insert_single_and_multi_rows() {
     let stmt = parse_sql("INSERT INTO users VALUES (1, 'Alice', true), (2, 'Bob', false);");
     assert_eq!(

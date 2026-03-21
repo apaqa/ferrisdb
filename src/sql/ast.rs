@@ -13,6 +13,9 @@ pub enum Statement {
     Explain {
         statement: Box<Statement>,
     },
+    AnalyzeTable {
+        table_name: String,
+    },
     CreateView {
         view_name: String,
         query_sql: String,
