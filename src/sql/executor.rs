@@ -2743,6 +2743,10 @@ pub fn format_execute_result(result: &ExecuteResult) -> String {
         ExecuteResult::Revoked { user, table_name } => {
             format!("Privileges revoked from '{}' on '{}'", user, table_name)
         }
+        // 中文註解：預存程序操作結果的顯示格式
+        ExecuteResult::ProcedureCreated { name } => format!("Procedure '{}' created", name),
+        ExecuteResult::ProcedureCalled { name } => format!("Procedure '{}' called", name),
+        ExecuteResult::ProcedureDropped { name } => format!("Procedure '{}' dropped", name),
     }
 }
 
@@ -3368,7 +3372,7 @@ fn bind_statement_variables(
             order_by: order_by
                 .as_ref()
                 .map(|order| {
-                    Ok(OrderByClause {
+                    Ok::<OrderByClause, crate::error::FerrisDbError>(OrderByClause {
                         column: order.column.clone(),
                         expr: order
                             .expr
@@ -3777,7 +3781,7 @@ fn infer_materialized_type(rows: &[Vec<Value>], index: usize) -> DataType {
             Some(Value::Int(_)) => return DataType::Int,
             Some(Value::Text(_)) => return DataType::Text,
             Some(Value::Bool(_)) => return DataType::Bool,
-            Some(Value::Null) | None => {}
+            Some(Value::Null) | Some(Value::Variable(_)) | None => {}
         }
     }
     DataType::Text
