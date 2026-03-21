@@ -430,5 +430,6 @@ fn render_value(value: &Value) -> String {
         Value::Text(v) => v.clone(),
         Value::Bool(v) => v.to_string(),
         Value::Null => "NULL".to_string(),
+        Value::Variable(name) => name.clone(),
     }
 }

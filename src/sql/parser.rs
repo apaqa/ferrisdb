@@ -5,7 +5,7 @@ use crate::error::{FerrisDbError, Result};
 
 use super::ast::{
     AggregateFunc, Assignment, CTE, ColumnDef, DataType, Expr, GroupByClause, InsertSource,
-    IsolationLevel, JoinClause, JoinType, Operator, OrderByClause, OrderDirection,
+    IsolationLevel, JoinClause, JoinType, Operator, OrderByClause, OrderDirection, ProcedureParam,
     Privilege, SelectColumns, SelectItem, Statement, TriggerEvent, TriggerTiming, Value,
     WhereExpr, WindowFunc,
 };
@@ -62,6 +62,8 @@ impl Parser {
             Some(Token::Keyword(Keyword::Deallocate)) => self.parse_deallocate()?,
             Some(Token::Keyword(Keyword::Alter)) => self.parse_alter_table()?,
             Some(Token::Keyword(Keyword::Set)) => self.parse_set_statement()?,
+            Some(Token::Keyword(Keyword::Call)) => self.parse_call_procedure()?,
+            Some(Token::Keyword(Keyword::Declare)) => self.parse_declare_statement()?,
             Some(Token::Keyword(Keyword::Create)) => self.parse_create_statement()?,
             Some(Token::Keyword(Keyword::Drop)) => self.parse_drop_statement()?,
             Some(Token::Keyword(Keyword::Insert)) => self.parse_insert()?,
@@ -69,6 +71,11 @@ impl Parser {
             Some(Token::Keyword(Keyword::Select)) => self.parse_query_expression()?,
             Some(Token::Keyword(Keyword::Update)) => self.parse_update()?,
             Some(Token::Keyword(Keyword::Delete)) => self.parse_delete()?,
+            Some(Token::Keyword(Keyword::If)) => self.parse_if_then_else()?,
+            Some(Token::Keyword(Keyword::While)) => self.parse_while_do()?,
+            Some(Token::Keyword(Keyword::Open)) => self.parse_open_cursor()?,
+            Some(Token::Keyword(Keyword::Fetch)) => self.parse_fetch_cursor()?,
+            Some(Token::Keyword(Keyword::Close)) => self.parse_close_cursor()?,
             // 中文註解：GRANT 賦予權限
             Some(Token::Keyword(Keyword::Grant)) => self.parse_grant()?,
             // 中文註解：REVOKE 撤銷權限
@@ -92,12 +99,13 @@ impl Parser {
         self.expect_keyword(Keyword::Create)?;
         match self.peek() {
             Some(Token::Keyword(Keyword::View)) => self.parse_create_view_after_create(),
+            Some(Token::Keyword(Keyword::Procedure)) => self.parse_create_procedure_after_create(),
             Some(Token::Keyword(Keyword::Table)) => self.parse_create_table_after_create(),
             Some(Token::Keyword(Keyword::Index)) => self.parse_create_index_after_create(),
             // 中文註解：CREATE TRIGGER 觸發器定義
             Some(Token::Keyword(Keyword::Trigger)) => self.parse_create_trigger_after_create(),
             other => Err(FerrisDbError::InvalidCommand(format!(
-                "expected VIEW, TABLE, INDEX or TRIGGER after CREATE, got {:?}",
+                "expected VIEW, PROCEDURE, TABLE, INDEX or TRIGGER after CREATE, got {:?}",
                 other
             ))),
         }
@@ -123,6 +131,34 @@ impl Parser {
             query_sql,
             query: Box::new(query),
         })
+    }
+
+    // 中文註解：CREATE PROCEDURE 會把參數列表與 BEGIN...END 主體解析成 AST。
+    fn parse_create_procedure_after_create(&mut self) -> Result<Statement> {
+        self.expect_keyword(Keyword::Procedure)?;
+        let name = self.expect_ident()?;
+        self.expect_token(Token::LParen)?;
+        let mut params = Vec::new();
+        if !matches!(self.peek(), Some(Token::RParen)) {
+            loop {
+                let param_name = self.expect_ident()?;
+                let data_type = self.parse_data_type()?;
+                params.push(ProcedureParam {
+                    name: param_name,
+                    data_type,
+                });
+                if matches!(self.peek(), Some(Token::Comma)) {
+                    self.bump();
+                    continue;
+                }
+                break;
+            }
+        }
+        self.expect_token(Token::RParen)?;
+        self.expect_keyword(Keyword::Begin)?;
+        let body = self.parse_block_until(&[BlockTerminator::End])?;
+        self.expect_keyword(Keyword::End)?;
+        Ok(Statement::CreateProcedure { name, params, body })
     }
 
     fn parse_create_table_after_create(&mut self) -> Result<Statement> {
@@ -343,6 +379,11 @@ impl Parser {
                     if_exists,
                 })
             }
+            Some(Token::Keyword(Keyword::Procedure)) => {
+                self.expect_keyword(Keyword::Procedure)?;
+                let name = self.expect_ident()?;
+                Ok(Statement::DropProcedure { name })
+            }
             Some(Token::Keyword(Keyword::Index)) => {
                 self.expect_keyword(Keyword::Index)?;
                 self.expect_keyword(Keyword::On)?;
@@ -371,7 +412,7 @@ impl Parser {
                 Ok(Statement::DropTrigger { trigger_name })
             }
             other => Err(FerrisDbError::InvalidCommand(format!(
-                "expected VIEW, INDEX, TABLE or TRIGGER after DROP, got {:?}",
+                "expected VIEW, PROCEDURE, INDEX, TABLE or TRIGGER after DROP, got {:?}",
                 other
             ))),
         }
@@ -478,8 +519,55 @@ impl Parser {
         })
     }
 
+    // 中文註解：CALL 會把參數值保留成 Value，執行時再綁定到 procedure 區域變數。
+    fn parse_call_procedure(&mut self) -> Result<Statement> {
+        self.expect_keyword(Keyword::Call)?;
+        let name = self.expect_ident()?;
+        self.expect_token(Token::LParen)?;
+        let mut args = Vec::new();
+        if !matches!(self.peek(), Some(Token::RParen)) {
+            loop {
+                args.push(self.parse_value()?);
+                if matches!(self.peek(), Some(Token::Comma)) {
+                    self.bump();
+                    continue;
+                }
+                break;
+            }
+        }
+        self.expect_token(Token::RParen)?;
+        Ok(Statement::CallProcedure { name, args })
+    }
+
+    // 中文註解：DECLARE 同時支援區域變數與 cursor 兩種語法。
+    fn parse_declare_statement(&mut self) -> Result<Statement> {
+        self.expect_keyword(Keyword::Declare)?;
+        let name = self.expect_ident()?;
+        if matches!(self.peek(), Some(Token::Keyword(Keyword::Cursor))) {
+            self.bump();
+            self.expect_keyword(Keyword::For)?;
+            let query = self.parse_query_expression()?;
+            return Ok(Statement::DeclareCursor {
+                name,
+                query: Box::new(query),
+            });
+        }
+
+        let data_type = self.parse_data_type()?;
+        Ok(Statement::DeclareVariable { name, data_type })
+    }
+
     fn parse_set_statement(&mut self) -> Result<Statement> {
         self.expect_keyword(Keyword::Set)?;
+        if !matches!(self.peek(), Some(Token::Keyword(Keyword::Transaction))) {
+            let name = self.expect_ident()?;
+            self.expect_token(Token::Eq)?;
+            return Ok(Statement::SetVariable {
+                name,
+                value: self.parse_runtime_expr()?,
+            });
+        }
+
         self.expect_keyword(Keyword::Transaction)?;
         self.expect_keyword(Keyword::Isolation)?;
         self.expect_keyword(Keyword::Level)?;
@@ -501,6 +589,61 @@ impl Parser {
             }
         };
         Ok(Statement::SetIsolationLevel { level })
+    }
+
+    fn parse_if_then_else(&mut self) -> Result<Statement> {
+        self.expect_keyword(Keyword::If)?;
+        let condition = self.parse_where_expr()?;
+        self.expect_keyword(Keyword::Then)?;
+        let then_body =
+            self.parse_block_until(&[BlockTerminator::Else, BlockTerminator::EndIf])?;
+        let else_body = if matches!(self.peek(), Some(Token::Keyword(Keyword::Else))) {
+            self.bump();
+            self.parse_block_until(&[BlockTerminator::EndIf])?
+        } else {
+            Vec::new()
+        };
+        self.expect_keyword(Keyword::End)?;
+        self.expect_keyword(Keyword::If)?;
+        Ok(Statement::IfThenElse {
+            condition,
+            then_body,
+            else_body,
+        })
+    }
+
+    fn parse_while_do(&mut self) -> Result<Statement> {
+        self.expect_keyword(Keyword::While)?;
+        let condition = self.parse_where_expr()?;
+        self.expect_keyword(Keyword::Do)?;
+        let body = self.parse_block_until(&[BlockTerminator::EndWhile])?;
+        self.expect_keyword(Keyword::End)?;
+        self.expect_keyword(Keyword::While)?;
+        Ok(Statement::WhileDo { condition, body })
+    }
+
+    fn parse_open_cursor(&mut self) -> Result<Statement> {
+        self.expect_keyword(Keyword::Open)?;
+        Ok(Statement::OpenCursor {
+            name: self.expect_ident()?,
+        })
+    }
+
+    fn parse_fetch_cursor(&mut self) -> Result<Statement> {
+        self.expect_keyword(Keyword::Fetch)?;
+        self.expect_keyword(Keyword::Next)?;
+        self.expect_keyword(Keyword::From)?;
+        let name = self.expect_ident()?;
+        self.expect_keyword(Keyword::Into)?;
+        let variables = self.parse_identifier_list()?;
+        Ok(Statement::FetchCursor { name, variables })
+    }
+
+    fn parse_close_cursor(&mut self) -> Result<Statement> {
+        self.expect_keyword(Keyword::Close)?;
+        Ok(Statement::CloseCursor {
+            name: self.expect_ident()?,
+        })
     }
 
     fn parse_insert(&mut self) -> Result<Statement> {
@@ -989,6 +1132,20 @@ impl Parser {
         }
     }
 
+    // 中文註解：procedure 的運算式目前支援常值、變數與 CASE WHEN。
+    fn parse_runtime_expr(&mut self) -> Result<Expr> {
+        match self.peek() {
+            Some(Token::Keyword(Keyword::Case)) => self.parse_case_when_expr(),
+            Some(Token::Ident(_)) => Ok(Expr::Variable(self.expect_ident()?)),
+            Some(Token::Placeholder(index)) => {
+                let placeholder = *index;
+                self.bump();
+                Ok(Expr::Placeholder(placeholder))
+            }
+            _ => Ok(Expr::Value(self.parse_value()?)),
+        }
+    }
+
     fn parse_value(&mut self) -> Result<Value> {
         match self.bump() {
             Some(Token::IntLit(v)) => Ok(Value::Int(v)),
@@ -996,6 +1153,7 @@ impl Parser {
             Some(Token::Keyword(Keyword::True)) => Ok(Value::Bool(true)),
             Some(Token::Keyword(Keyword::False)) => Ok(Value::Bool(false)),
             Some(Token::Keyword(Keyword::Null)) => Ok(Value::Null),
+            Some(Token::Ident(name)) => Ok(Value::Variable(name)),
             other => Err(FerrisDbError::InvalidCommand(format!(
                 "expected SQL value, got {:?}",
                 other
@@ -1332,6 +1490,57 @@ impl Parser {
         }
         false
     }
+
+    // 中文註解：block parser 會一路吃到指定的結束標記，用來處理 procedure/if/while 主體。
+    fn parse_block_until(&mut self, terminators: &[BlockTerminator]) -> Result<Vec<Statement>> {
+        let mut body = Vec::new();
+        while !self.reached_block_terminator(terminators) {
+            if self.peek().is_none() {
+                return Err(FerrisDbError::InvalidCommand(
+                    "unterminated SQL block".to_string(),
+                ));
+            }
+            body.push(self.parse_inner()?);
+        }
+        Ok(body)
+    }
+
+    fn reached_block_terminator(&self, terminators: &[BlockTerminator]) -> bool {
+        terminators
+            .iter()
+            .any(|terminator| terminator.matches(self))
+    }
+}
+
+#[derive(Clone, Copy)]
+enum BlockTerminator {
+    End,
+    Else,
+    EndIf,
+    EndWhile,
+}
+
+impl BlockTerminator {
+    fn matches(&self, parser: &Parser) -> bool {
+        match self {
+            BlockTerminator::End => matches!(parser.peek(), Some(Token::Keyword(Keyword::End))),
+            BlockTerminator::Else => matches!(parser.peek(), Some(Token::Keyword(Keyword::Else))),
+            BlockTerminator::EndIf => matches!(
+                (parser.peek(), parser.peek_n(1)),
+                (
+                    Some(Token::Keyword(Keyword::End)),
+                    Some(Token::Keyword(Keyword::If))
+                )
+            ),
+            BlockTerminator::EndWhile => matches!(
+                (parser.peek(), parser.peek_n(1)),
+                (
+                    Some(Token::Keyword(Keyword::End)),
+                    Some(Token::Keyword(Keyword::While))
+                )
+            ),
+        }
+    }
 }
 
 fn render_condition_item(item: &SelectItem) -> String {
@@ -1353,11 +1562,14 @@ fn split_sql_statements(input: &str) -> Vec<String> {
     let mut statements = Vec::new();
     let mut current = String::new();
     let mut in_string = false;
+    let mut block_depth = 0_i32;
+    let mut word = String::new();
     let mut chars = input.chars().peekable();
 
     while let Some(ch) = chars.next() {
         match ch {
             '\'' => {
+                flush_split_word(&mut word, &mut block_depth);
                 current.push(ch);
                 if in_string && matches!(chars.peek(), Some('\'')) {
                     current.push(chars.next().expect("escaped quote"));
@@ -1365,23 +1577,44 @@ fn split_sql_statements(input: &str) -> Vec<String> {
                     in_string = !in_string;
                 }
             }
-            ';' if !in_string => {
+            ';' if !in_string && block_depth == 0 => {
+                flush_split_word(&mut word, &mut block_depth);
                 let trimmed = current.trim();
                 if !trimmed.is_empty() {
                     statements.push(trimmed.to_string());
                 }
                 current.clear();
             }
-            _ => current.push(ch),
+            _ => {
+                current.push(ch);
+                if !in_string && (ch.is_ascii_alphanumeric() || ch == '_') {
+                    word.push(ch);
+                } else if !in_string {
+                    flush_split_word(&mut word, &mut block_depth);
+                }
+            }
         }
     }
 
+    flush_split_word(&mut word, &mut block_depth);
     let trimmed = current.trim();
     if !trimmed.is_empty() {
         statements.push(trimmed.to_string());
     }
 
     statements
+}
+
+fn flush_split_word(word: &mut String, block_depth: &mut i32) {
+    if word.is_empty() {
+        return;
+    }
+    match word.to_ascii_uppercase().as_str() {
+        "BEGIN" => *block_depth += 1,
+        "END" => *block_depth = (*block_depth - 1).max(0),
+        _ => {}
+    }
+    word.clear();
 }
 
 fn tokens_to_sql(tokens: &[Token]) -> String {
@@ -1453,6 +1686,11 @@ fn keyword_to_sql(keyword: &Keyword) -> &'static str {
         Keyword::Into => "INTO",
         Keyword::Values => "VALUES",
         Keyword::Create => "CREATE",
+        Keyword::Procedure => "PROCEDURE",
+        Keyword::Call => "CALL",
+        Keyword::Declare => "DECLARE",
+        Keyword::Variable => "VARIABLE",
+        Keyword::Return => "RETURN",
         Keyword::View => "VIEW",
         Keyword::Index => "INDEX",
         Keyword::Table => "TABLE",
@@ -1460,6 +1698,7 @@ fn keyword_to_sql(keyword: &Keyword) -> &'static str {
         Keyword::Column => "COLUMN",
         Keyword::Drop => "DROP",
         Keyword::If => "IF",
+        Keyword::While => "WHILE",
         Keyword::Exists => "EXISTS",
         Keyword::Not => "NOT",
         Keyword::Is => "IS",
@@ -1503,6 +1742,12 @@ fn keyword_to_sql(keyword: &Keyword) -> &'static str {
         Keyword::Each => "EACH",
         Keyword::Row => "ROW",
         Keyword::Begin => "BEGIN",
+        Keyword::Cursor => "CURSOR",
+        Keyword::Open => "OPEN",
+        Keyword::Fetch => "FETCH",
+        Keyword::Close => "CLOSE",
+        Keyword::Next => "NEXT",
+        Keyword::Do => "DO",
         // 中文註解：GRANT/REVOKE 關鍵字轉回 SQL 字串
         Keyword::Grant => "GRANT",
         Keyword::Revoke => "REVOKE",
@@ -1515,15 +1760,26 @@ fn max_placeholder_in_statement(statement: &Statement) -> usize {
     match statement {
         Statement::Explain { statement } => max_placeholder_in_statement(statement),
         Statement::AnalyzeTable { .. }
+        | Statement::CreateProcedure { .. }
         | Statement::CreateTable { .. }
         | Statement::AlterTableAdd { .. }
         | Statement::AlterTableDropColumn { .. }
         | Statement::DropTable { .. }
         | Statement::DropView { .. }
+        | Statement::DropProcedure { .. }
         | Statement::CreateView { .. }
         | Statement::CreateIndex { .. }
         | Statement::DropIndex { .. }
         | Statement::Insert { .. }
+        | Statement::CallProcedure { .. }
+        | Statement::DeclareVariable { .. }
+        | Statement::DeclareCursor { .. }
+        | Statement::SetVariable { .. }
+        | Statement::IfThenElse { .. }
+        | Statement::WhileDo { .. }
+        | Statement::OpenCursor { .. }
+        | Statement::FetchCursor { .. }
+        | Statement::CloseCursor { .. }
         | Statement::Deallocate { .. }
         | Statement::Execute { .. }
         | Statement::SetIsolationLevel { .. }
@@ -1591,7 +1847,7 @@ fn max_placeholder_in_columns(columns: &SelectColumns) -> usize {
 
 fn max_placeholder_in_expr(expr: &Expr) -> usize {
     match expr {
-        Expr::Value(_) | Expr::Column(_) => 0,
+        Expr::Value(_) | Expr::Column(_) | Expr::Variable(_) => 0,
         Expr::Placeholder(index) => *index,
         Expr::CaseWhen {
             conditions,

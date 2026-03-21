@@ -89,5 +89,6 @@ pub fn primary_key_to_string(value: &Value) -> String {
         Value::Text(v) => v.clone(),
         Value::Bool(v) => v.to_string(),
         Value::Null => "null".to_string(),
+        Value::Variable(name) => name.clone(),
     }
 }

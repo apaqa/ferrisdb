@@ -173,6 +173,7 @@ fn compare_values(left: &Value, right: &Value) -> std::cmp::Ordering {
         (Value::Int(a), Value::Int(b)) => a.cmp(b),
         (Value::Text(a), Value::Text(b)) => a.cmp(b),
         (Value::Bool(a), Value::Bool(b)) => a.cmp(b),
+        (Value::Variable(a), Value::Variable(b)) => a.cmp(b),
         _ => std::cmp::Ordering::Equal,
     }
 }

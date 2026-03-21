@@ -33,7 +33,7 @@ use crate::transaction::mvcc::{MvccEngine, PreparedStatement, Transaction};
 
 use super::ast::{
     AggregateFunc, Assignment, CTE, ColumnDef, DataType, Expr, GroupByClause, InsertSource,
-    IsolationLevel, JoinClause, JoinType, Operator, OrderByClause, OrderDirection,
+    IsolationLevel, JoinClause, JoinType, Operator, OrderByClause, OrderDirection, ProcedureParam,
     Privilege, SelectColumns, SelectItem, Statement, TriggerEvent, TriggerTiming, Value,
     WhereExpr, WindowFunc,
 };
@@ -69,11 +69,20 @@ pub enum ExecuteResult {
     Created {
         table_name: String,
     },
+    ProcedureCreated {
+        name: String,
+    },
+    ProcedureCalled {
+        name: String,
+    },
     Altered {
         table_name: String,
     },
     Dropped {
         table_name: String,
+    },
+    ProcedureDropped {
+        name: String,
     },
     IndexCreated {
         table_name: String,
@@ -130,8 +139,30 @@ struct TriggerDefinition {
     body: Vec<Statement>,
 }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct ProcedureDefinition {
+    name: String,
+    params: Vec<ProcedureParam>,
+    body: Vec<Statement>,
+}
+
+#[derive(Debug, Clone)]
+struct CursorState {
+    query: Statement,
+    columns: Vec<String>,
+    rows: Vec<Vec<Value>>,
+    position: usize,
+    is_open: bool,
+}
+
+#[derive(Debug, Default)]
+struct ProcedureContext {
+    variables: HashMap<String, Value>,
+}
+
 // 中文註解：觸發器 metadata 的 KV key 前綴
 const TRIGGER_META_PREFIX: &str = "__meta:trigger:";
+const PROCEDURE_META_PREFIX: &str = "__meta:procedure:";
 // 中文註解：權限 metadata 的 KV key 前綴
 const PRIVILEGE_META_PREFIX: &str = "__meta:privilege:";
 
@@ -240,6 +271,7 @@ pub struct SqlExecutor {
     statistics: StatisticsManager,
     optimizer: Optimizer,
     plan_cache: Mutex<PlanCache>,
+    cursors: Mutex<HashMap<String, CursorState>>,
     // 中文註解：目前 session 的使用者名稱；None 表示管理員模式（不做權限檢查）
     current_user: Mutex<Option<String>>,
 }
@@ -257,6 +289,7 @@ impl SqlExecutor {
             statistics,
             optimizer,
             plan_cache: Mutex::new(PlanCache::new(100)),
+            cursors: Mutex::new(HashMap::new()),
             current_user: Mutex::new(None),
         }
     }
@@ -292,6 +325,9 @@ impl SqlExecutor {
             Statement::Deallocate { name } => self.execute_deallocate(name),
             Statement::SetIsolationLevel { level } => self.execute_set_isolation_level(level),
             Statement::AnalyzeTable { table_name } => self.execute_analyze_table(table_name),
+            Statement::CreateProcedure { name, params, body } => {
+                self.execute_create_procedure(name, params, body)
+            }
             Statement::CreateView {
                 view_name,
                 query_sql,
@@ -317,6 +353,7 @@ impl SqlExecutor {
                 view_name,
                 if_exists,
             } => self.execute_drop_view(view_name, if_exists),
+            Statement::DropProcedure { name } => self.execute_drop_procedure(name),
             Statement::CreateIndex {
                 table_name,
                 column_names,
@@ -325,6 +362,34 @@ impl SqlExecutor {
                 table_name,
                 column_names,
             } => self.execute_drop_index(table_name, column_names),
+            Statement::CallProcedure { name, args } => self.execute_call_procedure(name, args),
+            Statement::DeclareVariable { name, data_type } => {
+                let mut context = ProcedureContext::default();
+                self.execute_declare_variable(&mut context, name, data_type)
+            }
+            Statement::DeclareCursor { name, query } => self.execute_declare_cursor(name, *query),
+            Statement::SetVariable { name, value } => {
+                let mut context = ProcedureContext::default();
+                self.execute_set_variable(&mut context, name, value)
+            }
+            Statement::IfThenElse {
+                condition,
+                then_body,
+                else_body,
+            } => {
+                let mut context = ProcedureContext::default();
+                self.execute_if_then_else(&mut context, condition, then_body, else_body)
+            }
+            Statement::WhileDo { condition, body } => {
+                let mut context = ProcedureContext::default();
+                self.execute_while_do(&mut context, condition, body)
+            }
+            Statement::OpenCursor { name } => self.execute_open_cursor(name),
+            Statement::FetchCursor { name, variables } => {
+                let mut context = ProcedureContext::default();
+                self.execute_fetch_cursor(&mut context, name, variables)
+            }
+            Statement::CloseCursor { name } => self.execute_close_cursor(name),
             Statement::Insert { table_name, source } => self.execute_insert(table_name, source),
             Statement::Select {
                 ctes,
@@ -744,6 +809,287 @@ impl SqlExecutor {
         txn.delete(&key)?;
         txn.commit()?;
         Ok(ExecuteResult::TriggerDropped { trigger_name })
+    }
+
+    fn execute_create_procedure(
+        &self,
+        name: String,
+        params: Vec<ProcedureParam>,
+        body: Vec<Statement>,
+    ) -> Result<ExecuteResult> {
+        let mut txn = self.engine.begin_transaction();
+        let key = encode_procedure_key(&name);
+        if txn.get(&key)?.is_some() {
+            return Ok(ExecuteResult::Error {
+                message: format!("procedure '{}' already exists", name),
+            });
+        }
+
+        let definition = ProcedureDefinition {
+            name: name.clone(),
+            params,
+            body,
+        };
+        txn.put(key, serde_json::to_vec(&definition)?)?;
+        txn.commit()?;
+        Ok(ExecuteResult::ProcedureCreated { name })
+    }
+
+    fn execute_drop_procedure(&self, name: String) -> Result<ExecuteResult> {
+        let mut txn = self.engine.begin_transaction();
+        let key = encode_procedure_key(&name);
+        if txn.get(&key)?.is_none() {
+            return Ok(ExecuteResult::Error {
+                message: format!("procedure '{}' does not exist", name),
+            });
+        }
+        txn.delete(&key)?;
+        txn.commit()?;
+        Ok(ExecuteResult::ProcedureDropped { name })
+    }
+
+    fn execute_call_procedure(&self, name: String, args: Vec<Value>) -> Result<ExecuteResult> {
+        let definition = self.load_procedure_definition(&name)?;
+        let Some(definition) = definition else {
+            return Ok(ExecuteResult::Error {
+                message: format!("procedure '{}' does not exist", name),
+            });
+        };
+        if definition.params.len() != args.len() {
+            return Ok(ExecuteResult::Error {
+                message: format!(
+                    "procedure '{}' expects {} arguments, got {}",
+                    name,
+                    definition.params.len(),
+                    args.len()
+                ),
+            });
+        }
+
+        let mut context = ProcedureContext::default();
+        for (param, arg) in definition.params.iter().zip(args.into_iter()) {
+            context.variables.insert(param.name.clone(), arg);
+        }
+
+        let result = self.execute_block(&mut context, &definition.body)?;
+        Ok(match result {
+            Some(result) => result,
+            None => ExecuteResult::ProcedureCalled { name },
+        })
+    }
+
+    fn load_procedure_definition(&self, name: &str) -> Result<Option<ProcedureDefinition>> {
+        let txn = self.engine.begin_transaction();
+        Ok(txn
+            .get(&encode_procedure_key(name))?
+            .as_deref()
+            .map(serde_json::from_slice)
+            .transpose()?)
+    }
+
+    fn execute_block(
+        &self,
+        context: &mut ProcedureContext,
+        body: &[Statement],
+    ) -> Result<Option<ExecuteResult>> {
+        let mut last_result = None;
+        for statement in body {
+            last_result = Some(self.execute_statement_in_context(context, statement.clone())?);
+        }
+        Ok(last_result)
+    }
+
+    fn execute_statement_in_context(
+        &self,
+        context: &mut ProcedureContext,
+        stmt: Statement,
+    ) -> Result<ExecuteResult> {
+        match stmt {
+            Statement::DeclareVariable { name, data_type } => {
+                self.execute_declare_variable(context, name, data_type)
+            }
+            Statement::DeclareCursor { name, query } => {
+                self.execute_declare_cursor(name, bind_statement_variables(&query, &context.variables)?)
+            }
+            Statement::SetVariable { name, value } => self.execute_set_variable(context, name, value),
+            Statement::IfThenElse {
+                condition,
+                then_body,
+                else_body,
+            } => self.execute_if_then_else(context, condition, then_body, else_body),
+            Statement::WhileDo { condition, body } => self.execute_while_do(context, condition, body),
+            Statement::OpenCursor { name } => self.execute_open_cursor(name),
+            Statement::FetchCursor { name, variables } => {
+                self.execute_fetch_cursor(context, name, variables)
+            }
+            Statement::CloseCursor { name } => self.execute_close_cursor(name),
+            other => self.execute_unchecked(bind_statement_variables(&other, &context.variables)?),
+        }
+    }
+
+    fn execute_declare_variable(
+        &self,
+        context: &mut ProcedureContext,
+        name: String,
+        data_type: DataType,
+    ) -> Result<ExecuteResult> {
+        context
+            .variables
+            .insert(name, default_value_for_data_type(&data_type));
+        Ok(ExecuteResult::Selected {
+            columns: Vec::new(),
+            rows: Vec::new(),
+        })
+    }
+
+    fn execute_set_variable(
+        &self,
+        context: &mut ProcedureContext,
+        name: String,
+        value: Expr,
+    ) -> Result<ExecuteResult> {
+        let resolved = evaluate_runtime_expr(&value, &context.variables)?;
+        context.variables.insert(name, resolved);
+        Ok(ExecuteResult::Selected {
+            columns: Vec::new(),
+            rows: Vec::new(),
+        })
+    }
+
+    fn execute_if_then_else(
+        &self,
+        context: &mut ProcedureContext,
+        condition: WhereExpr,
+        then_body: Vec<Statement>,
+        else_body: Vec<Statement>,
+    ) -> Result<ExecuteResult> {
+        let branch = if evaluate_runtime_condition(&condition, &context.variables)? {
+            then_body
+        } else {
+            else_body
+        };
+        Ok(self
+            .execute_block(context, &branch)?
+            .unwrap_or(ExecuteResult::Selected {
+                columns: Vec::new(),
+                rows: Vec::new(),
+            }))
+    }
+
+    fn execute_while_do(
+        &self,
+        context: &mut ProcedureContext,
+        condition: WhereExpr,
+        body: Vec<Statement>,
+    ) -> Result<ExecuteResult> {
+        let mut last_result = ExecuteResult::Selected {
+            columns: Vec::new(),
+            rows: Vec::new(),
+        };
+        while evaluate_runtime_condition(&condition, &context.variables)? {
+            if let Some(result) = self.execute_block(context, &body)? {
+                last_result = result;
+            }
+        }
+        Ok(last_result)
+    }
+
+    fn execute_declare_cursor(&self, name: String, query: Statement) -> Result<ExecuteResult> {
+        self.cursors.lock().expect("cursor lock").insert(
+            name,
+            CursorState {
+                query,
+                columns: Vec::new(),
+                rows: Vec::new(),
+                position: 0,
+                is_open: false,
+            },
+        );
+        Ok(ExecuteResult::Selected {
+            columns: Vec::new(),
+            rows: Vec::new(),
+        })
+    }
+
+    fn execute_open_cursor(&self, name: String) -> Result<ExecuteResult> {
+        let query = {
+            let cursors = self.cursors.lock().expect("cursor lock");
+            let Some(cursor) = cursors.get(&name) else {
+                return Ok(ExecuteResult::Error {
+                    message: format!("cursor '{}' does not exist", name),
+                });
+            };
+            cursor.query.clone()
+        };
+        let result = self.execute_unchecked(query)?;
+        let ExecuteResult::Selected { columns, rows } = result else {
+            return Ok(ExecuteResult::Error {
+                message: format!("cursor '{}' query must be a SELECT", name),
+            });
+        };
+        let mut cursors = self.cursors.lock().expect("cursor lock");
+        let cursor = cursors.get_mut(&name).expect("cursor exists");
+        cursor.columns = columns;
+        cursor.rows = rows;
+        cursor.position = 0;
+        cursor.is_open = true;
+        Ok(ExecuteResult::Selected {
+            columns: Vec::new(),
+            rows: Vec::new(),
+        })
+    }
+
+    fn execute_fetch_cursor(
+        &self,
+        context: &mut ProcedureContext,
+        name: String,
+        variables: Vec<String>,
+    ) -> Result<ExecuteResult> {
+        let mut cursors = self.cursors.lock().expect("cursor lock");
+        let Some(cursor) = cursors.get_mut(&name) else {
+            return Ok(ExecuteResult::Error {
+                message: format!("cursor '{}' does not exist", name),
+            });
+        };
+        if !cursor.is_open {
+            return Ok(ExecuteResult::Error {
+                message: format!("cursor '{}' is not open", name),
+            });
+        }
+        if cursor.position >= cursor.rows.len() {
+            return Ok(ExecuteResult::Selected {
+                columns: variables,
+                rows: Vec::new(),
+            });
+        }
+
+        let row = cursor.rows[cursor.position].clone();
+        cursor.position += 1;
+        for (index, variable) in variables.iter().enumerate() {
+            let value = row.get(index).cloned().unwrap_or(Value::Null);
+            context.variables.insert(variable.clone(), value);
+        }
+        Ok(ExecuteResult::Selected {
+            columns: variables,
+            rows: vec![row],
+        })
+    }
+
+    fn execute_close_cursor(&self, name: String) -> Result<ExecuteResult> {
+        let mut cursors = self.cursors.lock().expect("cursor lock");
+        let Some(cursor) = cursors.get_mut(&name) else {
+            return Ok(ExecuteResult::Error {
+                message: format!("cursor '{}' does not exist", name),
+            });
+        };
+        cursor.rows.clear();
+        cursor.columns.clear();
+        cursor.position = 0;
+        cursor.is_open = false;
+        Ok(ExecuteResult::Selected {
+            columns: Vec::new(),
+            rows: Vec::new(),
+        })
     }
 
     // 中文註解：查出指定 table + timing + event 的所有觸發器
@@ -2611,6 +2957,7 @@ fn normalize_expr(expr: Expr, table_alias: Option<&str>, table_name: &str) -> Ex
             Expr::Column(normalize_column_reference(column, table_alias, table_name))
         }
         Expr::Placeholder(index) => Expr::Placeholder(index),
+        Expr::Variable(name) => Expr::Variable(name),
         Expr::CaseWhen {
             conditions,
             else_result,
@@ -2953,6 +3300,318 @@ fn substitute_statement_placeholders(
     })
 }
 
+// 中文註解：procedure 執行前會先把 AST 內的變數參考替換成實際值，讓既有 executor 可以重用。
+fn bind_statement_variables(
+    statement: &Statement,
+    variables: &HashMap<String, Value>,
+) -> Result<Statement> {
+    Ok(match statement {
+        Statement::Explain { statement } => Statement::Explain {
+            statement: Box::new(bind_statement_variables(statement, variables)?),
+        },
+        Statement::CreateView {
+            view_name,
+            query_sql,
+            query,
+        } => Statement::CreateView {
+            view_name: view_name.clone(),
+            query_sql: query_sql.clone(),
+            query: Box::new(bind_statement_variables(query, variables)?),
+        },
+        Statement::Insert { table_name, source } => Statement::Insert {
+            table_name: table_name.clone(),
+            source: bind_insert_source_variables(source, variables)?,
+        },
+        Statement::CallProcedure { name, args } => Statement::CallProcedure {
+            name: name.clone(),
+            args: args
+                .iter()
+                .map(|value| resolve_runtime_value(value, variables))
+                .collect::<Result<Vec<_>>>()?,
+        },
+        Statement::Select {
+            ctes,
+            distinct,
+            table_name,
+            table_alias,
+            columns,
+            join,
+            where_clause,
+            group_by,
+            having,
+            order_by,
+            limit,
+        } => Statement::Select {
+            ctes: ctes
+                .iter()
+                .map(|cte| {
+                    Ok(CTE {
+                        name: cte.name.clone(),
+                        query: Box::new(bind_statement_variables(&cte.query, variables)?),
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?,
+            distinct: *distinct,
+            table_name: table_name.clone(),
+            table_alias: table_alias.clone(),
+            columns: bind_select_columns_variables(columns, variables)?,
+            join: join.clone(),
+            where_clause: where_clause
+                .as_ref()
+                .map(|expr| bind_where_expr_variables(expr, variables))
+                .transpose()?,
+            group_by: group_by.clone(),
+            having: having
+                .as_ref()
+                .map(|expr| bind_where_expr_variables(expr, variables))
+                .transpose()?,
+            order_by: order_by
+                .as_ref()
+                .map(|order| {
+                    Ok(OrderByClause {
+                        column: order.column.clone(),
+                        expr: order
+                            .expr
+                            .as_ref()
+                            .map(|expr| bind_expr_variables(expr, variables))
+                            .transpose()?,
+                        direction: order.direction.clone(),
+                    })
+                })
+                .transpose()?,
+            limit: *limit,
+        },
+        Statement::Update {
+            table_name,
+            assignments,
+            from_table,
+            join_condition,
+            where_clause,
+        } => Statement::Update {
+            table_name: table_name.clone(),
+            assignments: assignments
+                .iter()
+                .map(|assignment| {
+                    Ok(Assignment {
+                        column: assignment.column.clone(),
+                        value: resolve_runtime_value(&assignment.value, variables)?,
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?,
+            from_table: from_table.clone(),
+            join_condition: join_condition
+                .as_ref()
+                .map(|expr| bind_where_expr_variables(expr, variables))
+                .transpose()?,
+            where_clause: where_clause
+                .as_ref()
+                .map(|expr| bind_where_expr_variables(expr, variables))
+                .transpose()?,
+        },
+        Statement::Delete {
+            table_name,
+            using_table,
+            join_condition,
+            where_clause,
+        } => Statement::Delete {
+            table_name: table_name.clone(),
+            using_table: using_table.clone(),
+            join_condition: join_condition
+                .as_ref()
+                .map(|expr| bind_where_expr_variables(expr, variables))
+                .transpose()?,
+            where_clause: where_clause
+                .as_ref()
+                .map(|expr| bind_where_expr_variables(expr, variables))
+                .transpose()?,
+        },
+        Statement::Union { left, right, all } => Statement::Union {
+            left: Box::new(bind_statement_variables(left, variables)?),
+            right: Box::new(bind_statement_variables(right, variables)?),
+            all: *all,
+        },
+        other => other.clone(),
+    })
+}
+
+fn bind_insert_source_variables(
+    source: &InsertSource,
+    variables: &HashMap<String, Value>,
+) -> Result<InsertSource> {
+    Ok(match source {
+        InsertSource::Values(rows) => InsertSource::Values(
+            rows.iter()
+                .map(|row| {
+                    row.iter()
+                        .map(|value| resolve_runtime_value(value, variables))
+                        .collect::<Result<Vec<_>>>()
+                })
+                .collect::<Result<Vec<_>>>()?,
+        ),
+        InsertSource::Select(query) => {
+            InsertSource::Select(Box::new(bind_statement_variables(query, variables)?))
+        }
+    })
+}
+
+fn bind_select_columns_variables(
+    columns: &SelectColumns,
+    variables: &HashMap<String, Value>,
+) -> Result<SelectColumns> {
+    Ok(match columns {
+        SelectColumns::All => SelectColumns::All,
+        SelectColumns::Named(items) => SelectColumns::Named(
+            items.iter()
+                .map(|item| bind_select_item_variables(item, variables))
+                .collect::<Result<Vec<_>>>()?,
+        ),
+        SelectColumns::Aggregate(items) => SelectColumns::Aggregate(
+            items.iter()
+                .map(|item| bind_select_item_variables(item, variables))
+                .collect::<Result<Vec<_>>>()?,
+        ),
+    })
+}
+
+fn bind_select_item_variables(
+    item: &SelectItem,
+    variables: &HashMap<String, Value>,
+) -> Result<SelectItem> {
+    Ok(match item {
+        SelectItem::Column { name, alias } => SelectItem::Column {
+            name: name.clone(),
+            alias: alias.clone(),
+        },
+        SelectItem::Expression { expr, alias } => SelectItem::Expression {
+            expr: bind_expr_variables(expr, variables)?,
+            alias: alias.clone(),
+        },
+        SelectItem::Aggregate {
+            func,
+            column,
+            alias,
+        } => SelectItem::Aggregate {
+            func: func.clone(),
+            column: column.clone(),
+            alias: alias.clone(),
+        },
+    })
+}
+
+fn bind_expr_variables(expr: &Expr, variables: &HashMap<String, Value>) -> Result<Expr> {
+    Ok(match expr {
+        Expr::Value(value) => Expr::Value(resolve_runtime_value(value, variables)?),
+        Expr::Column(column) => Expr::Column(column.clone()),
+        Expr::Placeholder(index) => Expr::Placeholder(*index),
+        Expr::Variable(name) => Expr::Value(resolve_named_variable(name, variables)?),
+        Expr::CaseWhen {
+            conditions,
+            else_result,
+        } => Expr::CaseWhen {
+            conditions: conditions
+                .iter()
+                .map(|(condition, result)| {
+                    Ok((
+                        bind_where_expr_variables(condition, variables)?,
+                        bind_expr_variables(result, variables)?,
+                    ))
+                })
+                .collect::<Result<Vec<_>>>()?,
+            else_result: else_result
+                .as_ref()
+                .map(|expr| bind_expr_variables(expr, variables).map(Box::new))
+                .transpose()?,
+        },
+        Expr::WindowFunction {
+            func,
+            target_column,
+            partition_by,
+            order_by,
+        } => Expr::WindowFunction {
+            func: func.clone(),
+            target_column: target_column.clone(),
+            partition_by: partition_by.clone(),
+            order_by: order_by.clone(),
+        },
+    })
+}
+
+fn bind_where_expr_variables(
+    expr: &WhereExpr,
+    variables: &HashMap<String, Value>,
+) -> Result<WhereExpr> {
+    Ok(match expr {
+        WhereExpr::Comparison {
+            column,
+            operator,
+            value,
+        } => WhereExpr::Comparison {
+            column: column.clone(),
+            operator: operator.clone(),
+            value: resolve_runtime_value(value, variables)?,
+        },
+        WhereExpr::PlaceholderComparison {
+            column,
+            operator,
+            placeholder,
+        } => WhereExpr::PlaceholderComparison {
+            column: column.clone(),
+            operator: operator.clone(),
+            placeholder: *placeholder,
+        },
+        WhereExpr::ColumnComparison {
+            left,
+            operator,
+            right,
+        } => WhereExpr::ColumnComparison {
+            left: left.clone(),
+            operator: operator.clone(),
+            right: right.clone(),
+        },
+        WhereExpr::Between { column, low, high } => WhereExpr::Between {
+            column: column.clone(),
+            low: resolve_runtime_value(low, variables)?,
+            high: resolve_runtime_value(high, variables)?,
+        },
+        WhereExpr::Like { column, pattern } => WhereExpr::Like {
+            column: column.clone(),
+            pattern: pattern.clone(),
+        },
+        WhereExpr::IsNull { column, negated } => WhereExpr::IsNull {
+            column: column.clone(),
+            negated: *negated,
+        },
+        WhereExpr::InSubquery { column, subquery } => WhereExpr::InSubquery {
+            column: column.clone(),
+            subquery: Box::new(bind_statement_variables(subquery, variables)?),
+        },
+        WhereExpr::And(left, right) => WhereExpr::And(
+            Box::new(bind_where_expr_variables(left, variables)?),
+            Box::new(bind_where_expr_variables(right, variables)?),
+        ),
+        WhereExpr::Or(left, right) => WhereExpr::Or(
+            Box::new(bind_where_expr_variables(left, variables)?),
+            Box::new(bind_where_expr_variables(right, variables)?),
+        ),
+        WhereExpr::Not(inner) => {
+            WhereExpr::Not(Box::new(bind_where_expr_variables(inner, variables)?))
+        }
+    })
+}
+
+fn resolve_runtime_value(value: &Value, variables: &HashMap<String, Value>) -> Result<Value> {
+    match value {
+        Value::Variable(name) => resolve_named_variable(name, variables),
+        other => Ok(other.clone()),
+    }
+}
+
+fn resolve_named_variable(name: &str, variables: &HashMap<String, Value>) -> Result<Value> {
+    variables.get(name).cloned().ok_or_else(|| {
+        crate::error::FerrisDbError::InvalidCommand(format!("variable '{}' is not declared", name))
+    })
+}
+
 fn substitute_select_columns(columns: &SelectColumns, params: &HashMap<usize, Value>) -> Result<SelectColumns> {
     Ok(match columns {
         SelectColumns::All => SelectColumns::All,
@@ -2996,6 +3655,7 @@ fn substitute_expr(expr: &Expr, params: &HashMap<usize, Value>) -> Result<Expr> 
         Expr::Value(value) => Expr::Value(value.clone()),
         Expr::Column(column) => Expr::Column(column.clone()),
         Expr::Placeholder(index) => Expr::Value(resolve_placeholder(*index, params)?),
+        Expr::Variable(name) => Expr::Variable(name.clone()),
         Expr::CaseWhen {
             conditions,
             else_result,
@@ -3131,7 +3791,7 @@ fn materialized_rows(columns: &[String], rows: Vec<Vec<Value>>) -> Vec<Row> {
 
 fn validate_expr_columns(expr: &Expr, schema: &TableSchema) -> std::result::Result<(), String> {
     match expr {
-        Expr::Value(_) | Expr::Placeholder(_) => Ok(()),
+        Expr::Value(_) | Expr::Placeholder(_) | Expr::Variable(_) => Ok(()),
         Expr::Column(column) => {
             if schema.columns.iter().any(|item| item.name == *column) {
                 Ok(())
@@ -3202,6 +3862,7 @@ fn render_expr(expr: &Expr) -> String {
         Expr::Value(value) => render_value(value),
         Expr::Column(column) => column.clone(),
         Expr::Placeholder(index) => format!("${}", index),
+        Expr::Variable(name) => name.clone(),
         Expr::CaseWhen {
             conditions,
             else_result,
@@ -3276,6 +3937,7 @@ fn eval_expr_on_row(row: &Row, expr: &Expr) -> Value {
         Expr::Value(value) => value.clone(),
         Expr::Column(column) => row.get(column).cloned().unwrap_or(Value::Null),
         Expr::Placeholder(_) => Value::Null,
+        Expr::Variable(name) => row.get(name).cloned().unwrap_or(Value::Null),
         Expr::CaseWhen {
             conditions,
             else_result,
@@ -3507,6 +4169,98 @@ fn eval_where_expr<T: ValueLookup>(row: &T, where_clause: Option<&ResolvedWhereE
     }
 }
 
+fn evaluate_runtime_expr(expr: &Expr, variables: &HashMap<String, Value>) -> Result<Value> {
+    match expr {
+        Expr::Value(value) => resolve_runtime_value(value, variables),
+        Expr::Variable(name) => resolve_named_variable(name, variables),
+        Expr::Column(name) => resolve_named_variable(name, variables),
+        Expr::Placeholder(index) => Err(crate::error::FerrisDbError::InvalidCommand(format!(
+            "placeholder ${} is not supported in procedure runtime expression",
+            index
+        ))),
+        Expr::CaseWhen {
+            conditions,
+            else_result,
+        } => {
+            for (condition, result) in conditions {
+                if evaluate_runtime_condition(condition, variables)? {
+                    return evaluate_runtime_expr(result, variables);
+                }
+            }
+            if let Some(result) = else_result {
+                evaluate_runtime_expr(result, variables)
+            } else {
+                Ok(Value::Null)
+            }
+        }
+        Expr::WindowFunction { .. } => Ok(Value::Null),
+    }
+}
+
+fn evaluate_runtime_condition(
+    condition: &WhereExpr,
+    variables: &HashMap<String, Value>,
+) -> Result<bool> {
+    match condition {
+        WhereExpr::Comparison {
+            column,
+            operator,
+            value,
+        } => {
+            let left = resolve_named_variable(column, variables)?;
+            let right = resolve_runtime_value(value, variables)?;
+            Ok(compare_values(&left, &right, operator.clone()))
+        }
+        WhereExpr::PlaceholderComparison { .. } => Err(crate::error::FerrisDbError::InvalidCommand(
+            "placeholder comparison is not supported in procedure runtime condition".to_string(),
+        )),
+        WhereExpr::ColumnComparison {
+            left,
+            operator,
+            right,
+        } => {
+            let left_value = resolve_named_variable(left, variables)?;
+            let right_value = resolve_named_variable(right, variables)?;
+            Ok(compare_values(&left_value, &right_value, operator.clone()))
+        }
+        WhereExpr::Between { column, low, high } => {
+            let value = resolve_named_variable(column, variables)?;
+            let low = resolve_runtime_value(low, variables)?;
+            let high = resolve_runtime_value(high, variables)?;
+            Ok(compare_values(&value, &low, Operator::Ge)
+                && compare_values(&value, &high, Operator::Le))
+        }
+        WhereExpr::Like { column, pattern } => {
+            let value = resolve_named_variable(column, variables)?;
+            Ok(matches_like_pattern(&value, pattern))
+        }
+        WhereExpr::IsNull { column, negated } => {
+            let is_null = matches!(variables.get(column).unwrap_or(&Value::Null), Value::Null);
+            Ok(if *negated { !is_null } else { is_null })
+        }
+        WhereExpr::InSubquery { .. } => Err(crate::error::FerrisDbError::InvalidCommand(
+            "IN subquery is not supported in procedure runtime condition".to_string(),
+        )),
+        WhereExpr::And(left, right) => Ok(
+            evaluate_runtime_condition(left, variables)?
+                && evaluate_runtime_condition(right, variables)?,
+        ),
+        WhereExpr::Or(left, right) => Ok(
+            evaluate_runtime_condition(left, variables)?
+                || evaluate_runtime_condition(right, variables)?,
+        ),
+        WhereExpr::Not(inner) => Ok(!evaluate_runtime_condition(inner, variables)?),
+    }
+}
+
+fn default_value_for_data_type(data_type: &DataType) -> Value {
+    match data_type {
+        DataType::Int => Value::Int(0),
+        DataType::Text => Value::Text(String::new()),
+        DataType::Bool => Value::Bool(false),
+    }
+}
+
 fn compare_values(left: &Value, right: &Value, operator: Operator) -> bool {
     match operator {
         Operator::Eq => left == right,
@@ -3523,6 +4277,7 @@ fn compare_order(left: &Value, right: &Value) -> Option<std::cmp::Ordering> {
         (Value::Int(a), Value::Int(b)) => Some(a.cmp(b)),
         (Value::Text(a), Value::Text(b)) => Some(a.cmp(b)),
         (Value::Bool(a), Value::Bool(b)) => Some(a.cmp(b)),
+        (Value::Variable(a), Value::Variable(b)) => Some(a.cmp(b)),
         _ => None,
     }
 }
@@ -3541,6 +4296,7 @@ fn render_value(value: &Value) -> String {
         Value::Text(v) => v.clone(),
         Value::Bool(v) => v.to_string(),
         Value::Null => "NULL".to_string(),
+        Value::Variable(name) => name.clone(),
     }
 }
 
@@ -3686,6 +4442,7 @@ fn value_group_key(value: &Value) -> String {
         Value::Text(value) => format!("t:{}", value),
         Value::Bool(value) => format!("b:{}", value),
         Value::Null => "n:null".to_string(),
+        Value::Variable(name) => format!("v:{}", name),
     }
 }
 
@@ -3905,6 +4662,10 @@ fn encode_trigger_key(trigger_name: &str) -> Vec<u8> {
 }
 
 // 中文註解：使用者對特定表的權限 KV key 編碼
+fn encode_procedure_key(procedure_name: &str) -> Vec<u8> {
+    format!("{}{}", PROCEDURE_META_PREFIX, procedure_name).into_bytes()
+}
+
 fn encode_privilege_key(user: &str, table_name: &str) -> Vec<u8> {
     format!("{}{}", PRIVILEGE_META_PREFIX, format!("{}:{}", user, table_name)).into_bytes()
 }

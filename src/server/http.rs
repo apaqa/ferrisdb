@@ -753,6 +753,7 @@ fn sql_value_to_json(value: SqlValue) -> JsonValue {
         SqlValue::Text(value) => JsonValue::from(value),
         SqlValue::Bool(value) => JsonValue::from(value),
         SqlValue::Null => JsonValue::Null,
+        SqlValue::Variable(name) => JsonValue::from(name),
     }
 }
 

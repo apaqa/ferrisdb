@@ -7,7 +7,7 @@
 // - WHERE 撣????EFT JOIN?AVING 蝑?瘜?行迤蝣箏遣璅?
 use ferrisdb::sql::ast::{
     AggregateFunc, Assignment, CTE, ColumnDef, DataType, GroupByClause, InsertSource,
-    IsolationLevel, JoinClause, JoinType, Operator, OrderByClause, OrderDirection,
+    IsolationLevel, JoinClause, JoinType, Operator, OrderByClause, OrderDirection, ProcedureParam,
     SelectColumns, SelectItem, Statement, Value, WhereExpr,
 };
 use ferrisdb::sql::lexer::{Keyword, Lexer, Token};
@@ -906,6 +906,136 @@ fn test_parse_prepare_execute_deallocate_and_isolation_level() {
         parse_sql("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE;"),
         Statement::SetIsolationLevel {
             level: IsolationLevel::Serializable,
+        }
+    );
+}
+
+#[test]
+fn test_parse_create_call_and_drop_procedure() {
+    assert_eq!(
+        parse_sql(
+            "CREATE PROCEDURE add_user(user_id INT, user_name TEXT) BEGIN DECLARE i INT; SET i = user_id; INSERT INTO users VALUES (i, user_name); END;"
+        ),
+        Statement::CreateProcedure {
+            name: "add_user".to_string(),
+            params: vec![
+                ProcedureParam {
+                    name: "user_id".to_string(),
+                    data_type: DataType::Int,
+                },
+                ProcedureParam {
+                    name: "user_name".to_string(),
+                    data_type: DataType::Text,
+                },
+            ],
+            body: vec![
+                Statement::DeclareVariable {
+                    name: "i".to_string(),
+                    data_type: DataType::Int,
+                },
+                Statement::SetVariable {
+                    name: "i".to_string(),
+                    value: ferrisdb::sql::ast::Expr::Variable("user_id".to_string()),
+                },
+                Statement::Insert {
+                    table_name: "users".to_string(),
+                    source: InsertSource::Values(vec![vec![
+                        Value::Variable("i".to_string()),
+                        Value::Variable("user_name".to_string()),
+                    ]]),
+                },
+            ],
+        }
+    );
+
+    assert_eq!(
+        parse_sql("CALL add_user(1, 'Alice');"),
+        Statement::CallProcedure {
+            name: "add_user".to_string(),
+            args: vec![Value::Int(1), Value::Text("Alice".to_string())],
+        }
+    );
+
+    assert_eq!(
+        parse_sql("DROP PROCEDURE add_user;"),
+        Statement::DropProcedure {
+            name: "add_user".to_string(),
+        }
+    );
+}
+
+#[test]
+fn test_parse_if_while_and_cursor_statements() {
+    assert_eq!(
+        parse_sql(
+            "IF counter > 0 THEN SET counter = counter; ELSE SET counter = 0; END IF;"
+        ),
+        Statement::IfThenElse {
+            condition: WhereExpr::Comparison {
+                column: "counter".to_string(),
+                operator: Operator::Gt,
+                value: Value::Int(0),
+            },
+            then_body: vec![Statement::SetVariable {
+                name: "counter".to_string(),
+                value: ferrisdb::sql::ast::Expr::Variable("counter".to_string()),
+            }],
+            else_body: vec![Statement::SetVariable {
+                name: "counter".to_string(),
+                value: ferrisdb::sql::ast::Expr::Value(Value::Int(0)),
+            }],
+        }
+    );
+
+    assert_eq!(
+        parse_sql("WHILE counter < 3 DO SET counter = counter; END WHILE;"),
+        Statement::WhileDo {
+            condition: WhereExpr::Comparison {
+                column: "counter".to_string(),
+                operator: Operator::Lt,
+                value: Value::Int(3),
+            },
+            body: vec![Statement::SetVariable {
+                name: "counter".to_string(),
+                value: ferrisdb::sql::ast::Expr::Variable("counter".to_string()),
+            }],
+        }
+    );
+
+    assert_eq!(
+        parse_sql("DECLARE user_cursor CURSOR FOR SELECT id, name FROM users;"),
+        Statement::DeclareCursor {
+            name: "user_cursor".to_string(),
+            query: Box::new(Statement::Select {
+                ctes: vec![],
+                distinct: false,
+                table_name: "users".to_string(),
+                table_alias: None,
+                columns: SelectColumns::Named(vec![
+                    SelectItem::Column {
+                        name: "id".to_string(),
+                        alias: None,
+                    },
+                    SelectItem::Column {
+                        name: "name".to_string(),
+                        alias: None,
+                    },
+                ]),
+                join: None,
+                where_clause: None,
+                group_by: None,
+                having: None,
+                order_by: None,
+                limit: None,
+            }),
+        }
+    );
+
+    assert_eq!(
+        parse_sql("FETCH NEXT FROM user_cursor INTO id_var, name_var;"),
+        Statement::FetchCursor {
+            name: "user_cursor".to_string(),
+            variables: vec!["id_var".to_string(), "name_var".to_string()],
         }
     );
 }

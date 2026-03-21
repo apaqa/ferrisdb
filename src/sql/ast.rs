@@ -36,6 +36,11 @@ pub enum Statement {
         query_sql: String,
         query: Box<Statement>,
     },
+    CreateProcedure {
+        name: String,
+        params: Vec<ProcedureParam>,
+        body: Vec<Statement>,
+    },
     CreateTable {
         table_name: String,
         if_not_exists: bool,
@@ -57,6 +62,9 @@ pub enum Statement {
         view_name: String,
         if_exists: bool,
     },
+    DropProcedure {
+        name: String,
+    },
     CreateIndex {
         table_name: String,
         // 中文註解：索引現在可同時覆蓋多個欄位，保留欄位順序供前綴匹配使用。
@@ -70,6 +78,41 @@ pub enum Statement {
     Insert {
         table_name: String,
         source: InsertSource,
+    },
+    CallProcedure {
+        name: String,
+        args: Vec<Value>,
+    },
+    DeclareVariable {
+        name: String,
+        data_type: DataType,
+    },
+    DeclareCursor {
+        name: String,
+        query: Box<Statement>,
+    },
+    SetVariable {
+        name: String,
+        value: Expr,
+    },
+    IfThenElse {
+        condition: WhereExpr,
+        then_body: Vec<Statement>,
+        else_body: Vec<Statement>,
+    },
+    WhileDo {
+        condition: WhereExpr,
+        body: Vec<Statement>,
+    },
+    OpenCursor {
+        name: String,
+    },
+    FetchCursor {
+        name: String,
+        variables: Vec<String>,
+    },
+    CloseCursor {
+        name: String,
     },
     Select {
         // 中文註解：WITH 產生的 CTE 只在當前 SELECT / 查詢表達式內有效。
@@ -149,6 +192,12 @@ pub struct ColumnDef {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProcedureParam {
+    pub name: String,
+    pub data_type: DataType,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DataType {
     Int,
     Text,
@@ -161,6 +210,7 @@ pub enum Value {
     Text(String),
     Bool(bool),
     Null,
+    Variable(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -198,6 +248,7 @@ pub enum Expr {
     Value(Value),
     Column(String),
     Placeholder(usize),
+    Variable(String),
     CaseWhen {
         conditions: Vec<(WhereExpr, Expr)>,
         else_result: Option<Box<Expr>>,
