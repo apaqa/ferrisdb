@@ -146,6 +146,20 @@ struct ProcedureDefinition {
     body: Vec<Statement>,
 }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct FunctionDefinition {
+    name: String,
+    params: Vec<ProcedureParam>,
+    return_type: DataType,
+    body: Vec<Statement>,
+}
+
+#[derive(Debug, Clone)]
+struct TempTable {
+    schema: TableSchema,
+    rows: HashMap<String, Row>,
+}
+
 #[derive(Debug, Clone)]
 struct CursorState {
     query: Statement,
@@ -163,6 +177,7 @@ struct ProcedureContext {
 // 中文註解：觸發器 metadata 的 KV key 前綴
 const TRIGGER_META_PREFIX: &str = "__meta:trigger:";
 const PROCEDURE_META_PREFIX: &str = "__meta:procedure:";
+const FUNCTION_META_PREFIX: &str = "__meta:function:";
 // 中文註解：權限 metadata 的 KV key 前綴
 const PRIVILEGE_META_PREFIX: &str = "__meta:privilege:";
 
@@ -272,6 +287,8 @@ pub struct SqlExecutor {
     optimizer: Optimizer,
     plan_cache: Mutex<PlanCache>,
     cursors: Mutex<HashMap<String, CursorState>>,
+    // 中文註解：temporary table 僅存在目前 executor 的記憶體中。
+    temp_tables: Mutex<HashMap<String, TempTable>>,
     // 中文註解：目前 session 的使用者名稱；None 表示管理員模式（不做權限檢查）
     current_user: Mutex<Option<String>>,
 }
@@ -290,6 +307,7 @@ impl SqlExecutor {
             optimizer,
             plan_cache: Mutex::new(PlanCache::new(100)),
             cursors: Mutex::new(HashMap::new()),
+            temp_tables: Mutex::new(HashMap::new()),
             current_user: Mutex::new(None),
         }
     }
@@ -304,6 +322,29 @@ impl SqlExecutor {
             .lock()
             .expect("plan cache lock")
             .stats()
+    }
+
+    // 中文註解：先查 temporary table，再回退到持久化 catalog。
+    fn get_temp_table(&self, table_name: &str) -> Option<TempTable> {
+        self.temp_tables
+            .lock()
+            .expect("temp table lock")
+            .get(table_name)
+            .cloned()
+    }
+
+    fn insert_temp_table(&self, table: TempTable) {
+        self.temp_tables
+            .lock()
+            .expect("temp table lock")
+            .insert(table.schema.table_name.clone(), table);
+    }
+
+    fn remove_temp_table(&self, table_name: &str) -> Option<TempTable> {
+        self.temp_tables
+            .lock()
+            .expect("temp table lock")
+            .remove(table_name)
     }
 
     pub fn execute(&self, stmt: Statement) -> Result<ExecuteResult> {
@@ -328,6 +369,12 @@ impl SqlExecutor {
             Statement::CreateProcedure { name, params, body } => {
                 self.execute_create_procedure(name, params, body)
             }
+            Statement::CreateFunction {
+                name,
+                params,
+                return_type,
+                body,
+            } => self.execute_create_function(name, params, return_type, body),
             Statement::CreateView {
                 view_name,
                 query_sql,
@@ -340,12 +387,14 @@ impl SqlExecutor {
             } => self.execute_create_materialized_view(view_name, query_sql, *query),
             Statement::CreateTable {
                 table_name,
+                temporary,
                 if_not_exists,
                 columns,
                 foreign_keys,
                 check_constraints,
             } => self.execute_create_table(
                 table_name,
+                temporary,
                 if_not_exists,
                 columns,
                 foreign_keys,
@@ -360,8 +409,9 @@ impl SqlExecutor {
             } => self.execute_alter_table_drop_column(table_name, column_name),
             Statement::DropTable {
                 table_name,
+                temporary,
                 if_exists,
-            } => self.execute_drop_table(table_name, if_exists),
+            } => self.execute_drop_table(table_name, temporary, if_exists),
             Statement::DropView {
                 view_name,
                 if_exists,
@@ -371,6 +421,7 @@ impl SqlExecutor {
                 if_exists,
             } => self.execute_drop_materialized_view(view_name, if_exists),
             Statement::DropProcedure { name } => self.execute_drop_procedure(name),
+            Statement::DropFunction { name } => self.execute_drop_function(name),
             Statement::CreateIndex {
                 table_name,
                 column_names,
@@ -389,6 +440,9 @@ impl SqlExecutor {
                 let mut context = ProcedureContext::default();
                 self.execute_set_variable(&mut context, name, value)
             }
+            Statement::Return { .. } => Ok(ExecuteResult::Error {
+                message: "RETURN cannot be executed directly outside a function body".to_string(),
+            }),
             Statement::IfThenElse {
                 condition,
                 then_body,
@@ -532,6 +586,7 @@ impl SqlExecutor {
     fn execute_create_table(
         &self,
         table_name: String,
+        temporary: bool,
         if_not_exists: bool,
         columns: Vec<super::ast::ColumnDef>,
         foreign_keys: Vec<ForeignKey>,
@@ -543,12 +598,6 @@ impl SqlExecutor {
             });
         }
 
-        let mut txn = self.engine.begin_transaction();
-        if let Some(message) =
-            self.validate_foreign_keys_on_create(&txn, &table_name, &columns, &foreign_keys)?
-        {
-            return Ok(ExecuteResult::Error { message });
-        }
         let schema = TableSchema {
             table_name: table_name.clone(),
             columns,
@@ -556,6 +605,29 @@ impl SqlExecutor {
             check_constraints,
         };
         if let Some(message) = self.validate_check_constraints_on_create(&schema) {
+            return Ok(ExecuteResult::Error { message });
+        }
+
+        if temporary {
+            if self.get_temp_table(&table_name).is_some() {
+                if if_not_exists {
+                    return Ok(ExecuteResult::Created { table_name });
+                }
+                return Ok(ExecuteResult::Error {
+                    message: format!("table '{}' already exists", table_name),
+                });
+            }
+            self.insert_temp_table(TempTable {
+                schema,
+                rows: HashMap::new(),
+            });
+            return Ok(ExecuteResult::Created { table_name });
+        }
+
+        let mut txn = self.engine.begin_transaction();
+        if let Some(message) =
+            self.validate_foreign_keys_on_create(&txn, &table_name, &schema.columns, &schema.foreign_keys)?
+        {
             return Ok(ExecuteResult::Error { message });
         }
 
@@ -725,7 +797,21 @@ impl SqlExecutor {
         Ok(ExecuteResult::Altered { table_name })
     }
 
-    fn execute_drop_table(&self, table_name: String, if_exists: bool) -> Result<ExecuteResult> {
+    fn execute_drop_table(
+        &self,
+        table_name: String,
+        temporary: bool,
+        if_exists: bool,
+    ) -> Result<ExecuteResult> {
+        if temporary {
+            if self.remove_temp_table(&table_name).is_none() && !if_exists {
+                return Ok(ExecuteResult::Error {
+                    message: format!("temporary table '{}' does not exist", table_name),
+                });
+            }
+            return Ok(ExecuteResult::Dropped { table_name });
+        }
+
         let mut txn = self.engine.begin_transaction();
         let Some(schema) = self.catalog.get_table(&txn, &table_name)? else {
             if if_exists {
@@ -956,6 +1042,31 @@ impl SqlExecutor {
         Ok(ExecuteResult::ProcedureCreated { name })
     }
 
+    fn execute_create_function(
+        &self,
+        name: String,
+        params: Vec<ProcedureParam>,
+        return_type: DataType,
+        body: Vec<Statement>,
+    ) -> Result<ExecuteResult> {
+        let mut txn = self.engine.begin_transaction();
+        let key = encode_function_key(&name);
+        if txn.get(&key)?.is_some() {
+            return Ok(ExecuteResult::Error {
+                message: format!("function '{}' already exists", name),
+            });
+        }
+        let definition = FunctionDefinition {
+            name: name.clone(),
+            params,
+            return_type,
+            body,
+        };
+        txn.put(key, serde_json::to_vec(&definition)?)?;
+        txn.commit()?;
+        Ok(ExecuteResult::Created { table_name: name })
+    }
+
     fn execute_drop_procedure(&self, name: String) -> Result<ExecuteResult> {
         let mut txn = self.engine.begin_transaction();
         let key = encode_procedure_key(&name);
@@ -967,6 +1078,19 @@ impl SqlExecutor {
         txn.delete(&key)?;
         txn.commit()?;
         Ok(ExecuteResult::ProcedureDropped { name })
+    }
+
+    fn execute_drop_function(&self, name: String) -> Result<ExecuteResult> {
+        let mut txn = self.engine.begin_transaction();
+        let key = encode_function_key(&name);
+        if txn.get(&key)?.is_none() {
+            return Ok(ExecuteResult::Error {
+                message: format!("function '{}' does not exist", name),
+            });
+        }
+        txn.delete(&key)?;
+        txn.commit()?;
+        Ok(ExecuteResult::Dropped { table_name: name })
     }
 
     fn execute_call_procedure(&self, name: String, args: Vec<Value>) -> Result<ExecuteResult> {
@@ -1006,6 +1130,324 @@ impl SqlExecutor {
             .as_deref()
             .map(serde_json::from_slice)
             .transpose()?)
+    }
+
+    fn load_function_definition(&self, name: &str) -> Result<Option<FunctionDefinition>> {
+        let txn = self.engine.begin_transaction();
+        Ok(txn
+            .get(&encode_function_key(name))?
+            .as_deref()
+            .map(serde_json::from_slice)
+            .transpose()?)
+    }
+
+    fn execute_function_call_from_lookup<T: ValueLookup>(
+        &self,
+        name: &str,
+        args: &[Expr],
+        row: &T,
+    ) -> Result<Value> {
+        let Some(definition) = self.load_function_definition(name)? else {
+            return Err(crate::error::FerrisDbError::InvalidCommand(format!(
+                "function '{}' does not exist",
+                name
+            )));
+        };
+        if definition.params.len() != args.len() {
+            return Err(crate::error::FerrisDbError::InvalidCommand(format!(
+                "function '{}' expects {} arguments, got {}",
+                name,
+                definition.params.len(),
+                args.len()
+            )));
+        }
+
+        let mut variables = HashMap::new();
+        for (param, arg) in definition.params.iter().zip(args.iter()) {
+            variables.insert(
+                param.name.clone(),
+                self.evaluate_expr_on_lookup(row, arg)?,
+            );
+        }
+        self.execute_function_body(&definition, &mut variables)
+    }
+
+    fn execute_function_body(
+        &self,
+        definition: &FunctionDefinition,
+        variables: &mut HashMap<String, Value>,
+    ) -> Result<Value> {
+        for statement in &definition.body {
+            if let Some(value) = self.execute_function_statement(statement, variables)? {
+                return Ok(value);
+            }
+        }
+        Err(crate::error::FerrisDbError::InvalidCommand(format!(
+            "function '{}' ended without RETURN",
+            definition.name
+        )))
+    }
+
+    fn execute_function_statement(
+        &self,
+        statement: &Statement,
+        variables: &mut HashMap<String, Value>,
+    ) -> Result<Option<Value>> {
+        match statement {
+            Statement::DeclareVariable { name, data_type } => {
+                variables.insert(name.clone(), default_value_for_data_type(data_type));
+                Ok(None)
+            }
+            Statement::SetVariable { name, value } => {
+                let resolved = self.evaluate_function_runtime_expr(value, variables)?;
+                variables.insert(name.clone(), resolved);
+                Ok(None)
+            }
+            Statement::IfThenElse {
+                condition,
+                then_body,
+                else_body,
+            } => {
+                let branch = if self.evaluate_function_runtime_condition(condition, variables)? {
+                    then_body
+                } else {
+                    else_body
+                };
+                for stmt in branch {
+                    if let Some(value) = self.execute_function_statement(stmt, variables)? {
+                        return Ok(Some(value));
+                    }
+                }
+                Ok(None)
+            }
+            Statement::WhileDo { condition, body } => {
+                while self.evaluate_function_runtime_condition(condition, variables)? {
+                    for stmt in body {
+                        if let Some(value) = self.execute_function_statement(stmt, variables)? {
+                            return Ok(Some(value));
+                        }
+                    }
+                }
+                Ok(None)
+            }
+            Statement::Return { expr } => Ok(Some(self.evaluate_function_runtime_expr(expr, variables)?)),
+            other => Err(crate::error::FerrisDbError::InvalidCommand(format!(
+                "statement '{:?}' is not supported inside function body",
+                other
+            ))),
+        }
+    }
+
+    fn evaluate_function_runtime_expr(
+        &self,
+        expr: &Expr,
+        variables: &HashMap<String, Value>,
+    ) -> Result<Value> {
+        match expr {
+            Expr::Value(value) => resolve_runtime_value(value, variables),
+            Expr::Variable(name) | Expr::Column(name) => resolve_named_variable(name, variables),
+            Expr::Placeholder(index) => Err(crate::error::FerrisDbError::InvalidCommand(format!(
+                "placeholder ${} is not supported in function runtime expression",
+                index
+            ))),
+            Expr::JsonExtract { .. } | Expr::JsonSet { .. } => Err(
+                crate::error::FerrisDbError::InvalidCommand(
+                    "JSON functions are not supported in function runtime expression".to_string(),
+                ),
+            ),
+            Expr::CaseWhen {
+                conditions,
+                else_result,
+            } => {
+                for (condition, result) in conditions {
+                    if self.evaluate_function_runtime_condition(condition, variables)? {
+                        return self.evaluate_function_runtime_expr(result, variables);
+                    }
+                }
+                if let Some(result) = else_result {
+                    self.evaluate_function_runtime_expr(result, variables)
+                } else {
+                    Ok(Value::Null)
+                }
+            }
+            Expr::WindowFunction { .. } => Ok(Value::Null),
+            Expr::FunctionCall { name, args } => {
+                let empty_row = ProjectedRow { columns: Vec::new() };
+                let resolved_args = args
+                    .iter()
+                    .map(|arg| self.evaluate_function_runtime_expr(arg, variables))
+                    .collect::<Result<Vec<_>>>()?;
+                let expr_args = resolved_args
+                    .into_iter()
+                    .map(Expr::Value)
+                    .collect::<Vec<_>>();
+                self.execute_function_call_from_lookup(name, &expr_args, &empty_row)
+            }
+        }
+    }
+
+    fn evaluate_function_runtime_condition(
+        &self,
+        condition: &WhereExpr,
+        variables: &HashMap<String, Value>,
+    ) -> Result<bool> {
+        match condition {
+            WhereExpr::Comparison {
+                column,
+                operator,
+                value,
+            } => Ok(compare_values(
+                &resolve_named_variable(column, variables)?,
+                &resolve_runtime_value(value, variables)?,
+                operator.clone(),
+            )),
+            WhereExpr::PlaceholderComparison { .. } => Err(crate::error::FerrisDbError::InvalidCommand(
+                "placeholder comparison is not supported in function runtime condition".to_string(),
+            )),
+            WhereExpr::ColumnComparison {
+                left,
+                operator,
+                right,
+            } => Ok(compare_values(
+                &resolve_named_variable(left, variables)?,
+                &resolve_named_variable(right, variables)?,
+                operator.clone(),
+            )),
+            WhereExpr::Between { column, low, high } => {
+                let value = resolve_named_variable(column, variables)?;
+                let low = resolve_runtime_value(low, variables)?;
+                let high = resolve_runtime_value(high, variables)?;
+                Ok(compare_values(&value, &low, Operator::Ge)
+                    && compare_values(&value, &high, Operator::Le))
+            }
+            WhereExpr::Like { column, pattern } => {
+                Ok(matches_like_pattern(&resolve_named_variable(column, variables)?, pattern))
+            }
+            WhereExpr::IsNull { column, negated } => {
+                let is_null = matches!(variables.get(column).unwrap_or(&Value::Null), Value::Null);
+                Ok(if *negated { !is_null } else { is_null })
+            }
+            WhereExpr::ExprComparison {
+                left,
+                operator,
+                right,
+            } => Ok(compare_values(
+                &self.evaluate_function_runtime_expr(left, variables)?,
+                &self.evaluate_function_runtime_expr(right, variables)?,
+                operator.clone(),
+            )),
+            WhereExpr::InSubquery { .. } => Err(crate::error::FerrisDbError::InvalidCommand(
+                "IN subquery is not supported in function runtime condition".to_string(),
+            )),
+            WhereExpr::And(left, right) => Ok(
+                self.evaluate_function_runtime_condition(left, variables)?
+                    && self.evaluate_function_runtime_condition(right, variables)?,
+            ),
+            WhereExpr::Or(left, right) => Ok(
+                self.evaluate_function_runtime_condition(left, variables)?
+                    || self.evaluate_function_runtime_condition(right, variables)?,
+            ),
+            WhereExpr::Not(inner) => Ok(!self.evaluate_function_runtime_condition(inner, variables)?),
+        }
+    }
+
+    fn evaluate_expr_on_lookup<T: ValueLookup>(&self, row: &T, expr: &Expr) -> Result<Value> {
+        match expr {
+            Expr::Value(value) => Ok(value.clone()),
+            Expr::Column(column) | Expr::Variable(column) => {
+                Ok(row.lookup(column).cloned().unwrap_or(Value::Null))
+            }
+            Expr::Placeholder(_) => Ok(Value::Null),
+            Expr::JsonExtract { column, path } => Ok(row
+                .lookup(column)
+                .map(|value| json_extract_value(value, path))
+                .unwrap_or(Value::Null)),
+            Expr::JsonSet { column, path, value } => Ok(row
+                .lookup(column)
+                .map(|current| {
+                    json_set_value(
+                        current,
+                        path,
+                        &self.evaluate_expr_on_lookup(row, value).unwrap_or(Value::Null),
+                    )
+                })
+                .unwrap_or(Value::Null)),
+            Expr::CaseWhen {
+                conditions,
+                else_result,
+            } => {
+                for (condition, result) in conditions {
+                    if self.evaluate_where_on_lookup(row, condition)? {
+                        return self.evaluate_expr_on_lookup(row, result);
+                    }
+                }
+                if let Some(result) = else_result {
+                    self.evaluate_expr_on_lookup(row, result)
+                } else {
+                    Ok(Value::Null)
+                }
+            }
+            Expr::WindowFunction { .. } => Ok(Value::Null),
+            Expr::FunctionCall { name, args } => self.execute_function_call_from_lookup(name, args, row),
+        }
+    }
+
+    fn evaluate_where_on_lookup<T: ValueLookup>(&self, row: &T, expr: &WhereExpr) -> Result<bool> {
+        match expr {
+            WhereExpr::Comparison {
+                column,
+                operator,
+                value,
+            } => Ok(compare_values(
+                row.lookup(column).unwrap_or(&Value::Null),
+                value,
+                operator.clone(),
+            )),
+            WhereExpr::PlaceholderComparison { .. } => Ok(false),
+            WhereExpr::ColumnComparison {
+                left,
+                operator,
+                right,
+            } => Ok(compare_values(
+                row.lookup(left).unwrap_or(&Value::Null),
+                row.lookup(right).unwrap_or(&Value::Null),
+                operator.clone(),
+            )),
+            WhereExpr::Between { column, low, high } => Ok(row.lookup(column).is_some_and(|value| {
+                compare_values(value, low, Operator::Ge) && compare_values(value, high, Operator::Le)
+            })),
+            WhereExpr::Like { column, pattern } => Ok(row
+                .lookup(column)
+                .is_some_and(|value| matches_like_pattern(value, pattern))),
+            WhereExpr::IsNull { column, negated } => {
+                let is_null = row.lookup(column).is_none_or(|value| matches!(value, Value::Null));
+                Ok(if *negated { !is_null } else { is_null })
+            }
+            WhereExpr::ExprComparison {
+                left,
+                operator,
+                right,
+            } => Ok(compare_values(
+                &self.evaluate_expr_on_lookup(row, left)?,
+                &self.evaluate_expr_on_lookup(row, right)?,
+                operator.clone(),
+            )),
+            WhereExpr::InSubquery { .. } => Err(crate::error::FerrisDbError::InvalidCommand(
+                "IN subquery with UDF-aware evaluation is not supported here".to_string(),
+            )),
+            WhereExpr::And(left, right) => Ok(
+                self.evaluate_where_on_lookup(row, left)? && self.evaluate_where_on_lookup(row, right)?,
+            ),
+            WhereExpr::Or(left, right) => Ok(
+                self.evaluate_where_on_lookup(row, left)? || self.evaluate_where_on_lookup(row, right)?,
+            ),
+            WhereExpr::Not(inner) => Ok(!self.evaluate_where_on_lookup(row, inner)?),
+        }
+    }
+
+    fn evaluate_expr_without_row(&self, expr: &Expr) -> Result<Value> {
+        let empty_row = ProjectedRow { columns: Vec::new() };
+        self.evaluate_expr_on_lookup(&empty_row, expr)
     }
 
     fn execute_block(
@@ -1440,6 +1882,10 @@ impl SqlExecutor {
     }
 
     fn execute_insert(&self, table_name: String, source: InsertSource) -> Result<ExecuteResult> {
+        if let Some(temp_table) = self.get_temp_table(&table_name) {
+            return self.execute_insert_into_temp_table(temp_table, table_name, source);
+        }
+
         let mut txn = self.engine.begin_transaction();
         let Some(schema) = self.catalog.get_table(&txn, &table_name)? else {
             return Ok(ExecuteResult::Error {
@@ -1448,7 +1894,7 @@ impl SqlExecutor {
         };
 
         let rows = match source {
-            InsertSource::Values(rows) => rows,
+            InsertSource::Values(rows) => self.evaluate_insert_rows(&rows)?,
             InsertSource::Select(statement) => {
                 let result = self.execute(*statement)?;
                 let ExecuteResult::Selected { rows, .. } = result else {
@@ -1624,11 +2070,50 @@ impl SqlExecutor {
         };
         let txn = self.engine.begin_transaction();
         let cte_scope = self.materialize_ctes(&ctes)?;
+        if table_name.is_empty() {
+            let schema = TableSchema {
+                table_name: String::new(),
+                columns: Vec::new(),
+                foreign_keys: Vec::new(),
+                check_constraints: Vec::new(),
+            };
+            return self.execute_select_from_materialized_rows(
+                &txn,
+                schema,
+                vec![Row::new(Vec::new())],
+                distinct,
+                table_alias,
+                columns,
+                join,
+                where_clause,
+                group_by,
+                having,
+                order_by,
+                limit,
+            );
+        }
         if let Some(relation) = cte_scope.get(&table_name) {
             return self.execute_select_from_materialized_rows(
                 &txn,
                 relation.schema.clone(),
                 relation.rows.clone(),
+                distinct,
+                table_alias,
+                columns,
+                join,
+                where_clause,
+                group_by,
+                having,
+                order_by,
+                limit,
+            );
+        }
+        if let Some(temp_table) = self.get_temp_table(&table_name) {
+            let rows = temp_table.rows.into_values().collect();
+            return self.execute_select_from_materialized_rows(
+                &txn,
+                temp_table.schema,
+                rows,
                 distinct,
                 table_alias,
                 columns,
@@ -1746,11 +2231,39 @@ impl SqlExecutor {
             Err(message) => return Ok(ExecuteResult::Error { message }),
         };
 
-        let mut rows: Vec<Row> = self
-            .fetch_rows_for_select(&txn, &schema, where_clause.as_ref(), optimized_plan.as_ref())?
-            .into_iter()
-            .map(|(_, row)| row)
-            .collect();
+        let uses_udf = where_clause
+            .as_ref()
+            .is_some_and(where_expr_contains_function_call)
+            || select_columns_contain_function_call(&columns)
+            || order_by
+                .as_ref()
+                .and_then(|order| order.expr.as_ref())
+                .is_some_and(expr_contains_function_call);
+        let mut rows: Vec<Row> = if uses_udf {
+            let mut filtered = Vec::new();
+            for (_, row) in self.scan_rows(&txn, &schema)? {
+                let matches = match where_clause.as_ref() {
+                    Some(expr) => match self.evaluate_where_on_lookup(&row, expr) {
+                        Ok(matches) => matches,
+                        Err(message) => {
+                            return Ok(ExecuteResult::Error {
+                                message: message.to_string(),
+                            })
+                        }
+                    },
+                    None => true,
+                };
+                if matches {
+                    filtered.push(row);
+                }
+            }
+            filtered
+        } else {
+            self.fetch_rows_for_select(&txn, &schema, where_clause.as_ref(), optimized_plan.as_ref())?
+                .into_iter()
+                .map(|(_, row)| row)
+                .collect()
+        };
         if let Some(order_by) = order_by.as_ref() {
             if order_by.expr.is_some() {
                 sort_plain_rows_by_order_expr(&mut rows, order_by);
@@ -1761,24 +2274,36 @@ impl SqlExecutor {
             .map(|item| item.header.clone())
             .collect::<Vec<_>>();
         let window_values = build_window_projection_values(&rows, &projection)?;
-        let mut selected = rows
+        let selected = rows
             .iter()
             .enumerate()
             .map(|(row_index, row)| {
                 projection
                     .iter()
                     .enumerate()
-                    .map(|(projection_index, column)| {
-                        evaluate_projection_value(
-                            row,
-                            column,
-                            window_values.get(projection_index),
-                            row_index,
-                        )
+                    .map(|(projection_index, column)| match &column.kind {
+                        ProjectionKind::Expression(Expr::WindowFunction { .. }) => Ok(
+                            window_values
+                                .get(projection_index)
+                                .and_then(|values| values.get(row_index).cloned())
+                                .unwrap_or(Value::Null),
+                        ),
+                        ProjectionKind::Column(name) => {
+                            Ok(row.get(name).cloned().unwrap_or(Value::Null))
+                        }
+                        ProjectionKind::Expression(expr) => self.evaluate_expr_on_lookup(row, expr),
                     })
-                    .collect::<Vec<_>>()
+                    .collect::<Result<Vec<_>>>()
             })
-            .collect::<Vec<_>>();
+            .collect::<Result<Vec<_>>>();
+        let mut selected = match selected {
+            Ok(rows) => rows,
+            Err(message) => {
+                return Ok(ExecuteResult::Error {
+                    message: message.to_string(),
+                })
+            }
+        };
         if distinct {
             dedup_selected_rows(&mut selected);
         }
@@ -2028,8 +2553,6 @@ impl SqlExecutor {
                 .map(|expr| normalize_expr(expr, table_alias.as_deref(), &table_name)),
             direction: order.direction,
         });
-        let resolved_where = self.resolve_where_expr(where_clause.as_ref())?;
-
         if let Some(join_clause) = join {
             return self.execute_join_select_from_rows(
                 txn,
@@ -2056,9 +2579,24 @@ impl SqlExecutor {
                     Ok(columns) => columns,
                     Err(message) => return Ok(ExecuteResult::Error { message }),
                 };
+            let mut prefiltered = Vec::new();
+            for row in source_rows {
+                match where_clause.as_ref() {
+                    Some(expr) => match self.evaluate_where_on_lookup(&row, expr) {
+                        Ok(true) => prefiltered.push(row),
+                        Ok(false) => {}
+                        Err(message) => {
+                            return Ok(ExecuteResult::Error {
+                                message: message.to_string(),
+                            })
+                        }
+                    },
+                    None => prefiltered.push(row),
+                }
+            }
             let mut selected = Vec::new();
             for (_, group_rows) in group_rows(
-                filtered_rows(source_rows, resolved_where.as_ref()),
+                prefiltered,
                 group_by.as_ref(),
             ) {
                 let mut output_row = Vec::with_capacity(items.len());
@@ -2101,31 +2639,59 @@ impl SqlExecutor {
             .iter()
             .map(|item| item.header.clone())
             .collect::<Vec<_>>();
-        let mut filtered = filtered_rows(source_rows, resolved_where.as_ref());
+        let mut filtered = Vec::new();
+        for row in source_rows {
+            let matches = match where_clause.as_ref() {
+                Some(expr) => match self.evaluate_where_on_lookup(&row, expr) {
+                    Ok(matches) => matches,
+                    Err(message) => {
+                        return Ok(ExecuteResult::Error {
+                            message: message.to_string(),
+                        })
+                    }
+                },
+                None => true,
+            };
+            if matches {
+                filtered.push(row);
+            }
+        }
         if let Some(order_by) = order_by.as_ref() {
             if order_by.expr.is_some() {
                 sort_plain_rows_by_order_expr(&mut filtered, order_by);
             }
         }
         let window_values = build_window_projection_values(&filtered, &projection)?;
-        let mut selected = filtered
+        let selected = filtered
             .iter()
             .enumerate()
             .map(|(row_index, row)| {
                 projection
                     .iter()
                     .enumerate()
-                    .map(|(projection_index, column)| {
-                        evaluate_projection_value(
-                            row,
-                            column,
-                            window_values.get(projection_index),
-                            row_index,
-                        )
+                    .map(|(projection_index, column)| match &column.kind {
+                        ProjectionKind::Expression(Expr::WindowFunction { .. }) => Ok(
+                            window_values
+                                .get(projection_index)
+                                .and_then(|values| values.get(row_index).cloned())
+                                .unwrap_or(Value::Null),
+                        ),
+                        ProjectionKind::Column(name) => {
+                            Ok(row.get(name).cloned().unwrap_or(Value::Null))
+                        }
+                        ProjectionKind::Expression(expr) => self.evaluate_expr_on_lookup(row, expr),
                     })
-                    .collect::<Vec<_>>()
-            })
-            .collect::<Vec<_>>();
+                    .collect::<Result<Vec<_>>>()
+                })
+            .collect::<Result<Vec<_>>>();
+        let mut selected = match selected {
+            Ok(rows) => rows,
+            Err(message) => {
+                return Ok(ExecuteResult::Error {
+                    message: message.to_string(),
+                })
+            }
+        };
         if distinct {
             dedup_selected_rows(&mut selected);
         }
@@ -2262,6 +2828,16 @@ impl SqlExecutor {
         join_condition: Option<WhereExpr>,
         where_clause: Option<WhereExpr>,
     ) -> Result<ExecuteResult> {
+        if self.get_temp_table(&table_name).is_some() {
+            return self.execute_update_temp_table(
+                table_name,
+                assignments,
+                from_table,
+                join_condition,
+                where_clause,
+            );
+        }
+
         let mut txn = self.engine.begin_transaction();
         let Some(schema) = self.catalog.get_table(&txn, &table_name)? else {
             return Ok(ExecuteResult::Error {
@@ -2422,6 +2998,10 @@ impl SqlExecutor {
         join_condition: Option<WhereExpr>,
         where_clause: Option<WhereExpr>,
     ) -> Result<ExecuteResult> {
+        if self.get_temp_table(&table_name).is_some() {
+            return self.execute_delete_temp_table(table_name, using_table, join_condition, where_clause);
+        }
+
         let mut txn = self.engine.begin_transaction();
         let Some(schema) = self.catalog.get_table(&txn, &table_name)? else {
             return Ok(ExecuteResult::Error {
@@ -2860,6 +3440,144 @@ impl SqlExecutor {
             txn.put(encode_row_key(view_name, &pk), serde_json::to_vec(&row)?)?;
         }
         Ok(())
+    }
+
+    // 中文註解：INSERT ... VALUES 先把 expression 求值成實際值，讓 UDF 也能放進 VALUES。
+    fn evaluate_insert_rows(&self, rows: &[Vec<Expr>]) -> Result<Vec<Vec<Value>>> {
+        rows.iter()
+            .map(|row| {
+                row.iter()
+                    .map(|expr| self.evaluate_expr_without_row(expr))
+                    .collect::<Result<Vec<_>>>()
+            })
+            .collect::<Result<Vec<_>>>()
+    }
+
+    fn execute_insert_into_temp_table(
+        &self,
+        temp_table: TempTable,
+        table_name: String,
+        source: InsertSource,
+    ) -> Result<ExecuteResult> {
+        let rows = match source {
+            InsertSource::Values(rows) => self.evaluate_insert_rows(&rows)?,
+            InsertSource::Select(statement) => {
+                let result = self.execute(*statement)?;
+                let ExecuteResult::Selected { rows, .. } = result else {
+                    return Ok(ExecuteResult::Error {
+                        message: "INSERT INTO SELECT requires a SELECT-compatible source"
+                            .to_string(),
+                    });
+                };
+                rows
+            }
+        };
+
+        let mut guard = self.temp_tables.lock().expect("temp table lock");
+        let Some(current) = guard.get_mut(&table_name) else {
+            return Ok(ExecuteResult::Error {
+                message: format!("table '{}' does not exist", table_name),
+            });
+        };
+
+        let schema = temp_table.schema;
+        let mut inserted = 0;
+        for row_values in rows {
+            if row_values.len() != schema.columns.len() {
+                return Ok(ExecuteResult::Error {
+                    message: format!(
+                        "table '{}' expects {} values, got {}",
+                        table_name,
+                        schema.columns.len(),
+                        row_values.len()
+                    ),
+                });
+            }
+            let pk_value = row_values[0].clone();
+            if matches!(pk_value, Value::Null) {
+                return Ok(ExecuteResult::Error {
+                    message: "primary key cannot be NULL".to_string(),
+                });
+            }
+            let pk = render_value(&pk_value);
+            if current.rows.contains_key(&pk) {
+                return Ok(ExecuteResult::Error {
+                    message: format!("duplicate primary key '{}' for table '{}'", pk, table_name),
+                });
+            }
+            let row = Row::new(
+                schema
+                    .columns
+                    .iter()
+                    .map(|column| column.name.clone())
+                    .zip(row_values.into_iter())
+                    .collect(),
+            );
+            current.rows.insert(pk, row);
+            inserted += 1;
+        }
+        Ok(ExecuteResult::Inserted { count: inserted })
+    }
+
+    fn execute_update_temp_table(
+        &self,
+        table_name: String,
+        assignments: Vec<Assignment>,
+        from_table: Option<String>,
+        _join_condition: Option<WhereExpr>,
+        where_clause: Option<WhereExpr>,
+    ) -> Result<ExecuteResult> {
+        if from_table.is_some() {
+            return Ok(ExecuteResult::Error {
+                message: "UPDATE ... FROM is not supported for temporary tables".to_string(),
+            });
+        }
+
+        let mut guard = self.temp_tables.lock().expect("temp table lock");
+        let Some(table) = guard.get_mut(&table_name) else {
+            return Ok(ExecuteResult::Error {
+                message: format!("table '{}' does not exist", table_name),
+            });
+        };
+        let resolved_where = self.resolve_where_expr(where_clause.as_ref())?;
+        let mut updated = 0;
+        for row in table.rows.values_mut() {
+            if !eval_where_expr(row, resolved_where.as_ref()) {
+                continue;
+            }
+            for assignment in &assignments {
+                row.set(&assignment.column, assignment.value.clone());
+            }
+            updated += 1;
+        }
+        Ok(ExecuteResult::Updated { count: updated })
+    }
+
+    fn execute_delete_temp_table(
+        &self,
+        table_name: String,
+        using_table: Option<String>,
+        _join_condition: Option<WhereExpr>,
+        where_clause: Option<WhereExpr>,
+    ) -> Result<ExecuteResult> {
+        if using_table.is_some() {
+            return Ok(ExecuteResult::Error {
+                message: "DELETE ... USING is not supported for temporary tables".to_string(),
+            });
+        }
+
+        let mut guard = self.temp_tables.lock().expect("temp table lock");
+        let Some(table) = guard.get_mut(&table_name) else {
+            return Ok(ExecuteResult::Error {
+                message: format!("table '{}' does not exist", table_name),
+            });
+        };
+        let resolved_where = self.resolve_where_expr(where_clause.as_ref())?;
+        let before = table.rows.len();
+        table.rows.retain(|_, row| !eval_where_expr(row, resolved_where.as_ref()));
+        Ok(ExecuteResult::Deleted {
+            count: before - table.rows.len(),
+        })
     }
 
     fn insert_rows_into_table(
@@ -3460,6 +4178,13 @@ fn normalize_expr(expr: Expr, table_alias: Option<&str>, table_name: &str) -> Ex
                 )
             }),
         },
+        Expr::FunctionCall { name, args } => Expr::FunctionCall {
+            name,
+            args: args
+                .into_iter()
+                .map(|arg| normalize_expr(arg, table_alias, table_name))
+                .collect(),
+        },
     }
 }
 
@@ -3664,6 +4389,7 @@ struct MaterializedRelation {
     rows: Vec<Row>,
 }
 
+#[allow(dead_code)]
 fn filtered_rows(rows: Vec<Row>, where_clause: Option<&ResolvedWhereExpr>) -> Vec<Row> {
     rows.into_iter()
         .filter(|row| eval_where_expr(row, where_clause))
@@ -3920,7 +4646,7 @@ fn bind_insert_source_variables(
             rows.iter()
                 .map(|row| {
                     row.iter()
-                        .map(|value| resolve_runtime_value(value, variables))
+                        .map(|expr| bind_expr_variables(expr, variables))
                         .collect::<Result<Vec<_>>>()
                 })
                 .collect::<Result<Vec<_>>>()?,
@@ -3978,7 +4704,11 @@ fn bind_select_item_variables(
 fn bind_expr_variables(expr: &Expr, variables: &HashMap<String, Value>) -> Result<Expr> {
     Ok(match expr {
         Expr::Value(value) => Expr::Value(resolve_runtime_value(value, variables)?),
-        Expr::Column(column) => Expr::Column(column.clone()),
+        // 中文註解：在 procedure/function runtime 綁定階段，若欄位名同時是區域變數，優先解析成變數值。
+        Expr::Column(column) => match variables.get(column) {
+            Some(value) => Expr::Value(value.clone()),
+            None => Expr::Column(column.clone()),
+        },
         Expr::Placeholder(index) => Expr::Placeholder(*index),
         Expr::Variable(name) => Expr::Value(resolve_named_variable(name, variables)?),
         Expr::JsonExtract { column, path } => Expr::JsonExtract {
@@ -4022,6 +4752,13 @@ fn bind_expr_variables(expr: &Expr, variables: &HashMap<String, Value>) -> Resul
             target_column: target_column.clone(),
             partition_by: partition_by.clone(),
             order_by: order_by.clone(),
+        },
+        Expr::FunctionCall { name, args } => Expr::FunctionCall {
+            name: name.clone(),
+            args: args
+                .iter()
+                .map(|arg| bind_expr_variables(arg, variables))
+                .collect::<Result<Vec<_>>>()?,
         },
     })
 }
@@ -4197,6 +4934,13 @@ fn substitute_expr(expr: &Expr, params: &HashMap<usize, Value>) -> Result<Expr> 
             partition_by: partition_by.clone(),
             order_by: order_by.clone(),
         },
+        Expr::FunctionCall { name, args } => Expr::FunctionCall {
+            name: name.clone(),
+            args: args
+                .iter()
+                .map(|arg| substitute_expr(arg, params))
+                .collect::<Result<Vec<_>>>()?,
+        },
     })
 }
 
@@ -4357,6 +5101,12 @@ fn validate_expr_columns(expr: &Expr, schema: &TableSchema) -> std::result::Resu
             }
             Ok(())
         }
+        Expr::FunctionCall { args, .. } => {
+            for arg in args {
+                validate_expr_columns(arg, schema)?;
+            }
+            Ok(())
+        }
     }
 }
 
@@ -4450,9 +5200,55 @@ fn render_expr(expr: &Expr) -> String {
             }
             format!("{} OVER ({})", func_str, over_parts.join(" "))
         }
+        Expr::FunctionCall { name, args } => format!(
+            "{}({})",
+            name,
+            args.iter().map(render_expr).collect::<Vec<_>>().join(", ")
+        ),
     }
 }
 
+fn select_columns_contain_function_call(columns: &SelectColumns) -> bool {
+    match columns {
+        SelectColumns::All => false,
+        SelectColumns::Named(items) | SelectColumns::Aggregate(items) => items.iter().any(|item| {
+            matches!(item, SelectItem::Expression { expr, .. } if expr_contains_function_call(expr))
+        }),
+    }
+}
+
+fn where_expr_contains_function_call(expr: &WhereExpr) -> bool {
+    match expr {
+        WhereExpr::ExprComparison { left, right, .. } => {
+            expr_contains_function_call(left) || expr_contains_function_call(right)
+        }
+        WhereExpr::And(left, right) | WhereExpr::Or(left, right) => {
+            where_expr_contains_function_call(left) || where_expr_contains_function_call(right)
+        }
+        WhereExpr::Not(inner) => where_expr_contains_function_call(inner),
+        _ => false,
+    }
+}
+
+fn expr_contains_function_call(expr: &Expr) -> bool {
+    match expr {
+        Expr::FunctionCall { .. } => true,
+        Expr::JsonSet { value, .. } => expr_contains_function_call(value),
+        Expr::CaseWhen {
+            conditions,
+            else_result,
+        } => {
+            conditions.iter().any(|(condition, result)| {
+                where_expr_contains_function_call(condition) || expr_contains_function_call(result)
+            }) || else_result
+                .as_ref()
+                .is_some_and(|expr| expr_contains_function_call(expr))
+        }
+        _ => false,
+    }
+}
+
+#[allow(dead_code)]
 fn evaluate_projection_value(
     row: &Row,
     projection: &ProjectionColumn,
@@ -4499,6 +5295,7 @@ fn eval_expr_on_row(row: &Row, expr: &Expr) -> Value {
                 .unwrap_or(Value::Null)
         }
         Expr::WindowFunction { .. } => Value::Null,
+        Expr::FunctionCall { .. } => Value::Null,
     }
 }
 
@@ -4531,6 +5328,7 @@ fn eval_expr_lookup<T: ValueLookup>(row: &T, expr: &Expr) -> Value {
                 .unwrap_or(Value::Null)
         }
         Expr::WindowFunction { .. } => Value::Null,
+        Expr::FunctionCall { .. } => Value::Null,
     }
 }
 
@@ -4820,6 +5618,9 @@ fn evaluate_runtime_expr(expr: &Expr, variables: &HashMap<String, Value>) -> Res
             }
         }
         Expr::WindowFunction { .. } => Ok(Value::Null),
+        Expr::FunctionCall { name, .. } => Err(crate::error::FerrisDbError::InvalidCommand(
+            format!("function '{}' is not supported in procedure runtime expression", name),
+        )),
     }
 }
 
@@ -5377,6 +6178,10 @@ fn encode_trigger_key(trigger_name: &str) -> Vec<u8> {
 // 中文註解：使用者對特定表的權限 KV key 編碼
 fn encode_procedure_key(procedure_name: &str) -> Vec<u8> {
     format!("{}{}", PROCEDURE_META_PREFIX, procedure_name).into_bytes()
+}
+
+fn encode_function_key(function_name: &str) -> Vec<u8> {
+    format!("{}{}", FUNCTION_META_PREFIX, function_name).into_bytes()
 }
 
 fn encode_privilege_key(user: &str, table_name: &str) -> Vec<u8> {

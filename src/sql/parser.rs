@@ -74,6 +74,7 @@ impl Parser {
             Some(Token::Keyword(Keyword::Delete)) => self.parse_delete()?,
             Some(Token::Keyword(Keyword::If)) => self.parse_if_then_else()?,
             Some(Token::Keyword(Keyword::While)) => self.parse_while_do()?,
+            Some(Token::Keyword(Keyword::Return)) => self.parse_return_statement()?,
             Some(Token::Keyword(Keyword::Open)) => self.parse_open_cursor()?,
             Some(Token::Keyword(Keyword::Fetch)) => self.parse_fetch_cursor()?,
             Some(Token::Keyword(Keyword::Close)) => self.parse_close_cursor()?,
@@ -103,13 +104,15 @@ impl Parser {
                 self.parse_create_materialized_view_after_create()
             }
             Some(Token::Keyword(Keyword::View)) => self.parse_create_view_after_create(),
+            Some(Token::Keyword(Keyword::Function)) => self.parse_create_function_after_create(),
             Some(Token::Keyword(Keyword::Procedure)) => self.parse_create_procedure_after_create(),
+            Some(Token::Keyword(Keyword::Temporary)) => self.parse_create_temporary_table_after_create(),
             Some(Token::Keyword(Keyword::Table)) => self.parse_create_table_after_create(),
             Some(Token::Keyword(Keyword::Index)) => self.parse_create_index_after_create(),
             // 中文註解：CREATE TRIGGER 觸發器定義
             Some(Token::Keyword(Keyword::Trigger)) => self.parse_create_trigger_after_create(),
             other => Err(FerrisDbError::InvalidCommand(format!(
-                "expected MATERIALIZED VIEW, VIEW, PROCEDURE, TABLE, INDEX or TRIGGER after CREATE, got {:?}",
+                "expected MATERIALIZED VIEW, VIEW, FUNCTION, PROCEDURE, TEMPORARY TABLE, TABLE, INDEX or TRIGGER after CREATE, got {:?}",
                 other
             ))),
         }
@@ -160,6 +163,41 @@ impl Parser {
         })
     }
 
+    // 中文註解：UDF 會重用 block statement parser，並在 executor 端以 RETURN 作為回傳點。
+    fn parse_create_function_after_create(&mut self) -> Result<Statement> {
+        self.expect_keyword(Keyword::Function)?;
+        let name = self.expect_ident()?;
+        self.expect_token(Token::LParen)?;
+        let mut params = Vec::new();
+        if !matches!(self.peek(), Some(Token::RParen)) {
+            loop {
+                let param_name = self.expect_ident()?;
+                let data_type = self.parse_data_type()?;
+                params.push(ProcedureParam {
+                    name: param_name,
+                    data_type,
+                });
+                if matches!(self.peek(), Some(Token::Comma)) {
+                    self.bump();
+                    continue;
+                }
+                break;
+            }
+        }
+        self.expect_token(Token::RParen)?;
+        self.expect_keyword(Keyword::Returns)?;
+        let return_type = self.parse_data_type()?;
+        self.expect_keyword(Keyword::Begin)?;
+        let body = self.parse_block_until(&[BlockTerminator::End])?;
+        self.expect_keyword(Keyword::End)?;
+        Ok(Statement::CreateFunction {
+            name,
+            params,
+            return_type,
+            body,
+        })
+    }
+
     // 中文註解：CREATE PROCEDURE 會把參數列表與 BEGIN...END 主體解析成 AST。
     fn parse_create_procedure_after_create(&mut self) -> Result<Statement> {
         self.expect_keyword(Keyword::Procedure)?;
@@ -188,7 +226,16 @@ impl Parser {
         Ok(Statement::CreateProcedure { name, params, body })
     }
 
+    fn parse_create_temporary_table_after_create(&mut self) -> Result<Statement> {
+        self.expect_keyword(Keyword::Temporary)?;
+        self.parse_create_table_after_modifier(true)
+    }
+
     fn parse_create_table_after_create(&mut self) -> Result<Statement> {
+        self.parse_create_table_after_modifier(false)
+    }
+
+    fn parse_create_table_after_modifier(&mut self, temporary: bool) -> Result<Statement> {
         self.expect_keyword(Keyword::Table)?;
         let if_not_exists = self.parse_optional_if_not_exists()?;
         let table_name = self.expect_ident()?;
@@ -218,6 +265,7 @@ impl Parser {
         self.expect_token(Token::RParen)?;
         Ok(Statement::CreateTable {
             table_name,
+            temporary,
             if_not_exists,
             columns,
             foreign_keys,
@@ -458,6 +506,11 @@ impl Parser {
                 let name = self.expect_ident()?;
                 Ok(Statement::DropProcedure { name })
             }
+            Some(Token::Keyword(Keyword::Function)) => {
+                self.expect_keyword(Keyword::Function)?;
+                let name = self.expect_ident()?;
+                Ok(Statement::DropFunction { name })
+            }
             Some(Token::Keyword(Keyword::Index)) => {
                 self.expect_keyword(Keyword::Index)?;
                 self.expect_keyword(Keyword::On)?;
@@ -470,12 +523,24 @@ impl Parser {
                     column_names,
                 })
             }
+            Some(Token::Keyword(Keyword::Temporary)) => {
+                self.expect_keyword(Keyword::Temporary)?;
+                self.expect_keyword(Keyword::Table)?;
+                let if_exists = self.parse_optional_if_exists()?;
+                let table_name = self.expect_ident()?;
+                Ok(Statement::DropTable {
+                    table_name,
+                    temporary: true,
+                    if_exists,
+                })
+            }
             Some(Token::Keyword(Keyword::Table)) => {
                 self.expect_keyword(Keyword::Table)?;
                 let if_exists = self.parse_optional_if_exists()?;
                 let table_name = self.expect_ident()?;
                 Ok(Statement::DropTable {
                     table_name,
+                    temporary: false,
                     if_exists,
                 })
             }
@@ -486,7 +551,7 @@ impl Parser {
                 Ok(Statement::DropTrigger { trigger_name })
             }
             other => Err(FerrisDbError::InvalidCommand(format!(
-                "expected MATERIALIZED VIEW, VIEW, PROCEDURE, INDEX, TABLE or TRIGGER after DROP, got {:?}",
+                "expected MATERIALIZED VIEW, VIEW, PROCEDURE, FUNCTION, INDEX, TEMPORARY TABLE, TABLE or TRIGGER after DROP, got {:?}",
                 other
             ))),
         }
@@ -753,13 +818,13 @@ impl Parser {
         Ok(Statement::Insert { table_name, source })
     }
 
-    fn parse_insert_values(&mut self) -> Result<Vec<Vec<Value>>> {
+    fn parse_insert_values(&mut self) -> Result<Vec<Vec<Expr>>> {
         let mut rows = Vec::new();
         loop {
             self.expect_token(Token::LParen)?;
             let mut values = Vec::new();
             loop {
-                values.push(self.parse_value()?);
+                values.push(self.parse_scalar_expr()?);
                 if matches!(self.peek(), Some(Token::Comma)) {
                     self.bump();
                     continue;
@@ -776,6 +841,14 @@ impl Parser {
             break;
         }
         Ok(rows)
+    }
+
+    // 中文註解：RETURN 只會在 UDF body 裡被 executor 視為回傳點。
+    fn parse_return_statement(&mut self) -> Result<Statement> {
+        self.expect_keyword(Keyword::Return)?;
+        Ok(Statement::Return {
+            expr: self.parse_runtime_expr()?,
+        })
     }
 
     fn parse_optional_ctes(&mut self) -> Result<Vec<CTE>> {
@@ -866,10 +939,17 @@ impl Parser {
             }
         };
 
-        self.expect_keyword(Keyword::From)?;
-        let table_name = self.parse_identifier_path()?;
-        let table_alias = self.parse_optional_table_alias()?;
-        let join = self.parse_optional_join()?;
+        // 中文註解：沒有 FROM 時，table_name 會保留空字串，交給 executor 走單列 scalar select。
+        let (table_name, table_alias, join) =
+            if matches!(self.peek(), Some(Token::Keyword(Keyword::From))) {
+                self.bump();
+                let table_name = self.parse_identifier_path()?;
+                let table_alias = self.parse_optional_table_alias()?;
+                let join = self.parse_optional_join()?;
+                (table_name, table_alias, join)
+            } else {
+                (String::new(), None, None)
+            };
         let where_clause = self.parse_optional_where()?;
         let group_by = self.parse_optional_group_by()?;
         let having = self.parse_optional_having()?;
@@ -1018,7 +1098,8 @@ impl Parser {
             Some(Token::Keyword(Keyword::JsonExtract))
                 | Some(Token::Keyword(Keyword::JsonSet))
                 | Some(Token::Keyword(Keyword::Case))
-        ) {
+        ) || self.is_function_call_start()
+        {
             let left = self.parse_scalar_expr()?;
             let operator = self.parse_operator()?;
             let right = self.parse_scalar_expr()?;
@@ -1238,6 +1319,7 @@ impl Parser {
             Some(Token::Keyword(Keyword::Case)) => self.parse_case_when_expr(),
             Some(Token::Keyword(Keyword::JsonExtract))
             | Some(Token::Keyword(Keyword::JsonSet)) => self.parse_json_function_expr(),
+            Some(Token::Ident(_)) if self.is_function_call_start() => self.parse_function_call_expr(),
             Some(Token::Ident(_)) => Ok(Expr::Variable(self.expect_ident()?)),
             Some(Token::Placeholder(index)) => {
                 let placeholder = *index;
@@ -1293,6 +1375,11 @@ impl Parser {
                     self.parse_aggregate_item()
                 }
             }
+            Some(Token::Ident(_)) if self.is_function_call_start() => {
+                let expr = self.parse_function_call_expr()?;
+                let alias = self.parse_optional_alias()?;
+                Ok(SelectItem::Expression { expr, alias })
+            }
             _ => {
                 let name = self.parse_identifier_path()?;
                 let alias = self.parse_optional_alias()?;
@@ -1329,6 +1416,7 @@ impl Parser {
             Some(Token::Keyword(Keyword::Case)) => self.parse_case_when_expr(),
             Some(Token::Keyword(Keyword::JsonExtract))
             | Some(Token::Keyword(Keyword::JsonSet)) => self.parse_json_function_expr(),
+            Some(Token::Ident(_)) if self.is_function_call_start() => self.parse_function_call_expr(),
             Some(Token::Ident(_)) => Ok(Expr::Column(self.parse_identifier_path()?)),
             Some(Token::Placeholder(index)) => {
                 let placeholder = *index;
@@ -1344,6 +1432,7 @@ impl Parser {
             Some(Token::Keyword(Keyword::Case)) => self.parse_case_when_expr(),
             Some(Token::Keyword(Keyword::JsonExtract))
             | Some(Token::Keyword(Keyword::JsonSet)) => self.parse_json_function_expr(),
+            Some(Token::Ident(_)) if self.is_function_call_start() => self.parse_function_call_expr(),
             Some(Token::Ident(_)) => Ok(Expr::Column(self.parse_identifier_path()?)),
             Some(Token::Placeholder(index)) => {
                 let placeholder = *index;
@@ -1399,6 +1488,29 @@ impl Parser {
                 other
             ))),
         }
+    }
+
+    fn is_function_call_start(&self) -> bool {
+        matches!(self.peek(), Some(Token::Ident(_))) && matches!(self.peek_n(1), Some(Token::LParen))
+    }
+
+    // 中文註解：一般 scalar function/UDF 走這條路，aggregate 仍維持原本的特殊解析。
+    fn parse_function_call_expr(&mut self) -> Result<Expr> {
+        let name = self.expect_ident()?;
+        self.expect_token(Token::LParen)?;
+        let mut args = Vec::new();
+        if !matches!(self.peek(), Some(Token::RParen)) {
+            loop {
+                args.push(self.parse_scalar_expr()?);
+                if matches!(self.peek(), Some(Token::Comma)) {
+                    self.bump();
+                    continue;
+                }
+                break;
+            }
+        }
+        self.expect_token(Token::RParen)?;
+        Ok(Expr::FunctionCall { name, args })
     }
 
     fn parse_aggregate_item(&mut self) -> Result<SelectItem> {
@@ -1858,16 +1970,19 @@ fn keyword_to_sql(keyword: &Keyword) -> &'static str {
         Keyword::Into => "INTO",
         Keyword::Values => "VALUES",
         Keyword::Create => "CREATE",
+        Keyword::Function => "FUNCTION",
         Keyword::Procedure => "PROCEDURE",
         Keyword::Call => "CALL",
         Keyword::Declare => "DECLARE",
         Keyword::Variable => "VARIABLE",
         Keyword::Return => "RETURN",
+        Keyword::Returns => "RETURNS",
         Keyword::View => "VIEW",
         Keyword::Materialized => "MATERIALIZED",
         Keyword::Refresh => "REFRESH",
         Keyword::Index => "INDEX",
         Keyword::Table => "TABLE",
+        Keyword::Temporary => "TEMPORARY",
         Keyword::Add => "ADD",
         Keyword::Column => "COLUMN",
         Keyword::Drop => "DROP",
@@ -1942,6 +2057,7 @@ fn max_placeholder_in_statement(statement: &Statement) -> usize {
         Statement::Explain { statement } => max_placeholder_in_statement(statement),
         Statement::AnalyzeTable { .. }
         | Statement::CreateProcedure { .. }
+        | Statement::CreateFunction { .. }
         | Statement::CreateTable { .. }
         | Statement::CreateMaterializedView { .. }
         | Statement::RefreshMaterializedView { .. }
@@ -1951,6 +2067,7 @@ fn max_placeholder_in_statement(statement: &Statement) -> usize {
         | Statement::DropView { .. }
         | Statement::DropMaterializedView { .. }
         | Statement::DropProcedure { .. }
+        | Statement::DropFunction { .. }
         | Statement::CreateView { .. }
         | Statement::CreateIndex { .. }
         | Statement::DropIndex { .. }
@@ -1959,6 +2076,7 @@ fn max_placeholder_in_statement(statement: &Statement) -> usize {
         | Statement::DeclareVariable { .. }
         | Statement::DeclareCursor { .. }
         | Statement::SetVariable { .. }
+        | Statement::Return { .. }
         | Statement::IfThenElse { .. }
         | Statement::WhileDo { .. }
         | Statement::OpenCursor { .. }
@@ -2053,6 +2171,11 @@ fn max_placeholder_in_expr(expr: &Expr) -> usize {
             )
         }
         Expr::WindowFunction { .. } => 0,
+        Expr::FunctionCall { args, .. } => args
+            .iter()
+            .map(max_placeholder_in_expr)
+            .max()
+            .unwrap_or(0),
     }
 }
 

@@ -43,6 +43,7 @@ fn test_parse_create_table() {
         stmt,
         Statement::CreateTable {
             table_name: "users".to_string(),
+            temporary: false,
             if_not_exists: false,
             columns: vec![
                 ColumnDef {
@@ -113,14 +114,14 @@ fn test_parse_insert_single_and_multi_rows() {
             table_name: "users".to_string(),
             source: InsertSource::Values(vec![
                 vec![
-                    Value::Int(1),
-                    Value::Text("Alice".to_string()),
-                    Value::Bool(true),
+                    Expr::Value(Value::Int(1)),
+                    Expr::Value(Value::Text("Alice".to_string())),
+                    Expr::Value(Value::Bool(true)),
                 ],
                 vec![
-                    Value::Int(2),
-                    Value::Text("Bob".to_string()),
-                    Value::Bool(false),
+                    Expr::Value(Value::Int(2)),
+                    Expr::Value(Value::Text("Bob".to_string())),
+                    Expr::Value(Value::Bool(false)),
                 ],
             ]),
         }
@@ -579,6 +580,7 @@ fn test_parse_create_if_not_exists_alter_drop_table_and_subquery() {
         parse_sql("CREATE TABLE IF NOT EXISTS users (id INT, name TEXT);"),
         Statement::CreateTable {
             table_name: "users".to_string(),
+            temporary: false,
             if_not_exists: true,
             columns: vec![
                 ColumnDef {
@@ -618,6 +620,7 @@ fn test_parse_create_if_not_exists_alter_drop_table_and_subquery() {
         parse_sql("DROP TABLE IF EXISTS users;"),
         Statement::DropTable {
             table_name: "users".to_string(),
+            temporary: false,
             if_exists: true,
         }
     );
@@ -893,6 +896,7 @@ fn test_parse_create_table_with_foreign_key() {
         ),
         Statement::CreateTable {
             table_name: "orders".to_string(),
+            temporary: false,
             if_not_exists: false,
             columns: vec![
                 ColumnDef {
@@ -920,6 +924,7 @@ fn test_parse_create_table_with_json_and_check() {
         parse_sql("CREATE TABLE employees (id INT, data JSON, salary INT, CHECK (salary > 0));"),
         Statement::CreateTable {
             table_name: "employees".to_string(),
+            temporary: false,
             if_not_exists: false,
             columns: vec![
                 ColumnDef {
@@ -1125,8 +1130,8 @@ fn test_parse_create_call_and_drop_procedure() {
                 Statement::Insert {
                     table_name: "users".to_string(),
                     source: InsertSource::Values(vec![vec![
-                        Value::Variable("i".to_string()),
-                        Value::Variable("user_name".to_string()),
+                        Expr::Column("i".to_string()),
+                        Expr::Column("user_name".to_string()),
                     ]]),
                 },
             ],
@@ -1221,6 +1226,102 @@ fn test_parse_if_while_and_cursor_statements() {
         Statement::FetchCursor {
             name: "user_cursor".to_string(),
             variables: vec!["id_var".to_string(), "name_var".to_string()],
+        }
+    );
+}
+
+#[test]
+fn test_parse_create_drop_function_and_scalar_select() {
+    assert_eq!(
+        parse_sql(
+            "CREATE FUNCTION greet(flag BOOL) RETURNS TEXT BEGIN IF flag = true THEN RETURN 'hello'; END IF; RETURN 'bye'; END;"
+        ),
+        Statement::CreateFunction {
+            name: "greet".to_string(),
+            params: vec![ProcedureParam {
+                name: "flag".to_string(),
+                data_type: DataType::Bool,
+            }],
+            return_type: DataType::Text,
+            body: vec![
+                Statement::IfThenElse {
+                    condition: WhereExpr::Comparison {
+                        column: "flag".to_string(),
+                        operator: Operator::Eq,
+                        value: Value::Bool(true),
+                    },
+                    then_body: vec![Statement::Return {
+                        expr: Expr::Value(Value::Text("hello".to_string())),
+                    }],
+                    else_body: vec![],
+                },
+                Statement::Return {
+                    expr: Expr::Value(Value::Text("bye".to_string())),
+                },
+            ],
+        }
+    );
+
+    assert_eq!(
+        parse_sql("DROP FUNCTION greet;"),
+        Statement::DropFunction {
+            name: "greet".to_string(),
+        }
+    );
+
+    assert_eq!(
+        parse_sql("SELECT greet(true) AS msg;"),
+        Statement::Select {
+            ctes: vec![],
+            distinct: false,
+            table_name: String::new(),
+            table_alias: None,
+            columns: SelectColumns::Named(vec![SelectItem::Expression {
+                expr: Expr::FunctionCall {
+                    name: "greet".to_string(),
+                    args: vec![Expr::Value(Value::Bool(true))],
+                },
+                alias: Some("msg".to_string()),
+            }]),
+            join: None,
+            where_clause: None,
+            group_by: None,
+            having: None,
+            order_by: None,
+            limit: None,
+        }
+    );
+}
+
+#[test]
+fn test_parse_create_and_drop_temporary_table() {
+    assert_eq!(
+        parse_sql("CREATE TEMPORARY TABLE scratch (id INT, name TEXT);"),
+        Statement::CreateTable {
+            table_name: "scratch".to_string(),
+            temporary: true,
+            if_not_exists: false,
+            columns: vec![
+                ColumnDef {
+                    name: "id".to_string(),
+                    data_type: DataType::Int,
+                },
+                ColumnDef {
+                    name: "name".to_string(),
+                    data_type: DataType::Text,
+                },
+            ],
+            foreign_keys: vec![],
+            check_constraints: vec![],
+        }
+    );
+
+    assert_eq!(
+        parse_sql("DROP TEMPORARY TABLE scratch;"),
+        Statement::DropTable {
+            table_name: "scratch".to_string(),
+            temporary: true,
+            if_exists: false,
         }
     );
 }

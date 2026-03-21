@@ -437,6 +437,11 @@ fn render_expr(expr: &super::ast::Expr) -> String {
         }
         super::ast::Expr::CaseWhen { .. } => "CASE".to_string(),
         super::ast::Expr::WindowFunction { .. } => "WINDOW".to_string(),
+        super::ast::Expr::FunctionCall { name, args } => format!(
+            "{}({})",
+            name,
+            args.iter().map(render_expr).collect::<Vec<_>>().join(", ")
+        ),
     }
 }
 

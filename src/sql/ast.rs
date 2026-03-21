@@ -51,8 +51,17 @@ pub enum Statement {
         params: Vec<ProcedureParam>,
         body: Vec<Statement>,
     },
+    // 中文註解：UDF 會保存參數型別、回傳型別與函式 body，供 executor 之後執行。
+    CreateFunction {
+        name: String,
+        params: Vec<ProcedureParam>,
+        return_type: DataType,
+        body: Vec<Statement>,
+    },
     CreateTable {
         table_name: String,
+        // 中文註解：temporary=true 代表這張表只存在 executor 記憶體中，不落盤。
+        temporary: bool,
         if_not_exists: bool,
         columns: Vec<ColumnDef>,
         foreign_keys: Vec<ForeignKey>,
@@ -68,6 +77,7 @@ pub enum Statement {
     },
     DropTable {
         table_name: String,
+        temporary: bool,
         if_exists: bool,
     },
     DropView {
@@ -80,6 +90,9 @@ pub enum Statement {
         if_exists: bool,
     },
     DropProcedure {
+        name: String,
+    },
+    DropFunction {
         name: String,
     },
     CreateIndex {
@@ -111,6 +124,10 @@ pub enum Statement {
     SetVariable {
         name: String,
         value: Expr,
+    },
+    // 中文註解：RETURN 只在 function body 內有意義，用來結束 UDF 並回傳值。
+    Return {
+        expr: Expr,
     },
     IfThenElse {
         condition: WhereExpr,
@@ -245,7 +262,8 @@ pub enum Value {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum InsertSource {
-    Values(Vec<Vec<Value>>),
+    // 中文註解：INSERT ... VALUES 現在允許 expression，才能在 VALUES 裡呼叫 UDF。
+    Values(Vec<Vec<Expr>>),
     Select(Box<Statement>),
 }
 
@@ -299,6 +317,11 @@ pub enum Expr {
         target_column: Option<String>,
         partition_by: Option<String>,
         order_by: Option<(String, bool)>,
+    },
+    // 中文註解：FunctionCall 同時承載 UDF 與未來可擴充的 scalar function 呼叫。
+    FunctionCall {
+        name: String,
+        args: Vec<Expr>,
     },
 }
 
