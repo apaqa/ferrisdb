@@ -356,7 +356,7 @@ fn handle_table_schema_api(engine: &Arc<MvccEngine>, table_name: &str) -> HttpRe
     match catalog.get_table(&txn, table_name) {
         Ok(Some(schema)) => {
             let indexed_columns: Vec<String> = match index_manager.list_indexes(&txn, table_name) {
-                Ok(columns) => columns,
+                Ok(columns) => columns.into_iter().flatten().collect(),
                 Err(err) => return json_error_response(500, "schema_failed", err.to_string()),
             };
             json_response(
@@ -953,7 +953,7 @@ impl SqlApiResponse {
             },
             ExecuteResult::IndexCreated {
                 table_name,
-                column_name,
+                column_names,
             } => Self {
                 success: true,
                 kind: "created".to_string(),
@@ -962,12 +962,12 @@ impl SqlApiResponse {
                 row_count: 0,
                 elapsed_ms,
                 executed_count,
-                message: format!("Index on '{}.{}' created", table_name, column_name),
+                message: format!("Index on '{}.{}' created", table_name, column_names.join(",")),
                 statement_results,
             },
             ExecuteResult::IndexDropped {
                 table_name,
-                column_name,
+                column_names,
             } => Self {
                 success: true,
                 kind: "deleted".to_string(),
@@ -976,7 +976,7 @@ impl SqlApiResponse {
                 row_count: 0,
                 elapsed_ms,
                 executed_count,
-                message: format!("Index on '{}.{}' dropped", table_name, column_name),
+                message: format!("Index on '{}.{}' dropped", table_name, column_names.join(",")),
                 statement_results,
             },
             ExecuteResult::Inserted { count } => Self {
@@ -1102,7 +1102,7 @@ impl SqlStatementResult {
             },
             ExecuteResult::IndexCreated {
                 table_name,
-                column_name,
+                column_names,
             } => Self {
                 sql,
                 success: true,
@@ -1111,11 +1111,11 @@ impl SqlStatementResult {
                 rows: Vec::new(),
                 row_count: 0,
                 elapsed_ms,
-                message: format!("Index on '{}.{}' created", table_name, column_name),
+                message: format!("Index on '{}.{}' created", table_name, column_names.join(",")),
             },
             ExecuteResult::IndexDropped {
                 table_name,
-                column_name,
+                column_names,
             } => Self {
                 sql,
                 success: true,
@@ -1124,7 +1124,7 @@ impl SqlStatementResult {
                 rows: Vec::new(),
                 row_count: 0,
                 elapsed_ms,
-                message: format!("Index on '{}.{}' dropped", table_name, column_name),
+                message: format!("Index on '{}.{}' dropped", table_name, column_names.join(",")),
             },
             ExecuteResult::Inserted { count } => Self {
                 sql,

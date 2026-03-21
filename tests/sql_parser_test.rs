@@ -1,16 +1,14 @@
-// =============================================================================
-// tests/sql_parser_test.rs -- SQL Lexer / Parser 測試
+﻿// =============================================================================
+// tests/sql_parser_test.rs -- SQL Lexer / Parser 皜祈岫
 // =============================================================================
 //
-// 這裡主要驗證：
-// - lexer 是否能正確切出 SQL token
-// - parser 是否能產生新版 AST
-// - WHERE 布林運算、LEFT JOIN、HAVING 等語法是否正確建模
-
+// ?ㄐ銝餉?撽?嚗?// - lexer ?臬?賣迤蝣箏???SQL token
+// - parser ?臬?賜???AST
+// - WHERE 撣????EFT JOIN?AVING 蝑?瘜?行迤蝣箏遣璅?
 use ferrisdb::sql::ast::{
-    AggregateFunc, Assignment, ColumnDef, DataType, GroupByClause, InsertSource, JoinClause,
-    JoinType, Operator, OrderByClause, OrderDirection, SelectColumns, SelectItem, Statement, Value,
-    WhereExpr,
+    AggregateFunc, Assignment, CTE, ColumnDef, DataType, GroupByClause, InsertSource, JoinClause,
+    JoinType, Operator, OrderByClause, OrderDirection, SelectColumns, SelectItem, Statement,
+    Value, WhereExpr,
 };
 use ferrisdb::sql::lexer::{Keyword, Lexer, Token};
 use ferrisdb::sql::parser::Parser;
@@ -70,7 +68,7 @@ fn test_parse_create_and_drop_index() {
         parse_sql("CREATE INDEX ON users(age);"),
         Statement::CreateIndex {
             table_name: "users".to_string(),
-            column_name: "age".to_string(),
+            column_names: vec!["age".to_string()],
         }
     );
 
@@ -78,7 +76,18 @@ fn test_parse_create_and_drop_index() {
         parse_sql("DROP INDEX ON users(age);"),
         Statement::DropIndex {
             table_name: "users".to_string(),
-            column_name: "age".to_string(),
+            column_names: vec!["age".to_string()],
+        }
+    );
+}
+
+#[test]
+fn test_parse_create_composite_index() {
+    assert_eq!(
+        parse_sql("CREATE INDEX ON employees(department, salary);"),
+        Statement::CreateIndex {
+            table_name: "employees".to_string(),
+            column_names: vec!["department".to_string(), "salary".to_string()],
         }
     );
 }
@@ -112,6 +121,7 @@ fn test_parse_select() {
     assert_eq!(
         stmt,
         Statement::Select {
+            ctes: vec![],
             distinct: false,
             table_name: "users".to_string(),
             table_alias: None,
@@ -145,6 +155,7 @@ fn test_parse_where_and_or_not() {
     assert_eq!(
         stmt,
         Statement::Select {
+            ctes: vec![],
             distinct: false,
             table_name: "users".to_string(),
             table_alias: None,
@@ -188,6 +199,8 @@ fn test_parse_update() {
                 column: "name".to_string(),
                 value: Value::Text("Bob".to_string()),
             }],
+            from_table: None,
+            join_condition: None,
             where_clause: Some(WhereExpr::Comparison {
                 column: "id".to_string(),
                 operator: Operator::Eq,
@@ -204,11 +217,143 @@ fn test_parse_delete() {
         stmt,
         Statement::Delete {
             table_name: "users".to_string(),
+            using_table: None,
+            join_condition: None,
             where_clause: Some(WhereExpr::Comparison {
                 column: "id".to_string(),
                 operator: Operator::Eq,
                 value: Value::Int(1),
             }),
+        }
+    );
+}
+
+#[test]
+fn test_parse_select_with_ctes() {
+    assert_eq!(
+        parse_sql(
+            "WITH a AS (SELECT * FROM users), b AS (SELECT * FROM admins) SELECT * FROM a;"
+        ),
+        Statement::Select {
+            ctes: vec![
+                CTE {
+                    name: "a".to_string(),
+                    query: Box::new(Statement::Select {
+                        ctes: vec![],
+                        distinct: false,
+                        table_name: "users".to_string(),
+                        table_alias: None,
+                        columns: SelectColumns::All,
+                        join: None,
+                        where_clause: None,
+                        group_by: None,
+                        having: None,
+                        order_by: None,
+                        limit: None,
+                    }),
+                },
+                CTE {
+                    name: "b".to_string(),
+                    query: Box::new(Statement::Select {
+                        ctes: vec![],
+                        distinct: false,
+                        table_name: "admins".to_string(),
+                        table_alias: None,
+                        columns: SelectColumns::All,
+                        join: None,
+                        where_clause: None,
+                        group_by: None,
+                        having: None,
+                        order_by: None,
+                        limit: None,
+                    }),
+                },
+            ],
+            distinct: false,
+            table_name: "a".to_string(),
+            table_alias: None,
+            columns: SelectColumns::All,
+            join: None,
+            where_clause: None,
+            group_by: None,
+            having: None,
+            order_by: None,
+            limit: None,
+        }
+    );
+}
+
+#[test]
+fn test_parse_update_from_and_delete_using() {
+    assert_eq!(
+        parse_sql(
+            "UPDATE employees SET salary = 0 FROM departments WHERE employees.department = departments.dept_name AND departments.location = 'Remote';"
+        ),
+        Statement::Update {
+            table_name: "employees".to_string(),
+            assignments: vec![Assignment {
+                column: "salary".to_string(),
+                value: Value::Int(0),
+            }],
+            from_table: Some("departments".to_string()),
+            join_condition: Some(WhereExpr::And(
+                Box::new(WhereExpr::ColumnComparison {
+                    left: "employees.department".to_string(),
+                    operator: Operator::Eq,
+                    right: "departments.dept_name".to_string(),
+                }),
+                Box::new(WhereExpr::Comparison {
+                    column: "departments.location".to_string(),
+                    operator: Operator::Eq,
+                    value: Value::Text("Remote".to_string()),
+                }),
+            )),
+            where_clause: Some(WhereExpr::And(
+                Box::new(WhereExpr::ColumnComparison {
+                    left: "employees.department".to_string(),
+                    operator: Operator::Eq,
+                    right: "departments.dept_name".to_string(),
+                }),
+                Box::new(WhereExpr::Comparison {
+                    column: "departments.location".to_string(),
+                    operator: Operator::Eq,
+                    value: Value::Text("Remote".to_string()),
+                }),
+            )),
+        }
+    );
+
+    assert_eq!(
+        parse_sql(
+            "DELETE FROM employees USING departments WHERE employees.department = departments.dept_name AND departments.location = 'Remote';"
+        ),
+        Statement::Delete {
+            table_name: "employees".to_string(),
+            using_table: Some("departments".to_string()),
+            join_condition: Some(WhereExpr::And(
+                Box::new(WhereExpr::ColumnComparison {
+                    left: "employees.department".to_string(),
+                    operator: Operator::Eq,
+                    right: "departments.dept_name".to_string(),
+                }),
+                Box::new(WhereExpr::Comparison {
+                    column: "departments.location".to_string(),
+                    operator: Operator::Eq,
+                    value: Value::Text("Remote".to_string()),
+                }),
+            )),
+            where_clause: Some(WhereExpr::And(
+                Box::new(WhereExpr::ColumnComparison {
+                    left: "employees.department".to_string(),
+                    operator: Operator::Eq,
+                    right: "departments.dept_name".to_string(),
+                }),
+                Box::new(WhereExpr::Comparison {
+                    column: "departments.location".to_string(),
+                    operator: Operator::Eq,
+                    value: Value::Text("Remote".to_string()),
+                }),
+            )),
         }
     );
 }
@@ -237,6 +382,7 @@ fn test_case_insensitive_and_extra_whitespace() {
     assert_eq!(
         stmt,
         Statement::Select {
+            ctes: vec![],
             distinct: false,
             table_name: "users".to_string(),
             table_alias: None,
@@ -259,6 +405,7 @@ fn test_parse_select_with_inner_join() {
     assert_eq!(
         stmt,
         Statement::Select {
+            ctes: vec![],
             distinct: false,
             table_name: "users".to_string(),
             table_alias: None,
@@ -289,6 +436,7 @@ fn test_parse_left_join() {
     assert_eq!(
         stmt,
         Statement::Select {
+            ctes: vec![],
             distinct: false,
             table_name: "users".to_string(),
             table_alias: None,
@@ -316,6 +464,7 @@ fn test_parse_explain_select() {
         stmt,
         Statement::Explain {
             statement: Box::new(Statement::Select {
+            ctes: vec![],
                 distinct: false,
                 table_name: "users".to_string(),
                 table_alias: None,
@@ -341,6 +490,7 @@ fn test_parse_select_with_order_by_and_limit() {
     assert_eq!(
         stmt,
         Statement::Select {
+            ctes: vec![],
             distinct: false,
             table_name: "users".to_string(),
             table_alias: None,
@@ -371,6 +521,7 @@ fn test_parse_select_with_count_group_by_and_having() {
     assert_eq!(
         stmt,
         Statement::Select {
+            ctes: vec![],
             distinct: false,
             table_name: "users".to_string(),
             table_alias: None,
@@ -459,6 +610,7 @@ fn test_parse_create_if_not_exists_alter_drop_table_and_subquery() {
     assert_eq!(
         parse_sql("SELECT * FROM users WHERE id IN (SELECT user_id FROM orders);"),
         Statement::Select {
+            ctes: vec![],
             distinct: false,
             table_name: "users".to_string(),
             table_alias: None,
@@ -467,6 +619,7 @@ fn test_parse_create_if_not_exists_alter_drop_table_and_subquery() {
             where_clause: Some(WhereExpr::InSubquery {
                 column: "id".to_string(),
                 subquery: Box::new(Statement::Select {
+            ctes: vec![],
                     distinct: false,
                     table_name: "orders".to_string(),
                     table_alias: None,
@@ -496,6 +649,7 @@ fn test_parse_select_distinct_and_alias() {
     assert_eq!(
         stmt,
         Statement::Select {
+            ctes: vec![],
             distinct: true,
             table_name: "employees".to_string(),
             table_alias: Some("e".to_string()),
@@ -521,6 +675,7 @@ fn test_parse_aggregate_alias_and_predicates() {
     assert_eq!(
         stmt,
         Statement::Select {
+            ctes: vec![],
             distinct: false,
             table_name: "employees".to_string(),
             table_alias: None,
@@ -573,6 +728,7 @@ fn test_parse_create_drop_view_insert_select_and_union() {
             view_name: "high_earners".to_string(),
             query_sql: "SELECT * FROM employees WHERE salary > 80000".to_string(),
             query: Box::new(Statement::Select {
+            ctes: vec![],
                 distinct: false,
                 table_name: "employees".to_string(),
                 table_alias: None,
@@ -604,6 +760,7 @@ fn test_parse_create_drop_view_insert_select_and_union() {
         Statement::Insert {
             table_name: "archived_users".to_string(),
             source: InsertSource::Select(Box::new(Statement::Select {
+            ctes: vec![],
                 distinct: false,
                 table_name: "users".to_string(),
                 table_alias: None,
@@ -635,6 +792,7 @@ fn test_parse_create_drop_view_insert_select_and_union() {
         parse_sql("SELECT name FROM employees UNION ALL SELECT dept_name FROM departments;"),
         Statement::Union {
             left: Box::new(Statement::Select {
+            ctes: vec![],
                 distinct: false,
                 table_name: "employees".to_string(),
                 table_alias: None,
@@ -650,6 +808,7 @@ fn test_parse_create_drop_view_insert_select_and_union() {
                 limit: None,
             }),
             right: Box::new(Statement::Select {
+            ctes: vec![],
                 distinct: false,
                 table_name: "departments".to_string(),
                 table_alias: None,
@@ -669,15 +828,18 @@ fn test_parse_create_drop_view_insert_select_and_union() {
     );
 }
 
-// 中文註解：測試內統一走 lexer + parser，避免每個案例重複樣板。
+// 中文註解：把 lexer + parser 封裝成 helper，讓測試更容易閱讀。
 fn parse_sql(sql: &str) -> Statement {
     parse_sql_result(sql).expect("parse sql")
 }
 
-// 中文註解：保留 Result 版 helper，方便直接測錯誤訊息。
+// 中文註解：保留 Result 版本，讓錯誤訊息測試可以直接斷言 parser 回傳的錯誤。
 fn parse_sql_result(sql: &str) -> Result<Statement, ferrisdb::error::FerrisDbError> {
     let mut lexer = Lexer::new(sql);
     let tokens = lexer.tokenize()?;
     let mut parser = Parser::new(tokens);
     parser.parse()
 }
+
+
+

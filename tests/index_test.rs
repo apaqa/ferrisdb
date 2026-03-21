@@ -75,7 +75,7 @@ fn test_create_index_and_select_where_uses_index_scan() {
         exec(&executor, "CREATE INDEX ON users(age);"),
         ExecuteResult::IndexCreated {
             table_name: "users".to_string(),
-            column_name: "age".to_string(),
+            column_names: vec!["age".to_string()],
         }
     );
 
@@ -214,7 +214,7 @@ fn test_no_index_uses_seq_scan_and_drop_index_restores_seq_scan() {
         exec(&executor, "DROP INDEX ON users(age);"),
         ExecuteResult::IndexDropped {
             table_name: "users".to_string(),
-            column_name: "age".to_string(),
+            column_names: vec!["age".to_string()],
         }
     );
 
@@ -224,6 +224,53 @@ fn test_no_index_uses_seq_scan_and_drop_index_restores_seq_scan() {
     ));
     assert!(seq_plan_again.contains("SeqScan"));
     assert!(!seq_plan_again.contains("IndexScan"));
+
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn test_composite_index_supports_prefix_and_full_match() {
+    let (dir, _engine, executor) = open_executor("composite-index");
+
+    exec(
+        &executor,
+        "CREATE TABLE employees (id INT, department TEXT, salary INT, active BOOL);",
+    );
+    exec(
+        &executor,
+        "INSERT INTO employees VALUES (1, 'Engineering', 90000, true), (2, 'Engineering', 85000, true), (3, 'HR', 70000, false);",
+    );
+    assert_eq!(
+        exec(&executor, "CREATE INDEX ON employees(department, salary);"),
+        ExecuteResult::IndexCreated {
+            table_name: "employees".to_string(),
+            column_names: vec!["department".to_string(), "salary".to_string()],
+        }
+    );
+
+    let prefix_plan = explain_plan(exec(
+        &executor,
+        "EXPLAIN SELECT * FROM employees WHERE department = 'Engineering';",
+    ));
+    assert!(prefix_plan.contains("CompositeIndexScan"));
+
+    let full_plan = explain_plan(exec(
+        &executor,
+        "EXPLAIN SELECT * FROM employees WHERE department = 'Engineering' AND salary = 90000;",
+    ));
+    assert!(full_plan.contains("CompositeIndexScan"));
+
+    let seq_plan = explain_plan(exec(
+        &executor,
+        "EXPLAIN SELECT * FROM employees WHERE salary = 90000;",
+    ));
+    assert!(seq_plan.contains("SeqScan"));
+
+    let (_, rows) = selected_rows(exec(
+        &executor,
+        "SELECT id FROM employees WHERE department = 'Engineering' AND salary = 90000;",
+    ));
+    assert_eq!(rows, vec![vec![Value::Int(1)]]);
 
     let _ = std::fs::remove_dir_all(dir);
 }

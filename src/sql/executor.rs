@@ -25,19 +25,19 @@
 //
 // 之後若要繼續演進，可以把 WHERE 下推、索引查找、型別檢查等能力逐步補上。
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 
 use crate::error::Result;
 use crate::transaction::mvcc::{MvccEngine, Transaction};
 
 use super::ast::{
-    AggregateFunc, Assignment, ColumnDef, DataType, Expr, GroupByClause, InsertSource, JoinClause,
-    JoinType, Operator, OrderByClause, OrderDirection, SelectColumns, SelectItem, Statement, Value,
-    WhereExpr, WindowFunc,
+    AggregateFunc, Assignment, CTE, ColumnDef, DataType, Expr, GroupByClause, InsertSource,
+    JoinClause, JoinType, Operator, OrderByClause, OrderDirection, SelectColumns, SelectItem,
+    Statement, Value, WhereExpr, WindowFunc,
 };
 use super::catalog::{Catalog, TableSchema, ViewDefinition};
-use super::index::IndexManager;
+use super::index::{IndexLookupPlan, IndexManager};
 use super::parser::Parser;
 use super::row::{
     decode_row_key, encode_row_key, encode_row_prefix_end, encode_row_prefix_start, Row,
@@ -59,11 +59,11 @@ pub enum ExecuteResult {
     },
     IndexCreated {
         table_name: String,
-        column_name: String,
+        column_names: Vec<String>,
     },
     IndexDropped {
         table_name: String,
-        column_name: String,
+        column_names: Vec<String>,
     },
     Inserted {
         count: usize,
@@ -131,14 +131,15 @@ impl SqlExecutor {
             } => self.execute_drop_view(view_name, if_exists),
             Statement::CreateIndex {
                 table_name,
-                column_name,
-            } => self.execute_create_index(table_name, column_name),
+                column_names,
+            } => self.execute_create_index(table_name, column_names),
             Statement::DropIndex {
                 table_name,
-                column_name,
-            } => self.execute_drop_index(table_name, column_name),
+                column_names,
+            } => self.execute_drop_index(table_name, column_names),
             Statement::Insert { table_name, source } => self.execute_insert(table_name, source),
             Statement::Select {
+                ctes,
                 distinct,
                 table_name,
                 table_alias,
@@ -150,6 +151,7 @@ impl SqlExecutor {
                 order_by,
                 limit,
             } => self.execute_select(
+                ctes,
                 distinct,
                 table_name,
                 table_alias,
@@ -164,12 +166,22 @@ impl SqlExecutor {
             Statement::Update {
                 table_name,
                 assignments,
+                from_table,
+                join_condition,
                 where_clause,
-            } => self.execute_update(table_name, assignments, where_clause),
+            } => self.execute_update(
+                table_name,
+                assignments,
+                from_table,
+                join_condition,
+                where_clause,
+            ),
             Statement::Delete {
                 table_name,
+                using_table,
+                join_condition,
                 where_clause,
-            } => self.execute_delete(table_name, where_clause),
+            } => self.execute_delete(table_name, using_table, join_condition, where_clause),
             Statement::Union { left, right, all } => self.execute_union(*left, *right, all),
         }
     }
@@ -297,12 +309,11 @@ impl SqlExecutor {
             txn.put(row_key, serde_json::to_vec(&row)?)?;
         }
 
-        if self
-            .index_manager
-            .has_index(&txn, &table_name, &column_name)?
-        {
-            self.index_manager
-                .drop_index_in_txn(&mut txn, &table_name, &column_name)?;
+        for index_columns in self.index_manager.list_indexes(&txn, &table_name)? {
+            if index_columns.iter().any(|column| column == &column_name) {
+                self.index_manager
+                    .drop_index_in_txn(&mut txn, &table_name, &index_columns)?;
+            }
         }
 
         schema.columns.retain(|column| column.name != column_name);
@@ -362,7 +373,7 @@ impl SqlExecutor {
     fn execute_create_index(
         &self,
         table_name: String,
-        column_name: String,
+        column_names: Vec<String>,
     ) -> Result<ExecuteResult> {
         let mut txn = self.engine.begin_transaction();
         let Some(schema) = self.catalog.get_table(&txn, &table_name)? else {
@@ -370,52 +381,68 @@ impl SqlExecutor {
                 message: format!("table '{}' does not exist", table_name),
             });
         };
-        if !schema
-            .columns
-            .iter()
-            .any(|column| column.name == column_name)
-        {
+        if column_names.is_empty() {
             return Ok(ExecuteResult::Error {
-                message: format!("unknown column '{}'", column_name),
+                message: "CREATE INDEX requires at least one column".to_string(),
             });
+        }
+        for column_name in &column_names {
+            if !schema.columns.iter().any(|column| column.name == *column_name) {
+                return Ok(ExecuteResult::Error {
+                    message: format!("unknown column '{}'", column_name),
+                });
+            }
         }
         if !self
             .index_manager
-            .create_index_in_txn(&mut txn, &table_name, &column_name)?
+            .create_index_in_txn(&mut txn, &table_name, &column_names)?
         {
             return Ok(ExecuteResult::Error {
-                message: format!("index on '{}.{}' already exists", table_name, column_name),
+                message: format!(
+                    "index on '{}.{}' already exists",
+                    table_name,
+                    column_names.join(",")
+                ),
             });
         }
 
         txn.commit()?;
         Ok(ExecuteResult::IndexCreated {
             table_name,
-            column_name,
+            column_names,
         })
     }
 
-    fn execute_drop_index(&self, table_name: String, column_name: String) -> Result<ExecuteResult> {
+    fn execute_drop_index(
+        &self,
+        table_name: String,
+        column_names: Vec<String>,
+    ) -> Result<ExecuteResult> {
         let mut txn = self.engine.begin_transaction();
         if !self
             .index_manager
-            .drop_index_in_txn(&mut txn, &table_name, &column_name)?
+            .drop_index_in_txn(&mut txn, &table_name, &column_names)?
         {
             return Ok(ExecuteResult::Error {
-                message: format!("index on '{}.{}' does not exist", table_name, column_name),
+                message: format!(
+                    "index on '{}.{}' does not exist",
+                    table_name,
+                    column_names.join(",")
+                ),
             });
         }
 
         txn.commit()?;
         Ok(ExecuteResult::IndexDropped {
             table_name,
-            column_name,
+            column_names,
         })
     }
 
     fn execute_explain(&self, statement: Statement) -> Result<ExecuteResult> {
         match statement {
             Statement::Select {
+                ctes: _,
                 distinct: _,
                 table_name,
                 table_alias: _,
@@ -442,11 +469,8 @@ impl SqlExecutor {
 
                 let use_index = self.can_use_index(&txn, &table_name, where_clause.as_ref())?;
                 let index_lookup = if use_index {
-                    self.index_manager.find_indexable_comparison(
-                        &txn,
-                        &table_name,
-                        where_clause.as_ref(),
-                    )?
+                    self.index_manager
+                        .find_best_index(&txn, &table_name, where_clause.as_ref())?
                 } else {
                     None
                 };
@@ -471,10 +495,13 @@ impl SqlExecutor {
                 let project_cost = estimate_project_cost(filtered_rows, &columns);
 
                 let mut lines = Vec::new();
-                if let Some((column, _)) = index_lookup {
+                if let Some(plan) = index_lookup {
                     lines.push(format!(
-                        "IndexScan(table={}, column={}, rows={}, cost={:.2})",
-                        table_name, column, scan_rows, scan_cost
+                        "CompositeIndexScan(table={}, columns={}, rows={}, cost={:.2})",
+                        table_name,
+                        plan.scan_columns.join(","),
+                        scan_rows,
+                        scan_cost
                     ));
                 } else {
                     lines.push(format!(
@@ -701,6 +728,7 @@ impl SqlExecutor {
 
     fn execute_select(
         &self,
+        ctes: Vec<CTE>,
         distinct: bool,
         table_name: String,
         table_alias: Option<String>,
@@ -713,6 +741,23 @@ impl SqlExecutor {
         limit: Option<usize>,
     ) -> Result<ExecuteResult> {
         let txn = self.engine.begin_transaction();
+        let cte_scope = self.materialize_ctes(&ctes)?;
+        if let Some(relation) = cte_scope.get(&table_name) {
+            return self.execute_select_from_materialized_rows(
+                &txn,
+                relation.schema.clone(),
+                relation.rows.clone(),
+                distinct,
+                table_alias,
+                columns,
+                join,
+                where_clause,
+                group_by,
+                having,
+                order_by,
+                limit,
+            );
+        }
         if self.catalog.get_table(&txn, &table_name)?.is_none() {
             if let Some(view) = self.catalog.get_view(&txn, &table_name)? {
                 return self.execute_select_from_view(
@@ -1284,6 +1329,8 @@ impl SqlExecutor {
         &self,
         table_name: String,
         assignments: Vec<Assignment>,
+        from_table: Option<String>,
+        join_condition: Option<WhereExpr>,
         where_clause: Option<WhereExpr>,
     ) -> Result<ExecuteResult> {
         let mut txn = self.engine.begin_transaction();
@@ -1316,9 +1363,25 @@ impl SqlExecutor {
 
         let rows = self.scan_rows(&txn, &schema)?;
         let resolved_where = self.resolve_where_expr(where_clause.as_ref())?;
+        let target_keys = if let Some(from_table) = from_table {
+            Some(self.resolve_target_rows_via_join(
+                &txn,
+                &schema,
+                &rows,
+                &from_table,
+                join_condition.as_ref().or(where_clause.as_ref()),
+            )?)
+        } else {
+            None
+        };
         let mut updated = 0;
         for (row_key, mut row) in rows {
-            if !eval_where_expr(&row, resolved_where.as_ref()) {
+            let matches_row = if let Some(target_keys) = target_keys.as_ref() {
+                target_keys.contains(&row_key)
+            } else {
+                eval_where_expr(&row, resolved_where.as_ref())
+            };
+            if !matches_row {
                 continue;
             }
 
@@ -1333,22 +1396,28 @@ impl SqlExecutor {
             }
 
             txn.put(row_key, serde_json::to_vec(&row)?)?;
-            for indexed_column in self.index_manager.list_indexes(&txn, &table_name)? {
-                let old_value = old_row.get(&indexed_column).cloned().unwrap_or(Value::Null);
-                let new_value = row.get(&indexed_column).cloned().unwrap_or(Value::Null);
-                if old_value != new_value {
+            for indexed_columns in self.index_manager.list_indexes(&txn, &table_name)? {
+                let old_values = indexed_columns
+                    .iter()
+                    .map(|column| old_row.get(column).cloned().unwrap_or(Value::Null))
+                    .collect::<Vec<_>>();
+                let new_values = indexed_columns
+                    .iter()
+                    .map(|column| row.get(column).cloned().unwrap_or(Value::Null))
+                    .collect::<Vec<_>>();
+                if old_values != new_values {
                     self.index_manager.delete_index_entry(
                         &mut txn,
                         &table_name,
-                        &indexed_column,
-                        &old_value,
+                        &indexed_columns,
+                        &old_row,
                         &pk_value,
                     )?;
                     self.index_manager.insert_index_entry(
                         &mut txn,
                         &table_name,
-                        &indexed_column,
-                        &new_value,
+                        &indexed_columns,
+                        &row,
                         &pk_value,
                     )?;
                 }
@@ -1364,6 +1433,8 @@ impl SqlExecutor {
     fn execute_delete(
         &self,
         table_name: String,
+        using_table: Option<String>,
+        join_condition: Option<WhereExpr>,
         where_clause: Option<WhereExpr>,
     ) -> Result<ExecuteResult> {
         let mut txn = self.engine.begin_transaction();
@@ -1375,25 +1446,39 @@ impl SqlExecutor {
 
         let rows = self.scan_rows(&txn, &schema)?;
         let resolved_where = self.resolve_where_expr(where_clause.as_ref())?;
+        let target_keys = if let Some(using_table) = using_table {
+            Some(self.resolve_target_rows_via_join(
+                &txn,
+                &schema,
+                &rows,
+                &using_table,
+                join_condition.as_ref().or(where_clause.as_ref()),
+            )?)
+        } else {
+            None
+        };
         let mut deleted = 0;
         for (row_key, row) in rows {
-            if !eval_where_expr(&row, resolved_where.as_ref()) {
+            let matches_row = if let Some(target_keys) = target_keys.as_ref() {
+                target_keys.contains(&row_key)
+            } else {
+                eval_where_expr(&row, resolved_where.as_ref())
+            };
+            if !matches_row {
                 continue;
             }
             let pk_value = row
                 .get(&schema.columns[0].name)
                 .cloned()
                 .unwrap_or(Value::Null);
-            for indexed_column in self.index_manager.list_indexes(&txn, &table_name)? {
-                if let Some(index_value) = row.get(&indexed_column) {
-                    self.index_manager.delete_index_entry(
-                        &mut txn,
-                        &table_name,
-                        &indexed_column,
-                        index_value,
-                        &pk_value,
-                    )?;
-                }
+            for indexed_columns in self.index_manager.list_indexes(&txn, &table_name)? {
+                self.index_manager.delete_index_entry(
+                    &mut txn,
+                    &table_name,
+                    &indexed_columns,
+                    &row,
+                    &pk_value,
+                )?;
             }
             txn.delete(&row_key)?;
             deleted += 1;
@@ -1401,6 +1486,50 @@ impl SqlExecutor {
 
         txn.commit()?;
         Ok(ExecuteResult::Deleted { count: deleted })
+    }
+
+    fn materialize_ctes(&self, ctes: &[CTE]) -> Result<BTreeMap<String, MaterializedRelation>> {
+        let mut scope = BTreeMap::new();
+        for cte in ctes {
+            let result = self.execute((*cte.query).clone())?;
+            let ExecuteResult::Selected { columns, rows } = result else {
+                continue;
+            };
+            scope.insert(
+                cte.name.clone(),
+                MaterializedRelation {
+                    schema: materialized_schema(&cte.name, &columns, &rows),
+                    rows: materialized_rows(&columns, rows),
+                },
+            );
+        }
+        Ok(scope)
+    }
+
+    fn resolve_target_rows_via_join(
+        &self,
+        txn: &Transaction,
+        left_schema: &TableSchema,
+        left_rows: &[(Vec<u8>, Row)],
+        right_table: &str,
+        predicate: Option<&WhereExpr>,
+    ) -> Result<HashSet<Vec<u8>>> {
+        let Some(right_schema) = self.catalog.get_table(txn, right_table)? else {
+            return Ok(HashSet::new());
+        };
+        let right_rows = self.scan_rows(txn, &right_schema)?;
+        let resolved_where = self.resolve_where_expr(predicate)?;
+        let mut matched = HashSet::new();
+        for (left_key, left_row) in left_rows {
+            for (_, right_row) in &right_rows {
+                let joined = JoinedRow::new(left_schema, left_row, &right_schema, Some(right_row));
+                if eval_where_expr(&joined, resolved_where.as_ref()) {
+                    matched.insert(left_key.clone());
+                    break;
+                }
+            }
+        }
+        Ok(matched)
     }
 
     fn resolve_projection(
@@ -1533,16 +1662,9 @@ impl SqlExecutor {
                 encode_row_key(table_name, &pk_value),
                 serde_json::to_vec(&row)?,
             )?;
-            for indexed_column in self.index_manager.list_indexes(txn, table_name)? {
-                if let Some(index_value) = row.get(&indexed_column) {
-                    self.index_manager.insert_index_entry(
-                        txn,
-                        table_name,
-                        &indexed_column,
-                        index_value,
-                        &pk_value,
-                    )?;
-                }
+            for indexed_columns in self.index_manager.list_indexes(txn, table_name)? {
+                self.index_manager
+                    .insert_index_entry(txn, table_name, &indexed_columns, &row, &pk_value)?;
             }
             inserted += 1;
         }
@@ -1577,13 +1699,13 @@ impl SqlExecutor {
         where_clause: Option<&WhereExpr>,
     ) -> Result<Vec<(Vec<u8>, Row)>> {
         let resolved_where = self.resolve_where_expr(where_clause)?;
-        if let Some((column, value)) =
-            self.index_manager
-                .find_indexable_comparison(txn, &schema.table_name, where_clause)?
+        if let Some(plan) = self
+            .index_manager
+            .find_best_index(txn, &schema.table_name, where_clause)?
         {
             let pks = self
                 .index_manager
-                .lookup(txn, &schema.table_name, column, value)?;
+                .lookup_prefix(txn, &schema.table_name, &plan.scan_columns, &plan.prefix_values)?;
             let mut rows = Vec::new();
             for pk in pks {
                 let row_key = encode_row_key(&schema.table_name, &pk);
@@ -1611,7 +1733,7 @@ impl SqlExecutor {
     ) -> Result<bool> {
         Ok(self
             .index_manager
-            .find_indexable_comparison(txn, table_name, where_clause)?
+            .find_best_index(txn, table_name, where_clause)?
             .is_some())
     }
 
@@ -1638,6 +1760,15 @@ impl SqlExecutor {
                 column: column.clone(),
                 operator: operator.clone(),
                 value: value.clone(),
+            }),
+            WhereExpr::ColumnComparison {
+                left,
+                operator,
+                right,
+            } => Ok(ResolvedWhereExpr::ColumnComparison {
+                left: left.clone(),
+                operator: operator.clone(),
+                right: right.clone(),
             }),
             WhereExpr::Between { column, low, high } => Ok(ResolvedWhereExpr::Between {
                 column: column.clone(),
@@ -1759,12 +1890,12 @@ pub fn format_execute_result(result: &ExecuteResult) -> String {
         ExecuteResult::Dropped { table_name } => format!("Table '{}' dropped", table_name),
         ExecuteResult::IndexCreated {
             table_name,
-            column_name,
-        } => format!("Index on '{}.{}' created", table_name, column_name),
+            column_names,
+        } => format!("Index on '{}.{}' created", table_name, column_names.join(",")),
         ExecuteResult::IndexDropped {
             table_name,
-            column_name,
-        } => format!("Index on '{}.{}' dropped", table_name, column_name),
+            column_names,
+        } => format!("Index on '{}.{}' dropped", table_name, column_names.join(",")),
         ExecuteResult::Inserted { count } => format!("Inserted {} row(s)", count),
         ExecuteResult::Selected { columns, rows } => format_selected(columns, rows),
         ExecuteResult::Updated { count } => format!("Updated {} row(s)", count),
@@ -1828,6 +1959,11 @@ enum ResolvedWhereExpr {
         operator: Operator,
         value: Value,
     },
+    ColumnComparison {
+        left: String,
+        operator: Operator,
+        right: String,
+    },
     Between {
         column: String,
         low: Value,
@@ -1889,6 +2025,11 @@ fn render_where_expr(where_clause: &WhereExpr) -> String {
             operator_to_str(operator),
             render_value(value)
         ),
+        WhereExpr::ColumnComparison {
+            left,
+            operator,
+            right,
+        } => format!("{} {} {}", left, operator_to_str(operator), right),
         WhereExpr::Between { column, low, high } => {
             format!(
                 "{} BETWEEN {} AND {}",
@@ -2027,6 +2168,15 @@ fn normalize_where_expr(expr: WhereExpr, table_alias: Option<&str>, table_name: 
             operator,
             value,
         },
+        WhereExpr::ColumnComparison {
+            left,
+            operator,
+            right,
+        } => WhereExpr::ColumnComparison {
+            left: normalize_column_reference(left, table_alias, table_name),
+            operator,
+            right: normalize_column_reference(right, table_alias, table_name),
+        },
         WhereExpr::Between { column, low, high } => WhereExpr::Between {
             column: normalize_column_reference(column, table_alias, table_name),
             low,
@@ -2085,6 +2235,12 @@ fn dedup_selected_rows(rows: &mut Vec<Vec<Value>>) {
         let key = format!("{:?}", row);
         seen.insert(key, ()).is_none()
     });
+}
+
+#[derive(Debug, Clone)]
+struct MaterializedRelation {
+    schema: TableSchema,
+    rows: Vec<Row>,
 }
 
 fn filtered_rows(rows: Vec<Row>, where_clause: Option<&ResolvedWhereExpr>) -> Vec<Row> {
@@ -2184,6 +2340,10 @@ fn validate_where_expr_columns(
         | WhereExpr::IsNull { column, .. }
         | WhereExpr::InSubquery { column, .. } => {
             validate_expr_columns(&Expr::Column(column.clone()), schema)
+        }
+        WhereExpr::ColumnComparison { left, right, .. } => {
+            validate_expr_columns(&Expr::Column(left.clone()), schema)?;
+            validate_expr_columns(&Expr::Column(right.clone()), schema)
         }
         WhereExpr::And(left, right) | WhereExpr::Or(left, right) => {
             validate_where_expr_columns(left, schema)?;
@@ -2297,6 +2457,14 @@ fn eval_where_expr_unresolved<T: ValueLookup>(row: &T, expr: &WhereExpr) -> bool
         } => row
             .lookup(column)
             .is_some_and(|left| compare_values(left, value, operator.clone())),
+        WhereExpr::ColumnComparison {
+            left,
+            operator,
+            right,
+        } => row
+            .lookup(left)
+            .zip(row.lookup(right))
+            .is_some_and(|(lhs, rhs)| compare_values(lhs, rhs, operator.clone())),
         WhereExpr::Between { column, low, high } => row.lookup(column).is_some_and(|value| {
             compare_values(value, low, Operator::Ge) && compare_values(value, high, Operator::Le)
         }),
@@ -2452,6 +2620,14 @@ fn eval_where_expr<T: ValueLookup>(row: &T, where_clause: Option<&ResolvedWhereE
         } => row
             .lookup(column)
             .is_some_and(|left| compare_values(left, value, operator.clone())),
+        ResolvedWhereExpr::ColumnComparison {
+            left,
+            operator,
+            right,
+        } => row
+            .lookup(left)
+            .zip(row.lookup(right))
+            .is_some_and(|(lhs, rhs)| compare_values(lhs, rhs, operator.clone())),
         ResolvedWhereExpr::Between { column, low, high } => {
             row.lookup(column).is_some_and(|value| {
                 compare_values(value, low, Operator::Ge)

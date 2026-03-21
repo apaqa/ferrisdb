@@ -856,3 +856,132 @@ fn test_having_filters_aggregate_rows() {
 
     let _ = std::fs::remove_dir_all(dir);
 }
+
+#[test]
+fn test_cte_select_variants() {
+    let (dir, _engine, executor) = open_executor("cte-select");
+
+    exec(
+        &executor,
+        "CREATE TABLE employees (id INT, name TEXT, department TEXT, salary INT);",
+    );
+    exec(
+        &executor,
+        "CREATE TABLE departments (id INT, dept_name TEXT, location TEXT);",
+    );
+    exec(
+        &executor,
+        "INSERT INTO employees VALUES (1, 'Alice', 'Engineering', 90000), (2, 'Bob', 'HR', 70000), (3, 'Cara', 'Engineering', 95000);",
+    );
+    exec(
+        &executor,
+        "INSERT INTO departments VALUES (1, 'Engineering', 'Remote'), (2, 'HR', 'Onsite');",
+    );
+
+    let (_, single_rows) = rows_only(exec(
+        &executor,
+        "WITH high_earners AS (SELECT * FROM employees WHERE salary > 80000) SELECT name FROM high_earners ORDER BY name ASC;",
+    ));
+    assert_eq!(
+        single_rows,
+        vec![
+            vec![Value::Text("Alice".to_string())],
+            vec![Value::Text("Cara".to_string())],
+        ]
+    );
+
+    let (_, multi_rows) = rows_only(exec(
+        &executor,
+        "WITH eng AS (SELECT * FROM employees WHERE department = 'Engineering'), hr AS (SELECT * FROM employees WHERE department = 'HR') SELECT name FROM hr ORDER BY name ASC;",
+    ));
+    assert_eq!(multi_rows, vec![vec![Value::Text("Bob".to_string())]]);
+
+    let (_, join_rows) = rows_only(exec(
+        &executor,
+        "WITH high_earners AS (SELECT * FROM employees WHERE salary > 80000) SELECT high_earners.name, departments.location FROM high_earners INNER JOIN departments ON high_earners.department = departments.dept_name ORDER BY high_earners.name ASC;",
+    ));
+    assert_eq!(
+        join_rows,
+        vec![
+            vec![
+                Value::Text("Alice".to_string()),
+                Value::Text("Remote".to_string()),
+            ],
+            vec![
+                Value::Text("Cara".to_string()),
+                Value::Text("Remote".to_string()),
+            ],
+        ]
+    );
+
+    let (_, filtered_rows) = rows_only(exec(
+        &executor,
+        "WITH high_earners AS (SELECT * FROM employees WHERE salary > 80000) SELECT name, salary FROM high_earners WHERE salary >= 90000 ORDER BY salary DESC;",
+    ));
+    assert_eq!(
+        filtered_rows,
+        vec![
+            vec![Value::Text("Cara".to_string()), Value::Int(95000)],
+            vec![Value::Text("Alice".to_string()), Value::Int(90000)],
+        ]
+    );
+
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn test_update_from_and_delete_using() {
+    let (dir, _engine, executor) = open_executor("update-delete-join");
+
+    exec(
+        &executor,
+        "CREATE TABLE employees (id INT, name TEXT, department TEXT, salary INT);",
+    );
+    exec(
+        &executor,
+        "CREATE TABLE departments (id INT, dept_name TEXT, location TEXT);",
+    );
+    exec(
+        &executor,
+        "INSERT INTO employees VALUES (1, 'Alice', 'Engineering', 100), (2, 'Bob', 'HR', 80), (3, 'Cara', 'Engineering', 110);",
+    );
+    exec(
+        &executor,
+        "INSERT INTO departments VALUES (1, 'Engineering', 'Remote'), (2, 'HR', 'Onsite');",
+    );
+
+    assert_eq!(
+        exec(
+            &executor,
+            "UPDATE employees SET salary = 0 FROM departments WHERE employees.department = departments.dept_name AND departments.location = 'Remote';",
+        ),
+        ExecuteResult::Updated { count: 2 }
+    );
+    let (_, updated_rows) = rows_only(exec(
+        &executor,
+        "SELECT name, salary FROM employees ORDER BY id ASC;",
+    ));
+    assert_eq!(
+        updated_rows,
+        vec![
+            vec![Value::Text("Alice".to_string()), Value::Int(0)],
+            vec![Value::Text("Bob".to_string()), Value::Int(80)],
+            vec![Value::Text("Cara".to_string()), Value::Int(0)],
+        ]
+    );
+
+    assert_eq!(
+        exec(
+            &executor,
+            "DELETE FROM employees USING departments WHERE employees.department = departments.dept_name AND departments.location = 'Remote';",
+        ),
+        ExecuteResult::Deleted { count: 2 }
+    );
+    let (_, remaining_rows) = rows_only(exec(
+        &executor,
+        "SELECT name FROM employees ORDER BY id ASC;",
+    ));
+    assert_eq!(remaining_rows, vec![vec![Value::Text("Bob".to_string())]]);
+
+    let _ = std::fs::remove_dir_all(dir);
+}

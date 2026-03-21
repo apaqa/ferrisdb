@@ -41,17 +41,21 @@ pub enum Statement {
     },
     CreateIndex {
         table_name: String,
-        column_name: String,
+        // 中文註解：索引現在可同時覆蓋多個欄位，保留欄位順序供前綴匹配使用。
+        column_names: Vec<String>,
     },
     DropIndex {
         table_name: String,
-        column_name: String,
+        // 中文註解：DROP INDEX 也改用多欄位簽名來唯一識別 composite index。
+        column_names: Vec<String>,
     },
     Insert {
         table_name: String,
         source: InsertSource,
     },
     Select {
+        // 中文註解：WITH 產生的 CTE 只在當前 SELECT / 查詢表達式內有效。
+        ctes: Vec<CTE>,
         distinct: bool,
         table_name: String,
         table_alias: Option<String>,
@@ -66,10 +70,16 @@ pub enum Statement {
     Update {
         table_name: String,
         assignments: Vec<Assignment>,
+        // 中文註解：UPDATE ... FROM 會先把來源表與目標表配對，再依 join_condition 判斷是否更新。
+        from_table: Option<String>,
+        join_condition: Option<WhereExpr>,
         where_clause: Option<WhereExpr>,
     },
     Delete {
         table_name: String,
+        // 中文註解：DELETE ... USING 會先建立目標表與來源表的 JOIN 視圖，再套用條件找刪除目標。
+        using_table: Option<String>,
+        join_condition: Option<WhereExpr>,
         where_clause: Option<WhereExpr>,
     },
     Union {
@@ -77,6 +87,12 @@ pub enum Statement {
         right: Box<Statement>,
         all: bool,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CTE {
+    pub name: String,
+    pub query: Box<Statement>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -168,6 +184,12 @@ pub enum WhereExpr {
         column: String,
         operator: Operator,
         value: Value,
+    },
+    // 中文註解：欄位對欄位比較供 UPDATE/DELETE JOIN 與進階條件共用。
+    ColumnComparison {
+        left: String,
+        operator: Operator,
+        right: String,
     },
     Between {
         column: String,

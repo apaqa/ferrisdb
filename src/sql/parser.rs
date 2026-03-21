@@ -4,9 +4,9 @@
 use crate::error::{FerrisDbError, Result};
 
 use super::ast::{
-    AggregateFunc, Assignment, ColumnDef, DataType, Expr, GroupByClause, InsertSource, JoinClause,
-    JoinType, Operator, OrderByClause, OrderDirection, SelectColumns, SelectItem, Statement, Value,
-    WhereExpr, WindowFunc,
+    AggregateFunc, Assignment, CTE, ColumnDef, DataType, Expr, GroupByClause, InsertSource,
+    JoinClause, JoinType, Operator, OrderByClause, OrderDirection, SelectColumns, SelectItem,
+    Statement, Value, WhereExpr, WindowFunc,
 };
 use super::lexer::{Keyword, Token};
 
@@ -45,6 +45,7 @@ impl Parser {
             Some(Token::Keyword(Keyword::Create)) => self.parse_create_statement()?,
             Some(Token::Keyword(Keyword::Drop)) => self.parse_drop_statement()?,
             Some(Token::Keyword(Keyword::Insert)) => self.parse_insert()?,
+            Some(Token::Keyword(Keyword::With)) => self.parse_query_expression()?,
             Some(Token::Keyword(Keyword::Select)) => self.parse_query_expression()?,
             Some(Token::Keyword(Keyword::Update)) => self.parse_update()?,
             Some(Token::Keyword(Keyword::Delete)) => self.parse_delete()?,
@@ -136,11 +137,11 @@ impl Parser {
         self.expect_keyword(Keyword::On)?;
         let table_name = self.expect_ident()?;
         self.expect_token(Token::LParen)?;
-        let column_name = self.expect_ident()?;
+        let column_names = self.parse_identifier_list()?;
         self.expect_token(Token::RParen)?;
         Ok(Statement::CreateIndex {
             table_name,
-            column_name,
+            column_names,
         })
     }
 
@@ -161,11 +162,11 @@ impl Parser {
                 self.expect_keyword(Keyword::On)?;
                 let table_name = self.expect_ident()?;
                 self.expect_token(Token::LParen)?;
-                let column_name = self.expect_ident()?;
+                let column_names = self.parse_identifier_list()?;
                 self.expect_token(Token::RParen)?;
                 Ok(Statement::DropIndex {
                     table_name,
-                    column_name,
+                    column_names,
                 })
             }
             Some(Token::Keyword(Keyword::Table)) => {
@@ -218,6 +219,7 @@ impl Parser {
     fn parse_explain(&mut self) -> Result<Statement> {
         self.expect_keyword(Keyword::Explain)?;
         let statement = match self.peek() {
+            Some(Token::Keyword(Keyword::With)) => self.parse_query_expression()?,
             Some(Token::Keyword(Keyword::Select)) => self.parse_query_expression()?,
             other => {
                 return Err(FerrisDbError::InvalidCommand(format!(
@@ -281,9 +283,45 @@ impl Parser {
         Ok(rows)
     }
 
+    fn parse_optional_ctes(&mut self) -> Result<Vec<CTE>> {
+        if !matches!(self.peek(), Some(Token::Keyword(Keyword::With))) {
+            return Ok(Vec::new());
+        }
+
+        self.expect_keyword(Keyword::With)?;
+        if matches!(self.peek(), Some(Token::Keyword(Keyword::Recursive))) {
+            return Err(FerrisDbError::InvalidCommand(
+                "WITH RECURSIVE is not supported yet".to_string(),
+            ));
+        }
+
+        let mut ctes = Vec::new();
+        loop {
+            let name = self.expect_ident()?;
+            self.expect_keyword(Keyword::As)?;
+            self.expect_token(Token::LParen)?;
+            let inner_tokens = self.collect_parenthesized_query_tokens()?;
+            let mut parser = Parser::new(inner_tokens);
+            let query = parser.parse_query_expression()?;
+            ctes.push(CTE {
+                name,
+                query: Box::new(query),
+            });
+
+            if matches!(self.peek(), Some(Token::Comma)) {
+                self.bump();
+                continue;
+            }
+            break;
+        }
+
+        Ok(ctes)
+    }
+
     // 中文註解：查詢表達式允許 `SELECT ... UNION [ALL] SELECT ...` 的鏈式結構。
     fn parse_query_expression(&mut self) -> Result<Statement> {
-        let mut statement = self.parse_select()?;
+        let ctes = self.parse_optional_ctes()?;
+        let mut statement = self.parse_select_with_ctes(ctes)?;
         while matches!(self.peek(), Some(Token::Keyword(Keyword::Union))) {
             self.bump();
             let all = if matches!(self.peek(), Some(Token::Keyword(Keyword::All))) {
@@ -292,7 +330,7 @@ impl Parser {
             } else {
                 false
             };
-            let right = self.parse_select()?;
+            let right = self.parse_select_with_ctes(Vec::new())?;
             statement = Statement::Union {
                 left: Box::new(statement),
                 right: Box::new(right),
@@ -303,6 +341,10 @@ impl Parser {
     }
 
     fn parse_select(&mut self) -> Result<Statement> {
+        self.parse_select_with_ctes(Vec::new())
+    }
+
+    fn parse_select_with_ctes(&mut self, ctes: Vec<CTE>) -> Result<Statement> {
         self.expect_keyword(Keyword::Select)?;
         let distinct = if matches!(self.peek(), Some(Token::Keyword(Keyword::Distinct))) {
             self.bump();
@@ -344,6 +386,7 @@ impl Parser {
         let limit = self.parse_optional_limit()?;
 
         Ok(Statement::Select {
+            ctes,
             distinct,
             table_name,
             table_alias,
@@ -376,10 +419,21 @@ impl Parser {
             break;
         }
 
+        let mut from_table = None;
+        let mut join_condition = None;
+        if matches!(self.peek(), Some(Token::Keyword(Keyword::From))) {
+            self.bump();
+            from_table = Some(self.expect_ident()?);
+        }
         let where_clause = self.parse_optional_where()?;
+        if from_table.is_some() {
+            join_condition = where_clause.clone();
+        }
         Ok(Statement::Update {
             table_name,
             assignments,
+            from_table,
+            join_condition,
             where_clause,
         })
     }
@@ -388,9 +442,20 @@ impl Parser {
         self.expect_keyword(Keyword::Delete)?;
         self.expect_keyword(Keyword::From)?;
         let table_name = self.expect_ident()?;
+        let mut using_table = None;
+        let mut join_condition = None;
+        if matches!(self.peek(), Some(Token::Keyword(Keyword::Using))) {
+            self.bump();
+            using_table = Some(self.expect_ident()?);
+        }
         let where_clause = self.parse_optional_where()?;
+        if using_table.is_some() {
+            join_condition = where_clause.clone();
+        }
         Ok(Statement::Delete {
             table_name,
+            using_table,
+            join_condition,
             where_clause,
         })
     }
@@ -501,12 +566,21 @@ impl Parser {
         }
 
         let operator = self.parse_operator()?;
-        let value = self.parse_value()?;
-        Ok(WhereExpr::Comparison {
-            column,
-            operator,
-            value,
-        })
+        match self.peek() {
+            Some(Token::Ident(_)) => Ok(WhereExpr::ColumnComparison {
+                left: column,
+                operator,
+                right: self.parse_identifier_path()?,
+            }),
+            _ => {
+                let value = self.parse_value()?;
+                Ok(WhereExpr::Comparison {
+                    column,
+                    operator,
+                    value,
+                })
+            }
+        }
     }
 
     fn parse_condition_column(&mut self) -> Result<String> {
@@ -852,6 +926,45 @@ impl Parser {
         Ok(true)
     }
 
+    fn parse_identifier_list(&mut self) -> Result<Vec<String>> {
+        let mut columns = Vec::new();
+        loop {
+            columns.push(self.expect_ident()?);
+            if matches!(self.peek(), Some(Token::Comma)) {
+                self.bump();
+                continue;
+            }
+            break;
+        }
+        Ok(columns)
+    }
+
+    fn collect_parenthesized_query_tokens(&mut self) -> Result<Vec<Token>> {
+        let mut depth = 1_i32;
+        let mut tokens = Vec::new();
+
+        while let Some(token) = self.bump() {
+            match token {
+                Token::LParen => {
+                    depth += 1;
+                    tokens.push(Token::LParen);
+                }
+                Token::RParen => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Ok(tokens);
+                    }
+                    tokens.push(Token::RParen);
+                }
+                other => tokens.push(other),
+            }
+        }
+
+        Err(FerrisDbError::InvalidCommand(
+            "unterminated CTE subquery".to_string(),
+        ))
+    }
+
     fn parse_optional_table_alias(&mut self) -> Result<Option<String>> {
         if matches!(self.peek(), Some(Token::Keyword(Keyword::As))) {
             self.bump();
@@ -1031,6 +1144,8 @@ fn keyword_to_sql(keyword: &Keyword) -> &'static str {
         Keyword::Select => "SELECT",
         Keyword::From => "FROM",
         Keyword::Where => "WHERE",
+        Keyword::With => "WITH",
+        Keyword::Recursive => "RECURSIVE",
         Keyword::Case => "CASE",
         Keyword::When => "WHEN",
         Keyword::Then => "THEN",
@@ -1069,6 +1184,7 @@ fn keyword_to_sql(keyword: &Keyword) -> &'static str {
         Keyword::Update => "UPDATE",
         Keyword::Set => "SET",
         Keyword::Delete => "DELETE",
+        Keyword::Using => "USING",
         Keyword::Over => "OVER",
         Keyword::Partition => "PARTITION",
         Keyword::RowNumber => "ROW_NUMBER",
