@@ -24,6 +24,18 @@ impl Parser {
         Parser { tokens, pos: 0 }
     }
 
+    // 中文註解：把整段輸入拆成多條 SQL，逐條使用既有 lexer/parser 解析。
+    pub fn parse_multiple(input: &str) -> Result<Vec<Statement>> {
+        let mut statements = Vec::new();
+        for sql in split_sql_statements(input) {
+            let mut lexer = super::lexer::Lexer::new(&sql);
+            let tokens = lexer.tokenize()?;
+            let mut parser = Parser::new(tokens);
+            statements.push(parser.parse()?);
+        }
+        Ok(statements)
+    }
+
     // 中文註解：解析整條 SQL，並檢查結尾是否還殘留未消耗的 token。
     pub fn parse(&mut self) -> Result<Statement> {
         if self.tokens.is_empty() {
@@ -250,7 +262,8 @@ impl Parser {
                 SelectColumns::Aggregate(items)
             } else {
                 SelectColumns::Named(
-                    items.into_iter()
+                    items
+                        .into_iter()
                         .map(|item| match item {
                             SelectItem::Column(name) => name,
                             SelectItem::Aggregate { .. } => unreachable!("aggregate filtered"),
@@ -672,4 +685,40 @@ fn render_condition_item(item: &SelectItem) -> String {
             (_, None) => "INVALID_AGGREGATE".to_string(),
         },
     }
+}
+
+// 中文註解：以簡單狀態機處理單引號字串，避免字串中的分號被誤判成語句分隔。
+fn split_sql_statements(input: &str) -> Vec<String> {
+    let mut statements = Vec::new();
+    let mut current = String::new();
+    let mut in_string = false;
+    let mut chars = input.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\'' => {
+                current.push(ch);
+                if in_string && matches!(chars.peek(), Some('\'')) {
+                    current.push(chars.next().expect("escaped quote"));
+                } else {
+                    in_string = !in_string;
+                }
+            }
+            ';' if !in_string => {
+                let trimmed = current.trim();
+                if !trimmed.is_empty() {
+                    statements.push(trimmed.to_string());
+                }
+                current.clear();
+            }
+            _ => current.push(ch),
+        }
+    }
+
+    let trimmed = current.trim();
+    if !trimmed.is_empty() {
+        statements.push(trimmed.to_string());
+    }
+
+    statements
 }

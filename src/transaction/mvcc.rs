@@ -19,19 +19,16 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use crate::error::Result;
 use crate::storage::lsm::{LsmEngine, TOMBSTONE};
-use crate::storage::traits::StorageEngine;
 
-use super::keyutil::{
-    decode_key, encode_key, encode_key_prefix_end,
-};
+use super::keyutil::{decode_key, encode_key, encode_key_prefix_end};
 
 #[derive(Debug)]
 pub struct MvccEngine {
-    pub inner: Mutex<LsmEngine>,
+    pub inner: Arc<LsmEngine>,
     pub next_ts: AtomicU64,
 }
 
@@ -47,7 +44,7 @@ impl MvccEngine {
     pub fn new(lsm: LsmEngine) -> MvccEngine {
         let next_ts = infer_next_timestamp(&lsm);
         MvccEngine {
-            inner: Mutex::new(lsm),
+            inner: Arc::new(lsm),
             next_ts: AtomicU64::new(next_ts),
         }
     }
@@ -69,13 +66,11 @@ impl MvccEngine {
     }
 
     pub fn shutdown(&self) -> Result<()> {
-        let mut inner = self.inner.lock().expect("mvcc engine mutex poisoned");
-        inner.shutdown()
+        self.inner.shutdown()
     }
 
     pub fn compact(&self) -> Result<()> {
-        let mut inner = self.inner.lock().expect("mvcc engine mutex poisoned");
-        inner.compact()
+        self.inner.compact()
     }
 }
 
@@ -91,8 +86,7 @@ impl Transaction {
         let encoded_start = encode_key(key, self.read_ts);
         let encoded_end = encode_key_prefix_end(key);
 
-        let inner = self.engine.inner.lock().expect("mvcc engine mutex poisoned");
-        let rows = inner.raw_scan(&encoded_start, &encoded_end)?;
+        let rows = self.engine.inner.raw_scan(&encoded_start, &encoded_end)?;
         for (encoded_key, value) in rows {
             let (user_key, ts) = decode_key(&encoded_key);
             if user_key == key && ts <= self.read_ts {
@@ -122,12 +116,10 @@ impl Transaction {
         }
 
         let write_ts = self.engine.next_timestamp();
-        let mut inner = self.engine.inner.lock().expect("mvcc engine mutex poisoned");
-
         for (key, value_opt) in &self.writes {
             let encoded_key = encode_key(key, write_ts);
             let value = value_opt.clone().unwrap_or_else(|| TOMBSTONE.to_vec());
-            inner.put(encoded_key, value)?;
+            self.engine.inner.put_entry(encoded_key, value)?;
         }
 
         self.committed = true;
@@ -139,8 +131,7 @@ impl Transaction {
         let mut seen = BTreeSet::<Vec<u8>>::new();
 
         {
-            let inner = self.engine.inner.lock().expect("mvcc engine mutex poisoned");
-            let rows = inner.raw_list_all()?;
+            let rows = self.engine.inner.raw_list_all()?;
             for (encoded_key, value) in rows {
                 let (user_key, ts) = decode_key(&encoded_key);
                 if user_key < start || user_key > end || ts > self.read_ts {

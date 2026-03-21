@@ -491,17 +491,38 @@
     function renderSqlResult(result) {
       const elapsed = Number(result.elapsed_ms || 0);
       const rowCount = Number(result.row_count || 0);
-      els.sqlMeta.textContent = `elapsed: ${elapsed} ms, rows: ${rowCount}`;
-      if (!result.success) return renderErrorBox(els.sqlResult, result.message || "Unknown SQL error");
-      if (result.type === "select") return void (els.sqlResult.innerHTML = renderTable(result.columns || [], result.rows || []));
-      if (result.type === "explained") {
-        const plan = (((result.rows || [])[0] || [])[0]) || result.message || "";
-        els.sqlResult.innerHTML = `<div class="result-message ok">Query plan ready.</div><pre class="mono-block">${escapeHtml(String(plan))}</pre>`;
+      const executedCount = Number(result.executed_count || 0);
+      els.sqlMeta.textContent = `elapsed: ${elapsed} ms, rows: ${rowCount}, executed: ${executedCount}`;
+      const statementResults = Array.isArray(result.statement_results) ? result.statement_results : [];
+      if (statementResults.length > 0) {
+        els.sqlResult.innerHTML = renderStatementResults(statementResults, result.success, result.message || "");
         return;
       }
-      let message = result.message || "Command completed.";
-      if (["inserted", "updated", "deleted"].includes(result.type)) message = `${capitalize(result.type)} ${rowCount} row(s).`;
-      els.sqlResult.innerHTML = `<div class="result-message ok">${escapeHtml(message)}</div>`;
+      if (!result.success) return renderErrorBox(els.sqlResult, result.message || "Unknown SQL error");
+      if (result.type === "select") return void (els.sqlResult.innerHTML = renderTable(result.columns || [], result.rows || []));
+      els.sqlResult.innerHTML = `<div class="result-message ok">${escapeHtml(result.message || "Command completed.")}</div>`;
+    }
+
+    function renderStatementResults(statementResults, overallSuccess, overallMessage) {
+      const headerClass = overallSuccess ? "ok" : "error";
+      const blocks = statementResults.map((entry, index) => {
+        const title = `<div class="result-message ${entry.success ? "ok" : "error"}">#${index + 1} · ${escapeHtml(entry.sql || "(statement)")}</div>`;
+        let body = "";
+        if (entry.type === "select") {
+          body = renderTable(entry.columns || [], entry.rows || []);
+        } else if (entry.type === "explained") {
+          const plan = (((entry.rows || [])[0] || [])[0]) || entry.message || "";
+          body = `<pre class="mono-block">${escapeHtml(String(plan))}</pre>`;
+        } else {
+          let message = entry.message || "Command completed.";
+          if (["inserted", "updated", "deleted"].includes(entry.type)) {
+            message = `${capitalize(entry.type)} ${Number(entry.row_count || 0)} row(s).`;
+          }
+          body = `<div>${escapeHtml(message)}</div>`;
+        }
+        return `${title}<div class="result-meta">type: ${escapeHtml(entry.type || "unknown")} · elapsed: ${Number(entry.elapsed_ms || 0)} ms · rows: ${Number(entry.row_count || 0)}</div><div style="margin:12px 0 18px;">${body}</div>${index < statementResults.length - 1 ? '<hr style="border:0;border-top:1px solid rgba(201,209,217,0.08);margin:18px 0;">' : ""}`;
+      }).join("");
+      return `<div class="result-message ${headerClass}">${escapeHtml(overallSuccess ? `Executed ${statementResults.length} statement(s).` : overallMessage || "Execution failed.")}</div>${blocks}`;
     }
 
     async function refreshTables() {

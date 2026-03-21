@@ -157,7 +157,9 @@ fn test_lsm_manifest_stays_consistent_after_flush_compact_restart() {
     for batch in 0..5_u32 {
         let key = format!("k{:03}", batch);
         let value = format!("payload-{}-xxxxxxxxxxxxxxxxxxxxxxxx", batch);
-        engine.put(key.into_bytes(), value.into_bytes()).expect("put");
+        engine
+            .put(key.into_bytes(), value.into_bytes())
+            .expect("put");
         engine
             .put(
                 format!("filler:{:03}", batch).into_bytes(),
@@ -172,16 +174,27 @@ fn test_lsm_manifest_stays_consistent_after_flush_compact_restart() {
 
     let reopened = LsmEngine::open(&dir, 64).expect("reopen lsm");
     let manifest_state = reopened.manifest_state();
-    assert_eq!(manifest_state.sstable_files.len(), reopened.sstables.len());
+    assert_eq!(
+        manifest_state.sstable_files.len(),
+        reopened.sstable_infos().expect("sstable infos").len()
+    );
     for filename in &manifest_state.sstable_files {
-        assert!(dir.join(filename).exists(), "manifest file should exist: {}", filename);
+        assert!(
+            dir.join(filename).exists(),
+            "manifest file should exist: {}",
+            filename
+        );
     }
 
     let disk_files: Vec<String> = fs::read_dir(&dir)
         .expect("read dir")
         .filter_map(|entry| entry.ok().map(|e| e.path()))
         .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("sst"))
-        .filter_map(|path| path.file_name().and_then(|name| name.to_str()).map(|s| s.to_string()))
+        .filter_map(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .map(|s| s.to_string())
+        })
         .collect();
     assert_eq!(disk_files.len(), manifest_state.sstable_files.len());
 

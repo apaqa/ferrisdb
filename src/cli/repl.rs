@@ -26,11 +26,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::bench::{format_bench_results, run_basic_kv_benchmark};
 use crate::error::Result;
+use crate::sql::executor::{format_execute_result, SqlExecutor};
+use crate::sql::parser::Parser;
 use crate::storage::lsm::TOMBSTONE;
 use crate::storage::traits::StorageEngine;
-use crate::sql::executor::{format_execute_result, SqlExecutor};
-use crate::sql::lexer::Lexer;
-use crate::sql::parser::Parser;
 use crate::transaction::keyutil::decode_key;
 use crate::transaction::mvcc::{MvccEngine, Transaction};
 
@@ -201,11 +200,7 @@ fn handle_get(engine: &Arc<MvccEngine>, active_txn: &mut Option<Transaction>, pa
     }
 }
 
-fn handle_delete(
-    engine: &Arc<MvccEngine>,
-    active_txn: &mut Option<Transaction>,
-    parts: &[&str],
-) {
+fn handle_delete(engine: &Arc<MvccEngine>, active_txn: &mut Option<Transaction>, parts: &[&str]) {
     if parts.len() != 2 {
         println!("Usage: delete <key>");
         return;
@@ -312,8 +307,7 @@ fn handle_flush(engine: &Arc<MvccEngine>, active_txn: &Option<Transaction>) {
         return;
     }
 
-    let mut inner = engine.inner.lock().expect("mvcc engine mutex poisoned");
-    match inner.flush() {
+    match engine.inner.flush() {
         Ok(()) => println!("OK"),
         Err(err) => println!("Error: {}", err),
     }
@@ -321,7 +315,7 @@ fn handle_flush(engine: &Arc<MvccEngine>, active_txn: &Option<Transaction>) {
 
 fn handle_show(engine: &Arc<MvccEngine>, _active_txn: &Option<Transaction>, parts: &[&str]) {
     if parts.len() != 2 {
-        println!("Usage: show <sstables|manifest|wal|stats>");
+        println!("Usage: show <sstables|manifest|wal|stats|compaction>");
         return;
     }
 
@@ -330,6 +324,7 @@ fn handle_show(engine: &Arc<MvccEngine>, _active_txn: &Option<Transaction>, part
         "manifest" => show_manifest(engine),
         "wal" => show_wal(engine),
         "stats" => show_full_stats(engine),
+        "compaction" => show_compaction(engine),
         _ => println!("Unknown show target: '{}'", parts[1]),
     }
 }
@@ -439,6 +434,7 @@ fn handle_help() {
     println!("  show manifest           Show MANIFEST state");
     println!("  show wal                Show WAL size and record count");
     println!("  show stats              Show storage statistics");
+    println!("  show compaction         Show background compaction status");
     println!("  debug key <key>         Show where a key exists in memtable / sstables");
     println!("  list                    List visible key-value pairs (alias: ls)");
     println!("  scan <start> <end>      Range scan");
@@ -453,22 +449,24 @@ fn handle_sql_line(line: &str, engine: &Arc<MvccEngine>, has_active_txn: bool) {
         return;
     }
 
-    let mut lexer = Lexer::new(line);
-    let tokens = match lexer.tokenize() {
-        Ok(tokens) => tokens,
-        Err(err) => {
-            println!("SQL lexer error: {}", err);
-            return;
-        }
-    };
-
-    let mut parser = Parser::new(tokens);
-    match parser.parse() {
-        Ok(stmt) => {
+    match Parser::parse_multiple(line) {
+        Ok(statements) => {
+            if statements.is_empty() {
+                println!("SQL parser error: empty SQL statement");
+                return;
+            }
             let executor = SqlExecutor::new(Arc::clone(engine));
-            match executor.execute(stmt) {
-                Ok(result) => println!("{}", format_execute_result(&result)),
-                Err(err) => println!("SQL execution error: {}", err),
+            for (idx, stmt) in statements.into_iter().enumerate() {
+                match executor.execute(stmt) {
+                    Ok(result) => {
+                        println!("-- statement {} --", idx + 1);
+                        println!("{}", format_execute_result(&result));
+                    }
+                    Err(err) => {
+                        println!("SQL execution error after {} statement(s): {}", idx, err);
+                        break;
+                    }
+                }
             }
         }
         Err(err) => println!("SQL parser error: {}", err),
@@ -503,8 +501,7 @@ fn read_pairs_from_file(filename: &str) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
 }
 
 fn show_sstables(engine: &Arc<MvccEngine>) {
-    let inner = engine.inner.lock().expect("mvcc engine mutex poisoned");
-    match inner.sstable_infos() {
+    match engine.inner.sstable_infos() {
         Ok(infos) => {
             if infos.is_empty() {
                 println!("(no sstables)");
@@ -523,8 +520,7 @@ fn show_sstables(engine: &Arc<MvccEngine>) {
 }
 
 fn show_manifest(engine: &Arc<MvccEngine>) {
-    let inner = engine.inner.lock().expect("mvcc engine mutex poisoned");
-    let state = inner.manifest_state();
+    let state = engine.inner.manifest_state();
 
     println!("MANIFEST:");
     println!("  next_sstable_id: {}", state.next_sstable_id);
@@ -540,10 +536,9 @@ fn show_manifest(engine: &Arc<MvccEngine>) {
 }
 
 fn show_wal(engine: &Arc<MvccEngine>) {
-    let inner = engine.inner.lock().expect("mvcc engine mutex poisoned");
-    match inner.wal_info() {
+    match engine.inner.wal_info() {
         Ok((size, records)) => {
-            println!("WAL path: {}", inner.wal_path().display());
+            println!("WAL path: {}", engine.inner.wal_path().display());
             println!("WAL size: {} bytes", size);
             println!("WAL records: {}", records);
         }
@@ -563,19 +558,28 @@ fn show_full_stats(engine: &Arc<MvccEngine>) {
         }
     };
 
-    let inner = engine.inner.lock().expect("mvcc engine mutex poisoned");
-    match inner.disk_usage_bytes() {
+    match engine.inner.disk_usage_bytes() {
         Ok(disk_usage) => {
             println!("Entries: {}", entries);
-            println!("SSTables: {}", inner.manifest_state().sstable_files.len());
+            println!(
+                "SSTables: {}",
+                engine.inner.manifest_state().sstable_files.len()
+            );
             println!("Disk usage: {} bytes", disk_usage);
             println!(
                 "Bloom filter hit rate: {:.2}%",
-                inner.bloom_filter_hit_rate() * 100.0
+                engine.inner.bloom_filter_hit_rate() * 100.0
             );
         }
         Err(err) => println!("Error: {}", err),
     }
+}
+
+fn show_compaction(engine: &Arc<MvccEngine>) {
+    let (enabled, last_compaction_ts, total_compactions) = engine.inner.compaction_status();
+    println!("Background compaction enabled: {}", enabled);
+    println!("Last compaction time: {}", last_compaction_ts);
+    println!("Total compactions: {}", total_compactions);
 }
 
 fn debug_key(engine: &Arc<MvccEngine>, key: &[u8]) {
@@ -593,15 +597,15 @@ fn debug_key(engine: &Arc<MvccEngine>, key: &[u8]) {
         }
     }
 
-    let inner = engine.inner.lock().expect("mvcc engine mutex poisoned");
-    match inner.active_memtable.list_all() {
+    match engine.inner.active_memtable_entries() {
         Ok(entries) => {
             let mem_matches: Vec<_> = entries
                 .into_iter()
-                .filter_map(|(encoded_key, value)| match decode_mvcc_entry(&encoded_key, &value, key)
-                {
-                    Some(line) => Some(line),
-                    None => None,
+                .filter_map(|(encoded_key, value)| {
+                    match decode_mvcc_entry(&encoded_key, &value, key) {
+                        Some(line) => Some(line),
+                        None => None,
+                    }
                 })
                 .collect();
 
@@ -620,35 +624,20 @@ fn debug_key(engine: &Arc<MvccEngine>, key: &[u8]) {
         }
     }
 
-    for reader in &inner.sstables {
+    let snapshots = match engine.inner.sstable_debug_snapshots() {
+        Ok(snapshots) => snapshots,
+        Err(err) => {
+            println!("Error: {}", err);
+            return;
+        }
+    };
+    for (name, entries) in snapshots {
         let mut matched = Vec::new();
-        match reader.iter() {
-            Ok(iter) => {
-                for item in iter {
-                    match item {
-                        Ok((encoded_key, value)) => {
-                            if let Some(line) = decode_mvcc_entry(&encoded_key, &value, key) {
-                                matched.push(line);
-                            }
-                        }
-                        Err(err) => {
-                            println!("Error: {}", err);
-                            return;
-                        }
-                    }
-                }
-            }
-            Err(err) => {
-                println!("Error: {}", err);
-                return;
+        for (encoded_key, value) in entries {
+            if let Some(line) = decode_mvcc_entry(&encoded_key, &value, key) {
+                matched.push(line);
             }
         }
-
-        let name = reader
-            .path()
-            .file_name()
-            .and_then(|file| file.to_str())
-            .unwrap_or("<invalid>");
         if matched.is_empty() {
             println!("{}: (no versions)", name);
         } else {

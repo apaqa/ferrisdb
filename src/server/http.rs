@@ -31,7 +31,6 @@ use crate::sql::ast::{DataType, Value as SqlValue};
 use crate::sql::catalog::Catalog;
 use crate::sql::executor::{ExecuteResult, SqlExecutor};
 use crate::sql::index::IndexManager;
-use crate::sql::lexer::Lexer;
 use crate::sql::parser::Parser;
 use crate::sql::row::{encode_row_prefix_end, encode_row_prefix_start, Row};
 use crate::transaction::mvcc::MvccEngine;
@@ -205,13 +204,12 @@ fn handle_stats(engine: &Arc<MvccEngine>) -> HttpResponse {
         total_rows += rows.len();
     }
 
-    let inner = engine.inner.lock().expect("mvcc engine mutex poisoned");
-    let disk_usage_bytes = match inner.disk_usage_bytes() {
+    let disk_usage_bytes = match engine.inner.disk_usage_bytes() {
         Ok(bytes) => bytes,
         Err(err) => return json_error_response(500, "stats_failed", err.to_string()),
     };
-    let manifest_state = inner.manifest_state();
-    let (wal_size_bytes, wal_record_count) = match inner.wal_info() {
+    let manifest_state = engine.inner.manifest_state();
+    let (wal_size_bytes, wal_record_count) = match engine.inner.wal_info() {
         Ok(info) => info,
         Err(err) => return json_error_response(500, "stats_failed", err.to_string()),
     };
@@ -227,14 +225,14 @@ fn handle_stats(engine: &Arc<MvccEngine>) -> HttpResponse {
             disk_usage_bytes,
             wal_size_bytes,
             wal_record_count,
-            bloom_filter_hit_rate: inner.bloom_filter_hit_rate(),
+            bloom_filter_hit_rate: engine.inner.bloom_filter_hit_rate(),
             next_sstable_id: manifest_state.next_sstable_id,
             manifest_status: ManifestStatusResponse {
                 summary: format!("{} SSTables tracked", manifest_state.sstable_files.len()),
                 last_compaction_ts: manifest_state.last_compaction_ts,
             },
             wal_status: WalStatusResponse {
-                path: inner.wal_path().display().to_string(),
+                path: engine.inner.wal_path().display().to_string(),
                 size_bytes: wal_size_bytes,
                 record_count: wal_record_count,
             },
@@ -243,13 +241,12 @@ fn handle_stats(engine: &Arc<MvccEngine>) -> HttpResponse {
 }
 
 fn handle_sstables(engine: &Arc<MvccEngine>) -> HttpResponse {
-    let inner = engine.inner.lock().expect("mvcc engine mutex poisoned");
-    let manifest_state = inner.manifest_state();
-    let wal_info = match inner.wal_info() {
+    let manifest_state = engine.inner.manifest_state();
+    let wal_info = match engine.inner.wal_info() {
         Ok(info) => info,
         Err(err) => return json_error_response(500, "sstables_failed", err.to_string()),
     };
-    match inner.sstable_infos() {
+    match engine.inner.sstable_infos() {
         Ok(sstables) => json_response(
             200,
             &SstablesResponse {
@@ -260,7 +257,7 @@ fn handle_sstables(engine: &Arc<MvccEngine>) -> HttpResponse {
                     last_compaction_ts: manifest_state.last_compaction_ts,
                 },
                 wal: WalStatusResponse {
-                    path: inner.wal_path().display().to_string(),
+                    path: engine.inner.wal_path().display().to_string(),
                     size_bytes: wal_info.0,
                     record_count: wal_info.1,
                 },
@@ -284,8 +281,7 @@ fn handle_compact(engine: &Arc<MvccEngine>) -> HttpResponse {
 }
 
 fn handle_flush(engine: &Arc<MvccEngine>) -> HttpResponse {
-    let mut inner = engine.inner.lock().expect("mvcc engine mutex poisoned");
-    match inner.flush() {
+    match engine.inner.flush() {
         Ok(()) => json_response(
             200,
             &SimpleMessage {
@@ -309,8 +305,12 @@ fn handle_homepage(path: &str) -> HttpResponse {
 fn handle_sql_api(request: &HttpRequest, engine: &Arc<MvccEngine>) -> HttpResponse {
     if let Some(content_type) = request.headers.get("content-type") {
         if !content_type.starts_with("text/plain") {
-            let response =
-                SqlApiResponse::error("request Content-Type must be text/plain".to_string(), 0);
+            let response = SqlApiResponse::error(
+                "request Content-Type must be text/plain".to_string(),
+                0,
+                0,
+                Vec::new(),
+            );
             return json_response(415, &response);
         }
     }
@@ -318,8 +318,12 @@ fn handle_sql_api(request: &HttpRequest, engine: &Arc<MvccEngine>) -> HttpRespon
     let sql = match String::from_utf8(request.body.clone()) {
         Ok(sql) => sql,
         Err(_) => {
-            let response =
-                SqlApiResponse::error("SQL request body must be valid UTF-8 text".to_string(), 0);
+            let response = SqlApiResponse::error(
+                "SQL request body must be valid UTF-8 text".to_string(),
+                0,
+                0,
+                Vec::new(),
+            );
             return json_response(400, &response);
         }
     };
@@ -524,26 +528,121 @@ fn write_http_response(writer: &mut BufWriter<TcpStream>, response: HttpResponse
 // 中文註解：重用 parser 與 executor，把 SQL 純文字轉成 API 回應格式。
 fn execute_sql_text(engine: &Arc<MvccEngine>, sql: &str) -> SqlApiResponse {
     let start = Instant::now();
-
-    let mut lexer = Lexer::new(sql);
-    let tokens = match lexer.tokenize() {
-        Ok(tokens) => tokens,
-        Err(err) => return SqlApiResponse::error(err.to_string(), elapsed_ms(start)),
-    };
-
-    let mut parser = Parser::new(tokens);
-    let statement = match parser.parse() {
-        Ok(statement) => statement,
-        Err(err) => return SqlApiResponse::error(err.to_string(), elapsed_ms(start)),
-    };
-
     let executor = SqlExecutor::new(Arc::clone(engine));
-    let result = match executor.execute(statement) {
-        Ok(result) => result,
-        Err(err) => return SqlApiResponse::error(err.to_string(), elapsed_ms(start)),
+    let statements = match Parser::parse_multiple(sql) {
+        Ok(statements) if !statements.is_empty() => statements,
+        Ok(_) => {
+            return SqlApiResponse::error(
+                "empty SQL statement".to_string(),
+                elapsed_ms(start),
+                0,
+                Vec::new(),
+            )
+        }
+        Err(err) => {
+            return SqlApiResponse::error(err.to_string(), elapsed_ms(start), 0, Vec::new())
+        }
     };
 
-    SqlApiResponse::from_execute_result(result, elapsed_ms(start))
+    let sql_texts = Parser::parse_multiple(sql)
+        .ok()
+        .and(Some(split_sql_texts_for_response(sql)))
+        .unwrap_or_else(|| vec![sql.trim().to_string()]);
+
+    let mut executed_count = 0;
+    let mut statement_results = Vec::new();
+    let mut last_result = ExecuteResult::Error {
+        message: "empty SQL statement".to_string(),
+    };
+
+    for (idx, statement) in statements.into_iter().enumerate() {
+        let statement_start = Instant::now();
+        let result = match executor.execute(statement) {
+            Ok(result) => result,
+            Err(err) => {
+                statement_results.push(SqlStatementResult::from_execute_result(
+                    sql_texts.get(idx).cloned().unwrap_or_default(),
+                    ExecuteResult::Error {
+                        message: err.to_string(),
+                    },
+                    elapsed_ms(statement_start),
+                ));
+                return SqlApiResponse::error(
+                    err.to_string(),
+                    elapsed_ms(start),
+                    executed_count,
+                    statement_results,
+                );
+            }
+        };
+
+        if let ExecuteResult::Error { message } = &result {
+            statement_results.push(SqlStatementResult::from_execute_result(
+                sql_texts.get(idx).cloned().unwrap_or_default(),
+                ExecuteResult::Error {
+                    message: message.clone(),
+                },
+                elapsed_ms(statement_start),
+            ));
+            return SqlApiResponse::error(
+                message.clone(),
+                elapsed_ms(start),
+                executed_count,
+                statement_results,
+            );
+        }
+
+        executed_count += 1;
+        statement_results.push(SqlStatementResult::from_execute_result(
+            sql_texts.get(idx).cloned().unwrap_or_default(),
+            result.clone(),
+            elapsed_ms(statement_start),
+        ));
+        last_result = result;
+    }
+
+    SqlApiResponse::from_execute_result(
+        last_result,
+        elapsed_ms(start),
+        executed_count,
+        statement_results,
+    )
+}
+
+// 中文註解：前端結果區需要保留原始語句文字，這裡沿用 parser 的切句規則。
+fn split_sql_texts_for_response(sql: &str) -> Vec<String> {
+    let mut statements = Vec::new();
+    let mut current = String::new();
+    let mut in_string = false;
+    let mut chars = sql.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\'' => {
+                current.push(ch);
+                if in_string && matches!(chars.peek(), Some('\'')) {
+                    current.push(chars.next().expect("escaped quote"));
+                } else {
+                    in_string = !in_string;
+                }
+            }
+            ';' if !in_string => {
+                let trimmed = current.trim();
+                if !trimmed.is_empty() {
+                    statements.push(trimmed.to_string());
+                }
+                current.clear();
+            }
+            _ => current.push(ch),
+        }
+    }
+
+    let trimmed = current.trim();
+    if !trimmed.is_empty() {
+        statements.push(trimmed.to_string());
+    }
+
+    statements
 }
 
 // 中文註解：把 SQL Value 轉成 JSON，方便前端直接渲染。
@@ -781,12 +880,32 @@ struct SqlApiResponse {
     rows: Vec<Vec<JsonValue>>,
     row_count: usize,
     elapsed_ms: u64,
+    executed_count: usize,
+    message: String,
+    statement_results: Vec<SqlStatementResult>,
+}
+
+#[derive(Serialize)]
+struct SqlStatementResult {
+    sql: String,
+    success: bool,
+    #[serde(rename = "type")]
+    kind: String,
+    columns: Vec<String>,
+    rows: Vec<Vec<JsonValue>>,
+    row_count: usize,
+    elapsed_ms: u64,
     message: String,
 }
 
 impl SqlApiResponse {
     // 中文註解：把 executor 回傳結果轉成前端固定吃的 JSON 格式。
-    fn from_execute_result(result: ExecuteResult, elapsed_ms: u64) -> Self {
+    fn from_execute_result(
+        result: ExecuteResult,
+        elapsed_ms: u64,
+        executed_count: usize,
+        statement_results: Vec<SqlStatementResult>,
+    ) -> Self {
         match result {
             ExecuteResult::Explain { plan } => Self {
                 success: true,
@@ -795,7 +914,9 @@ impl SqlApiResponse {
                 rows: vec![vec![JsonValue::from(plan)]],
                 row_count: 1,
                 elapsed_ms,
+                executed_count,
                 message: String::new(),
+                statement_results,
             },
             ExecuteResult::Created { table_name } => Self {
                 success: true,
@@ -804,7 +925,9 @@ impl SqlApiResponse {
                 rows: Vec::new(),
                 row_count: 0,
                 elapsed_ms,
+                executed_count,
                 message: format!("Table '{}' created", table_name),
+                statement_results,
             },
             ExecuteResult::Altered { table_name } => Self {
                 success: true,
@@ -813,7 +936,9 @@ impl SqlApiResponse {
                 rows: Vec::new(),
                 row_count: 0,
                 elapsed_ms,
+                executed_count,
                 message: format!("Table '{}' altered", table_name),
+                statement_results,
             },
             ExecuteResult::Dropped { table_name } => Self {
                 success: true,
@@ -822,7 +947,9 @@ impl SqlApiResponse {
                 rows: Vec::new(),
                 row_count: 0,
                 elapsed_ms,
+                executed_count,
                 message: format!("Table '{}' dropped", table_name),
+                statement_results,
             },
             ExecuteResult::IndexCreated {
                 table_name,
@@ -834,7 +961,9 @@ impl SqlApiResponse {
                 rows: Vec::new(),
                 row_count: 0,
                 elapsed_ms,
+                executed_count,
                 message: format!("Index on '{}.{}' created", table_name, column_name),
+                statement_results,
             },
             ExecuteResult::IndexDropped {
                 table_name,
@@ -846,7 +975,9 @@ impl SqlApiResponse {
                 rows: Vec::new(),
                 row_count: 0,
                 elapsed_ms,
+                executed_count,
                 message: format!("Index on '{}.{}' dropped", table_name, column_name),
+                statement_results,
             },
             ExecuteResult::Inserted { count } => Self {
                 success: true,
@@ -855,14 +986,18 @@ impl SqlApiResponse {
                 rows: Vec::new(),
                 row_count: count,
                 elapsed_ms,
+                executed_count,
                 message: String::new(),
+                statement_results,
             },
             ExecuteResult::Selected { columns, rows } => Self {
                 success: true,
                 kind: "select".to_string(),
                 row_count: rows.len(),
                 elapsed_ms,
+                executed_count,
                 message: String::new(),
+                statement_results,
                 columns,
                 rows: rows
                     .into_iter()
@@ -876,7 +1011,9 @@ impl SqlApiResponse {
                 rows: Vec::new(),
                 row_count: count,
                 elapsed_ms,
+                executed_count,
                 message: String::new(),
+                statement_results,
             },
             ExecuteResult::Deleted { count } => Self {
                 success: true,
@@ -885,14 +1022,23 @@ impl SqlApiResponse {
                 rows: Vec::new(),
                 row_count: count,
                 elapsed_ms,
+                executed_count,
                 message: String::new(),
+                statement_results,
             },
-            ExecuteResult::Error { message } => Self::error(message, elapsed_ms),
+            ExecuteResult::Error { message } => {
+                Self::error(message, elapsed_ms, executed_count, statement_results)
+            }
         }
     }
 
     // 中文註解：統一產生 SQL API 的錯誤 payload。
-    fn error(message: String, elapsed_ms: u64) -> Self {
+    fn error(
+        message: String,
+        elapsed_ms: u64,
+        executed_count: usize,
+        statement_results: Vec<SqlStatementResult>,
+    ) -> Self {
         Self {
             success: false,
             kind: "error".to_string(),
@@ -900,7 +1046,139 @@ impl SqlApiResponse {
             rows: Vec::new(),
             row_count: 0,
             elapsed_ms,
-            message,
+            executed_count,
+            message: format!(
+                "{} (executed {} statement(s) before failure)",
+                message, executed_count
+            ),
+            statement_results,
+        }
+    }
+}
+
+impl SqlStatementResult {
+    // 中文註解：每一條語句都保留自己的結果，前端才能完整顯示多語句輸出。
+    fn from_execute_result(sql: String, result: ExecuteResult, elapsed_ms: u64) -> Self {
+        match result {
+            ExecuteResult::Explain { plan } => Self {
+                sql,
+                success: true,
+                kind: "explained".to_string(),
+                columns: vec!["plan".to_string()],
+                rows: vec![vec![JsonValue::from(plan)]],
+                row_count: 1,
+                elapsed_ms,
+                message: String::new(),
+            },
+            ExecuteResult::Created { table_name } => Self {
+                sql,
+                success: true,
+                kind: "created".to_string(),
+                columns: Vec::new(),
+                rows: Vec::new(),
+                row_count: 0,
+                elapsed_ms,
+                message: format!("Table '{}' created", table_name),
+            },
+            ExecuteResult::Altered { table_name } => Self {
+                sql,
+                success: true,
+                kind: "updated".to_string(),
+                columns: Vec::new(),
+                rows: Vec::new(),
+                row_count: 0,
+                elapsed_ms,
+                message: format!("Table '{}' altered", table_name),
+            },
+            ExecuteResult::Dropped { table_name } => Self {
+                sql,
+                success: true,
+                kind: "deleted".to_string(),
+                columns: Vec::new(),
+                rows: Vec::new(),
+                row_count: 0,
+                elapsed_ms,
+                message: format!("Table '{}' dropped", table_name),
+            },
+            ExecuteResult::IndexCreated {
+                table_name,
+                column_name,
+            } => Self {
+                sql,
+                success: true,
+                kind: "created".to_string(),
+                columns: Vec::new(),
+                rows: Vec::new(),
+                row_count: 0,
+                elapsed_ms,
+                message: format!("Index on '{}.{}' created", table_name, column_name),
+            },
+            ExecuteResult::IndexDropped {
+                table_name,
+                column_name,
+            } => Self {
+                sql,
+                success: true,
+                kind: "deleted".to_string(),
+                columns: Vec::new(),
+                rows: Vec::new(),
+                row_count: 0,
+                elapsed_ms,
+                message: format!("Index on '{}.{}' dropped", table_name, column_name),
+            },
+            ExecuteResult::Inserted { count } => Self {
+                sql,
+                success: true,
+                kind: "inserted".to_string(),
+                columns: Vec::new(),
+                rows: Vec::new(),
+                row_count: count,
+                elapsed_ms,
+                message: String::new(),
+            },
+            ExecuteResult::Selected { columns, rows } => Self {
+                row_count: rows.len(),
+                sql,
+                success: true,
+                kind: "select".to_string(),
+                columns,
+                rows: rows
+                    .into_iter()
+                    .map(|row| row.into_iter().map(sql_value_to_json).collect())
+                    .collect(),
+                elapsed_ms,
+                message: String::new(),
+            },
+            ExecuteResult::Updated { count } => Self {
+                sql,
+                success: true,
+                kind: "updated".to_string(),
+                columns: Vec::new(),
+                rows: Vec::new(),
+                row_count: count,
+                elapsed_ms,
+                message: String::new(),
+            },
+            ExecuteResult::Deleted { count } => Self {
+                sql,
+                success: true,
+                kind: "deleted".to_string(),
+                columns: Vec::new(),
+                rows: Vec::new(),
+                row_count: count,
+                elapsed_ms,
+                message: String::new(),
+            },
+            ExecuteResult::Error { message } => Self {
+                sql,
+                success: false,
+                kind: "error".to_string(),
+                columns: Vec::new(),
+                rows: Vec::new(),
+                row_count: 0,
+                elapsed_ms,
+                message,
+            },
         }
     }
 }
