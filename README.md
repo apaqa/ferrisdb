@@ -20,7 +20,7 @@ FerrisDB is a database engine implemented from scratch in Rust, featuring LSM-Tr
 - SQL AS aliases for columns, aggregates, and tables
 - SQL ORDER BY ASC/DESC
 - SQL LIMIT
-- SQL EXPLAIN with query plan
+- SQL EXPLAIN with query plan and visual tree diagram in FerrisDB Studio
 - Cost-Based Query Optimizer with scan / join strategy selection
 - Query Plan Cache (LRU)
 - SQL `WHERE` with comparison operators (`=`, `!=`, `<`, `>`, `<=`, `>=`)
@@ -39,7 +39,7 @@ FerrisDB is a database engine implemented from scratch in Rust, featuring LSM-Tr
 - GRANT/REVOKE access control (`GRANT SELECT, INSERT ON table TO user`, `REVOKE ALL ON table FROM user`)
 - Per-session user context with privilege enforcement for SELECT/INSERT/UPDATE/DELETE
 - TCP server with multi-threaded connections
-- HTTP Admin API (`/health`, `/stats`, `/sstables`, `/compact`, `/flush`, `/api/sql/prepare`, `/api/sql/execute`, `/api/sql/deallocate`)
+- HTTP Admin API (`/health`, `/stats`, `/sstables`, `/compact`, `/flush`, `/api/sql/prepare`, `/api/sql/execute`, `/api/sql/deallocate`) with `plan_tree` JSON for EXPLAIN
 - Interactive REPL with KV and SQL modes
 - MANIFEST metadata management
 - Configurable via `ferrisdb.toml`

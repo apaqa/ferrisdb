@@ -235,6 +235,29 @@
       .stats-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
       .tab-btn { flex: 1 1 calc(50% - 10px); text-align: center; }
     }
+    /* 視覺化查詢計劃樹樣式 */
+    .explain-toolbar { display: flex; gap: 8px; align-items: center; margin-bottom: 12px; }
+    .explain-toggle { font-size: 12px; padding: 4px 10px; border-radius: 6px; border: 1px solid rgba(201,209,217,0.18); background: rgba(255,255,255,0.04); color: var(--muted); cursor: pointer; }
+    .explain-toggle.active { background: var(--accent); color: #fff; border-color: var(--accent); }
+    .plan-tree { display: flex; flex-direction: column; align-items: flex-start; gap: 0; padding: 12px 0; overflow-x: auto; }
+    .plan-node-wrap { display: flex; flex-direction: column; align-items: flex-start; }
+    .plan-node { display: inline-flex; flex-direction: column; align-items: flex-start; border-radius: 8px; padding: 8px 14px; margin: 4px 0; font-size: 12px; cursor: default; position: relative; min-width: 160px; box-shadow: 0 2px 8px rgba(0,0,0,0.3); transition: transform 0.12s; }
+    .plan-node:hover { transform: translateY(-1px); }
+    .plan-node-type { font-weight: 700; letter-spacing: 0.04em; font-size: 13px; }
+    .plan-node-meta { color: rgba(255,255,255,0.65); font-size: 11px; margin-top: 3px; }
+    .plan-node-details { color: rgba(255,255,255,0.5); font-size: 11px; margin-top: 2px; font-style: italic; }
+    /* 節點顏色依類型 */
+    .plan-node.SeqScan { background: #2a2f38; border-left: 3px solid #8b949e; }
+    .plan-node.IndexScan, .plan-node.CompositeIndexScan { background: #0d2818; border-left: 3px solid #3fb950; }
+    .plan-node.HashJoin { background: #0d1f3a; border-left: 3px solid #58a6ff; }
+    .plan-node.NestedLoopJoin { background: #1c0f38; border-left: 3px solid #a78bfa; }
+    .plan-node.Sort { background: #2a1f0a; border-left: 3px solid #d29922; }
+    .plan-node.Limit { background: #062020; border-left: 3px solid #56d4dd; }
+    .plan-node.Project { background: #2a1515; border-left: 3px solid #f97066; }
+    .plan-node.Aggregate { background: #2a1128; border-left: 3px solid #e879a6; }
+    .plan-node.Filter { background: #2a0f0f; border-left: 3px solid #f85149; }
+    .plan-children { display: flex; flex-direction: row; align-items: flex-start; gap: 16px; padding-left: 24px; border-left: 1px dashed rgba(201,209,217,0.15); margin-left: 12px; }
+    .plan-connector { width: 20px; height: 1px; background: rgba(201,209,217,0.15); align-self: center; flex-shrink: 0; }
   </style>
 </head>
 <body>
@@ -289,7 +312,7 @@
           <div class="sql-main">
             <article class="card">
               <div class="card-body">
-                <div class="editor-toolbar"><div class="toolbar-meta">Press Ctrl+Enter to run</div><button class="action-btn" id="run-sql-btn" type="button">Run</button></div>
+                <div class="editor-toolbar"><div class="toolbar-meta">Press Ctrl+Enter to run</div><div style="display:flex;gap:8px;align-items:center;"><button class="explain-toggle" id="visual-explain-btn" type="button" title="Toggle visual query plan diagram">Visual</button><button class="action-btn" id="run-sql-btn" type="button">Run</button></div></div>
                 <textarea id="sql-editor" spellcheck="false">SELECT * FROM employees LIMIT 10;</textarea>
               </div>
             </article>
@@ -349,7 +372,8 @@
   </div>
   <script>
     // 中文註解：集中管理前端狀態，避免各個 tab 各自散落資料。
-    const state = { stats: null, health: null, tables: [], selectedTable: null, history: loadHistory(), refreshTimer: null };
+    // visualExplain 控制 EXPLAIN 結果是否顯示視覺化圖表
+    const state = { stats: null, health: null, tables: [], selectedTable: null, history: loadHistory(), refreshTimer: null, visualExplain: false };
     const els = {
       tabs: Array.from(document.querySelectorAll(".tab-btn")),
       panels: Array.from(document.querySelectorAll(".tab-panel")),
@@ -358,6 +382,7 @@
       sqlMeta: document.getElementById("sql-meta"),
       sqlHistory: document.getElementById("sql-history"),
       runSqlBtn: document.getElementById("run-sql-btn"),
+      visualExplainBtn: document.getElementById("visual-explain-btn"),
       clearHistoryBtn: document.getElementById("clear-history-btn"),
       tableList: document.getElementById("table-list"),
       tableSchemaBox: document.getElementById("table-schema-box"),
@@ -410,6 +435,11 @@
         }
       });
       els.runSqlBtn.addEventListener("click", runSql);
+      // 中文註解：切換視覺化查詢計劃模式
+      els.visualExplainBtn.addEventListener("click", () => {
+        state.visualExplain = !state.visualExplain;
+        els.visualExplainBtn.classList.toggle("active", state.visualExplain);
+      });
       els.clearHistoryBtn.addEventListener("click", clearHistory);
       els.refreshTablesBtn.addEventListener("click", refreshTables);
       els.refreshSelectedTableBtn.addEventListener("click", refreshSelectedTable);
@@ -503,6 +533,27 @@
       els.sqlResult.innerHTML = `<div class="result-message ok">${escapeHtml(result.message || "Command completed.")}</div>`;
     }
 
+    // 中文註解：遞迴建立查詢計劃樹節點的 HTML，每個節點依類型套用不同顏色
+    function renderPlanNode(node) {
+      if (!node) return "";
+      const typeClass = (node.node_type || "").replace(/\s/g, "");
+      const table = node.table ? `<span class="plan-node-meta">table: ${escapeHtml(node.table)}</span>` : "";
+      const meta = `<span class="plan-node-meta">rows≈${node.estimated_rows || 0} · cost≈${(node.estimated_cost || 0).toFixed(1)}</span>`;
+      const details = node.details ? `<span class="plan-node-details">${escapeHtml(node.details)}</span>` : "";
+      const children = Array.isArray(node.children) && node.children.length > 0
+        ? `<div class="plan-children">${node.children.map(c => `<div style="display:flex;flex-direction:column;">${renderPlanNode(c)}</div>`).join("")}</div>`
+        : "";
+      return `<div class="plan-node-wrap"><div class="plan-node ${typeClass}" title="${escapeHtml(node.node_type || "")} · ${escapeHtml(node.details || "")}"><span class="plan-node-type">${escapeHtml(node.node_type || "")}</span>${table}${meta}${details}</div>${children}</div>`;
+    }
+
+    // 中文註解：把 plan_tree JSON 渲染成互動式視覺化圖表；若無 plan_tree 則 fallback 到文字
+    function renderExplainDiagram(entry) {
+      const planText = (((entry.rows || [])[0] || [])[0]) || entry.message || "";
+      const textBlock = `<pre class="mono-block">${escapeHtml(String(planText))}</pre>`;
+      if (!state.visualExplain || !entry.plan_tree) return textBlock;
+      return `<div class="explain-toolbar"><span style="color:var(--muted);font-size:11px;">Visual Query Plan</span></div><div class="plan-tree">${renderPlanNode(entry.plan_tree)}</div>`;
+    }
+
     function renderStatementResults(statementResults, overallSuccess, overallMessage) {
       const headerClass = overallSuccess ? "ok" : "error";
       const blocks = statementResults.map((entry, index) => {
@@ -511,8 +562,7 @@
         if (entry.type === "select") {
           body = renderTable(entry.columns || [], entry.rows || []);
         } else if (entry.type === "explained") {
-          const plan = (((entry.rows || [])[0] || [])[0]) || entry.message || "";
-          body = `<pre class="mono-block">${escapeHtml(String(plan))}</pre>`;
+          body = renderExplainDiagram(entry);
         } else {
           let message = entry.message || "Command completed.";
           if (["inserted", "updated", "deleted"].includes(entry.type)) {

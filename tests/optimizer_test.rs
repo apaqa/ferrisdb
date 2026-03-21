@@ -34,7 +34,7 @@ fn exec(executor: &SqlExecutor, sql: &str) -> ExecuteResult {
 
 fn explain(result: ExecuteResult) -> String {
     match result {
-        ExecuteResult::Explain { plan } => plan,
+        ExecuteResult::Explain { plan, .. } => plan,
         other => panic!("expected explain result, got {:?}", other),
     }
 }

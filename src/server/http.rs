@@ -997,6 +997,9 @@ struct SqlApiResponse {
     executed_count: usize,
     message: String,
     statement_results: Vec<SqlStatementResult>,
+    // 中文註解：EXPLAIN 時包含結構化查詢計劃樹，供前端視覺化顯示
+    #[serde(skip_serializing_if = "Option::is_none")]
+    plan_tree: Option<JsonValue>,
 }
 
 #[derive(Serialize)]
@@ -1010,6 +1013,9 @@ struct SqlStatementResult {
     row_count: usize,
     elapsed_ms: u64,
     message: String,
+    // 中文註解：EXPLAIN 時包含結構化查詢計劃樹，供前端視覺化顯示
+    #[serde(skip_serializing_if = "Option::is_none")]
+    plan_tree: Option<JsonValue>,
 }
 
 impl SqlApiResponse {
@@ -1021,7 +1027,7 @@ impl SqlApiResponse {
         statement_results: Vec<SqlStatementResult>,
     ) -> Self {
         match result {
-            ExecuteResult::Explain { plan } => Self {
+            ExecuteResult::Explain { plan, plan_tree_json } => Self {
                 success: true,
                 kind: "explained".to_string(),
                 columns: vec!["plan".to_string()],
@@ -1031,6 +1037,8 @@ impl SqlApiResponse {
                 executed_count,
                 message: String::new(),
                 statement_results,
+                // 中文註解：反序列化 JSON 字串成為結構化物件，讓前端可以直接使用
+                plan_tree: serde_json::from_str(&plan_tree_json).ok(),
             },
             ExecuteResult::Prepared { name } => Self {
                 success: true,
@@ -1042,6 +1050,7 @@ impl SqlApiResponse {
                 executed_count,
                 message: format!("Prepared statement '{}' created", name),
                 statement_results,
+                plan_tree: None,
             },
             ExecuteResult::Deallocated { name } => Self {
                 success: true,
@@ -1053,6 +1062,7 @@ impl SqlApiResponse {
                 executed_count,
                 message: format!("Prepared statement '{}' deallocated", name),
                 statement_results,
+                plan_tree: None,
             },
             ExecuteResult::IsolationLevelSet { level } => Self {
                 success: true,
@@ -1064,6 +1074,7 @@ impl SqlApiResponse {
                 executed_count,
                 message: format!("Isolation level set to {}", isolation_level_label(&level)),
                 statement_results,
+                plan_tree: None,
             },
             ExecuteResult::Created { table_name } => Self {
                 success: true,
@@ -1075,6 +1086,7 @@ impl SqlApiResponse {
                 executed_count,
                 message: format!("Table '{}' created", table_name),
                 statement_results,
+                plan_tree: None,
             },
             ExecuteResult::Analyzed { table_name } => Self {
                 success: true,
@@ -1086,6 +1098,7 @@ impl SqlApiResponse {
                 executed_count,
                 message: format!("Table '{}' analyzed", table_name),
                 statement_results,
+                plan_tree: None,
             },
             ExecuteResult::Altered { table_name } => Self {
                 success: true,
@@ -1097,6 +1110,7 @@ impl SqlApiResponse {
                 executed_count,
                 message: format!("Table '{}' altered", table_name),
                 statement_results,
+                plan_tree: None,
             },
             ExecuteResult::Dropped { table_name } => Self {
                 success: true,
@@ -1108,6 +1122,7 @@ impl SqlApiResponse {
                 executed_count,
                 message: format!("Table '{}' dropped", table_name),
                 statement_results,
+                plan_tree: None,
             },
             ExecuteResult::IndexCreated {
                 table_name,
@@ -1122,6 +1137,7 @@ impl SqlApiResponse {
                 executed_count,
                 message: format!("Index on '{}.{}' created", table_name, column_names.join(",")),
                 statement_results,
+                plan_tree: None,
             },
             ExecuteResult::IndexDropped {
                 table_name,
@@ -1136,6 +1152,7 @@ impl SqlApiResponse {
                 executed_count,
                 message: format!("Index on '{}.{}' dropped", table_name, column_names.join(",")),
                 statement_results,
+                plan_tree: None,
             },
             ExecuteResult::Inserted { count } => Self {
                 success: true,
@@ -1147,6 +1164,7 @@ impl SqlApiResponse {
                 executed_count,
                 message: String::new(),
                 statement_results,
+                plan_tree: None,
             },
             ExecuteResult::Selected { columns, rows } => Self {
                 success: true,
@@ -1161,6 +1179,7 @@ impl SqlApiResponse {
                     .into_iter()
                     .map(|row| row.into_iter().map(sql_value_to_json).collect())
                     .collect(),
+                plan_tree: None,
             },
             ExecuteResult::Updated { count } => Self {
                 success: true,
@@ -1172,6 +1191,7 @@ impl SqlApiResponse {
                 executed_count,
                 message: String::new(),
                 statement_results,
+                plan_tree: None,
             },
             ExecuteResult::Deleted { count } => Self {
                 success: true,
@@ -1183,6 +1203,7 @@ impl SqlApiResponse {
                 executed_count,
                 message: String::new(),
                 statement_results,
+                plan_tree: None,
             },
             ExecuteResult::Error { message } => {
                 Self::error(message, elapsed_ms, executed_count, statement_results)
@@ -1199,6 +1220,7 @@ impl SqlApiResponse {
                 executed_count,
                 message: trigger_name,
                 statement_results,
+                plan_tree: None,
             },
             ExecuteResult::Granted { user, table_name }
             | ExecuteResult::Revoked { user, table_name } => Self {
@@ -1211,6 +1233,7 @@ impl SqlApiResponse {
                 executed_count,
                 message: format!("{} on {}", user, table_name),
                 statement_results,
+                plan_tree: None,
             },
         }
     }
@@ -1235,6 +1258,7 @@ impl SqlApiResponse {
                 message, executed_count
             ),
             statement_results,
+            plan_tree: None,
         }
     }
 }
@@ -1243,7 +1267,7 @@ impl SqlStatementResult {
     // 中文註解：每一條語句都保留自己的結果，前端才能完整顯示多語句輸出。
     fn from_execute_result(sql: String, result: ExecuteResult, elapsed_ms: u64) -> Self {
         match result {
-            ExecuteResult::Explain { plan } => Self {
+            ExecuteResult::Explain { plan, plan_tree_json } => Self {
                 sql,
                 success: true,
                 kind: "explained".to_string(),
@@ -1252,6 +1276,8 @@ impl SqlStatementResult {
                 row_count: 1,
                 elapsed_ms,
                 message: String::new(),
+                // 中文註解：反序列化 JSON 字串成為結構化物件，讓前端可以直接使用
+                plan_tree: serde_json::from_str(&plan_tree_json).ok(),
             },
             ExecuteResult::Prepared { name } => Self {
                 sql,
@@ -1262,6 +1288,7 @@ impl SqlStatementResult {
                 row_count: 0,
                 elapsed_ms,
                 message: format!("Prepared statement '{}' created", name),
+                plan_tree: None,
             },
             ExecuteResult::Deallocated { name } => Self {
                 sql,
@@ -1272,6 +1299,7 @@ impl SqlStatementResult {
                 row_count: 0,
                 elapsed_ms,
                 message: format!("Prepared statement '{}' deallocated", name),
+                plan_tree: None,
             },
             ExecuteResult::IsolationLevelSet { level } => Self {
                 sql,
@@ -1282,6 +1310,7 @@ impl SqlStatementResult {
                 row_count: 0,
                 elapsed_ms,
                 message: format!("Isolation level set to {}", isolation_level_label(&level)),
+                plan_tree: None,
             },
             ExecuteResult::Created { table_name } => Self {
                 sql,
@@ -1292,6 +1321,7 @@ impl SqlStatementResult {
                 row_count: 0,
                 elapsed_ms,
                 message: format!("Table '{}' created", table_name),
+                plan_tree: None,
             },
             ExecuteResult::Analyzed { table_name } => Self {
                 sql,
@@ -1302,6 +1332,7 @@ impl SqlStatementResult {
                 row_count: 0,
                 elapsed_ms,
                 message: format!("Table '{}' analyzed", table_name),
+                plan_tree: None,
             },
             ExecuteResult::Altered { table_name } => Self {
                 sql,
@@ -1312,6 +1343,7 @@ impl SqlStatementResult {
                 row_count: 0,
                 elapsed_ms,
                 message: format!("Table '{}' altered", table_name),
+                plan_tree: None,
             },
             ExecuteResult::Dropped { table_name } => Self {
                 sql,
@@ -1322,6 +1354,7 @@ impl SqlStatementResult {
                 row_count: 0,
                 elapsed_ms,
                 message: format!("Table '{}' dropped", table_name),
+                plan_tree: None,
             },
             ExecuteResult::IndexCreated {
                 table_name,
@@ -1335,6 +1368,7 @@ impl SqlStatementResult {
                 row_count: 0,
                 elapsed_ms,
                 message: format!("Index on '{}.{}' created", table_name, column_names.join(",")),
+                plan_tree: None,
             },
             ExecuteResult::IndexDropped {
                 table_name,
@@ -1348,6 +1382,7 @@ impl SqlStatementResult {
                 row_count: 0,
                 elapsed_ms,
                 message: format!("Index on '{}.{}' dropped", table_name, column_names.join(",")),
+                plan_tree: None,
             },
             ExecuteResult::Inserted { count } => Self {
                 sql,
@@ -1358,6 +1393,7 @@ impl SqlStatementResult {
                 row_count: count,
                 elapsed_ms,
                 message: String::new(),
+                plan_tree: None,
             },
             ExecuteResult::Selected { columns, rows } => Self {
                 row_count: rows.len(),
@@ -1371,6 +1407,7 @@ impl SqlStatementResult {
                     .collect(),
                 elapsed_ms,
                 message: String::new(),
+                plan_tree: None,
             },
             ExecuteResult::Updated { count } => Self {
                 sql,
@@ -1381,6 +1418,7 @@ impl SqlStatementResult {
                 row_count: count,
                 elapsed_ms,
                 message: String::new(),
+                plan_tree: None,
             },
             ExecuteResult::Deleted { count } => Self {
                 sql,
@@ -1391,6 +1429,7 @@ impl SqlStatementResult {
                 row_count: count,
                 elapsed_ms,
                 message: String::new(),
+                plan_tree: None,
             },
             ExecuteResult::Error { message } => Self {
                 sql,
@@ -1401,6 +1440,7 @@ impl SqlStatementResult {
                 row_count: 0,
                 elapsed_ms,
                 message,
+                plan_tree: None,
             },
             // 中文註解：觸發器與權限操作結果
             ExecuteResult::TriggerCreated { trigger_name }
@@ -1413,6 +1453,7 @@ impl SqlStatementResult {
                 row_count: 0,
                 elapsed_ms,
                 message: trigger_name,
+                plan_tree: None,
             },
             ExecuteResult::Granted { user, table_name }
             | ExecuteResult::Revoked { user, table_name } => Self {
@@ -1424,6 +1465,7 @@ impl SqlStatementResult {
                 row_count: 0,
                 elapsed_ms,
                 message: format!("{} on {}", user, table_name),
+                plan_tree: None,
             },
         }
     }

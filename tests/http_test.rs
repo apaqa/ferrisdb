@@ -181,6 +181,13 @@ fn test_http_sql_table_and_storage_routes_used_by_studio() {
     let explain_json = parse_json_body(&explain);
     assert_eq!(explain_json["success"], true);
     assert_eq!(explain_json["type"], "explained");
+    // 中文註解：驗證 EXPLAIN 回傳 plan_tree 結構化 JSON，供前端視覺化使用
+    let plan_tree = &explain_json["plan_tree"];
+    assert!(plan_tree.is_object(), "plan_tree should be an object, got: {:?}", plan_tree);
+    assert!(plan_tree["node_type"].is_string(), "plan_tree.node_type should be a string");
+    assert!(plan_tree["estimated_rows"].is_number(), "plan_tree.estimated_rows should be a number");
+    assert!(plan_tree["estimated_cost"].is_number(), "plan_tree.estimated_cost should be a number");
+    assert!(plan_tree["children"].is_array(), "plan_tree.children should be an array");
 
     let tables = http_request(addr, "GET", "/api/tables", &[], "");
     let tables_json = parse_json_body(&tables);

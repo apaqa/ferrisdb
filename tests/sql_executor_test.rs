@@ -52,7 +52,7 @@ fn rows_only(result: ExecuteResult) -> (Vec<String>, Vec<Vec<Value>>) {
 // 中文註解：把 EXPLAIN 結果抽成字串，方便直接驗證是否走到 IndexScan/Filter。
 fn explain_only(result: ExecuteResult) -> String {
     match result {
-        ExecuteResult::Explain { plan } => plan,
+        ExecuteResult::Explain { plan, .. } => plan,
         other => panic!("expected explain result, got {:?}", other),
     }
 }
@@ -403,7 +403,7 @@ fn test_explain_select_returns_plan() {
 
     let result = exec(&executor, "EXPLAIN SELECT * FROM users WHERE id = 1;");
     match result {
-        ExecuteResult::Explain { plan } => {
+        ExecuteResult::Explain { plan, .. } => {
             assert!(plan.contains("SeqScan"));
             assert!(plan.contains("Filter"));
             assert!(plan.contains("Project"));

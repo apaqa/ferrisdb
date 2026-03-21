@@ -54,7 +54,7 @@ fn selected_rows(result: ExecuteResult) -> (Vec<String>, Vec<Vec<Value>>) {
 
 fn explain_plan(result: ExecuteResult) -> String {
     match result {
-        ExecuteResult::Explain { plan } => plan,
+        ExecuteResult::Explain { plan, .. } => plan,
         other => panic!("expected explain result, got {:?}", other),
     }
 }

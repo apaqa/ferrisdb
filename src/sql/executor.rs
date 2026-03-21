@@ -49,8 +49,10 @@ use super::statistics::StatisticsManager;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExecuteResult {
+    // 中文註解：EXPLAIN 結果包含純文字 plan 與 JSON 序列化的結構化 plan_tree
     Explain {
         plan: String,
+        plan_tree_json: String,
     },
     Prepared {
         name: String,
@@ -132,6 +134,103 @@ struct TriggerDefinition {
 const TRIGGER_META_PREFIX: &str = "__meta:trigger:";
 // 中文註解：權限 metadata 的 KV key 前綴
 const PRIVILEGE_META_PREFIX: &str = "__meta:privilege:";
+
+// 中文註解：視覺化查詢計劃樹節點，對應前端的互動式圖表
+#[derive(Debug, Clone, serde::Serialize)]
+struct PlanTreeNode {
+    node_type: String,
+    table: String,
+    estimated_rows: usize,
+    estimated_cost: f64,
+    details: String,
+    children: Vec<PlanTreeNode>,
+}
+
+// 中文註解：把優化器產生的 QueryPlanNode 遞迴轉成可序列化的 PlanTreeNode
+fn build_plan_tree(node: &QueryPlanNode) -> PlanTreeNode {
+    match &node.plan {
+        Plan::SeqScan { table, filter } => PlanTreeNode {
+            node_type: "SeqScan".to_string(),
+            table: table.clone(),
+            estimated_rows: node.estimated_rows,
+            estimated_cost: node.estimated_cost,
+            details: if filter.is_some() { "with filter".to_string() } else { String::new() },
+            children: vec![],
+        },
+        Plan::IndexScan { table, index_columns, lookup_value: _, filter } => PlanTreeNode {
+            node_type: "IndexScan".to_string(),
+            table: table.clone(),
+            estimated_rows: node.estimated_rows,
+            estimated_cost: node.estimated_cost,
+            details: format!(
+                "index: {}{}",
+                index_columns.join(","),
+                if filter.is_some() { " with filter" } else { "" }
+            ),
+            children: vec![],
+        },
+        Plan::CompositeIndexScan { table, index_columns, prefix_values: _, filter } => PlanTreeNode {
+            node_type: "CompositeIndexScan".to_string(),
+            table: table.clone(),
+            estimated_rows: node.estimated_rows,
+            estimated_cost: node.estimated_cost,
+            details: format!(
+                "index: {}{}",
+                index_columns.join(","),
+                if filter.is_some() { " with filter" } else { "" }
+            ),
+            children: vec![],
+        },
+        Plan::NestedLoopJoin { left, right, condition } => PlanTreeNode {
+            node_type: "NestedLoopJoin".to_string(),
+            table: String::new(),
+            estimated_rows: node.estimated_rows,
+            estimated_cost: node.estimated_cost,
+            details: format!("join: {} = {}", condition.left_column, condition.right_column),
+            children: vec![build_plan_tree(left), build_plan_tree(right)],
+        },
+        Plan::HashJoin { left, right, left_key, right_key } => PlanTreeNode {
+            node_type: "HashJoin".to_string(),
+            table: String::new(),
+            estimated_rows: node.estimated_rows,
+            estimated_cost: node.estimated_cost,
+            details: format!("join: {} = {}", left_key, right_key),
+            children: vec![build_plan_tree(left), build_plan_tree(right)],
+        },
+        Plan::Sort { input, order_by } => PlanTreeNode {
+            node_type: "Sort".to_string(),
+            table: String::new(),
+            estimated_rows: node.estimated_rows,
+            estimated_cost: node.estimated_cost,
+            details: format!("by: {} {:?}", order_by.column, order_by.direction),
+            children: vec![build_plan_tree(input)],
+        },
+        Plan::Limit { input, count } => PlanTreeNode {
+            node_type: "Limit".to_string(),
+            table: String::new(),
+            estimated_rows: node.estimated_rows,
+            estimated_cost: node.estimated_cost,
+            details: format!("count: {}", count),
+            children: vec![build_plan_tree(input)],
+        },
+        Plan::Project { input, .. } => PlanTreeNode {
+            node_type: "Project".to_string(),
+            table: String::new(),
+            estimated_rows: node.estimated_rows,
+            estimated_cost: node.estimated_cost,
+            details: String::new(),
+            children: vec![build_plan_tree(input)],
+        },
+        Plan::Aggregate { input, group_by, .. } => PlanTreeNode {
+            node_type: "Aggregate".to_string(),
+            table: String::new(),
+            estimated_rows: node.estimated_rows,
+            estimated_cost: node.estimated_cost,
+            details: if group_by.is_some() { "with GROUP BY".to_string() } else { String::new() },
+            children: vec![build_plan_tree(input)],
+        },
+    }
+}
 
 #[derive(Debug)]
 pub struct SqlExecutor {
@@ -794,9 +893,18 @@ impl SqlExecutor {
 
     fn execute_explain(&self, statement: Statement) -> Result<ExecuteResult> {
         match statement {
-            Statement::Select { .. } => Ok(ExecuteResult::Explain {
-                plan: Optimizer::format_plan_tree(&self.get_or_optimize_plan(&statement)?),
-            }),
+            Statement::Select { .. } => {
+                // 中文註解：建立查詢計劃，同時產生純文字與 JSON 兩種表示形式
+                let plan_node = self.get_or_optimize_plan(&statement)?;
+                let plan_text = Optimizer::format_plan_tree(&plan_node);
+                let tree_node = build_plan_tree(&plan_node);
+                let plan_tree_json = serde_json::to_string(&tree_node)
+                    .unwrap_or_else(|_| "{}".to_string());
+                Ok(ExecuteResult::Explain {
+                    plan: plan_text,
+                    plan_tree_json,
+                })
+            }
             other => Ok(ExecuteResult::Error {
                 message: format!("EXPLAIN does not support {:?}", other),
             }),
@@ -2251,7 +2359,7 @@ impl SqlExecutor {
 
 pub fn format_execute_result(result: &ExecuteResult) -> String {
     match result {
-        ExecuteResult::Explain { plan } => plan.clone(),
+        ExecuteResult::Explain { plan, .. } => plan.clone(),
         ExecuteResult::Prepared { name } => format!("Prepared statement '{}' created", name),
         ExecuteResult::Deallocated { name } => {
             format!("Prepared statement '{}' deallocated", name)
