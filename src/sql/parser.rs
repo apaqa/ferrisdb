@@ -6,7 +6,8 @@ use crate::error::{FerrisDbError, Result};
 use super::ast::{
     AggregateFunc, Assignment, CTE, ColumnDef, DataType, Expr, GroupByClause, InsertSource,
     IsolationLevel, JoinClause, JoinType, Operator, OrderByClause, OrderDirection,
-    SelectColumns, SelectItem, Statement, Value, WhereExpr, WindowFunc,
+    Privilege, SelectColumns, SelectItem, Statement, TriggerEvent, TriggerTiming, Value,
+    WhereExpr, WindowFunc,
 };
 use super::lexer::{Keyword, Token};
 
@@ -33,7 +34,21 @@ impl Parser {
     }
 
     pub fn parse(&mut self) -> Result<Statement> {
-        if self.tokens.is_empty() {
+        // 中文註解：parse() 是公開入口，解析完畢後會確保沒有多餘的 token。
+        let stmt = self.parse_inner()?;
+
+        if self.peek().is_some() {
+            return Err(FerrisDbError::InvalidCommand(
+                "unexpected trailing tokens in SQL".to_string(),
+            ));
+        }
+
+        Ok(stmt)
+    }
+
+    // 中文註解：parse_inner() 是內部解析方法，供觸發器主體等場合重複呼叫，不檢查尾端 token。
+    fn parse_inner(&mut self) -> Result<Statement> {
+        if self.tokens.is_empty() || self.pos >= self.tokens.len() {
             return Err(FerrisDbError::InvalidCommand(
                 "empty SQL statement".to_string(),
             ));
@@ -54,6 +69,10 @@ impl Parser {
             Some(Token::Keyword(Keyword::Select)) => self.parse_query_expression()?,
             Some(Token::Keyword(Keyword::Update)) => self.parse_update()?,
             Some(Token::Keyword(Keyword::Delete)) => self.parse_delete()?,
+            // 中文註解：GRANT 賦予權限
+            Some(Token::Keyword(Keyword::Grant)) => self.parse_grant()?,
+            // 中文註解：REVOKE 撤銷權限
+            Some(Token::Keyword(Keyword::Revoke)) => self.parse_revoke()?,
             other => {
                 return Err(FerrisDbError::InvalidCommand(format!(
                     "unsupported SQL statement starting with {:?}",
@@ -66,12 +85,6 @@ impl Parser {
             self.bump();
         }
 
-        if self.peek().is_some() {
-            return Err(FerrisDbError::InvalidCommand(
-                "unexpected trailing tokens in SQL".to_string(),
-            ));
-        }
-
         Ok(stmt)
     }
 
@@ -81,8 +94,10 @@ impl Parser {
             Some(Token::Keyword(Keyword::View)) => self.parse_create_view_after_create(),
             Some(Token::Keyword(Keyword::Table)) => self.parse_create_table_after_create(),
             Some(Token::Keyword(Keyword::Index)) => self.parse_create_index_after_create(),
+            // 中文註解：CREATE TRIGGER 觸發器定義
+            Some(Token::Keyword(Keyword::Trigger)) => self.parse_create_trigger_after_create(),
             other => Err(FerrisDbError::InvalidCommand(format!(
-                "expected VIEW, TABLE or INDEX after CREATE, got {:?}",
+                "expected VIEW, TABLE, INDEX or TRIGGER after CREATE, got {:?}",
                 other
             ))),
         }
@@ -150,6 +165,172 @@ impl Parser {
         })
     }
 
+    // 中文註解：解析 CREATE TRIGGER trigger_name BEFORE/AFTER INSERT/UPDATE/DELETE
+    //           ON table_name FOR EACH ROW BEGIN ... END
+    fn parse_create_trigger_after_create(&mut self) -> Result<Statement> {
+        self.expect_keyword(Keyword::Trigger)?;
+        let trigger_name = self.expect_ident()?;
+
+        // 解析 BEFORE 或 AFTER
+        let timing = match self.bump() {
+            Some(Token::Keyword(Keyword::Before)) => TriggerTiming::Before,
+            Some(Token::Keyword(Keyword::After)) => TriggerTiming::After,
+            other => {
+                return Err(FerrisDbError::InvalidCommand(format!(
+                    "expected BEFORE or AFTER in trigger definition, got {:?}",
+                    other
+                )));
+            }
+        };
+
+        // 解析觸發事件 INSERT / UPDATE / DELETE
+        let event = match self.bump() {
+            Some(Token::Keyword(Keyword::Insert)) => TriggerEvent::Insert,
+            Some(Token::Keyword(Keyword::Update)) => TriggerEvent::Update,
+            Some(Token::Keyword(Keyword::Delete)) => TriggerEvent::Delete,
+            other => {
+                return Err(FerrisDbError::InvalidCommand(format!(
+                    "expected INSERT, UPDATE or DELETE in trigger definition, got {:?}",
+                    other
+                )));
+            }
+        };
+
+        self.expect_keyword(Keyword::On)?;
+        let table_name = self.expect_ident()?;
+        self.expect_keyword(Keyword::For)?;
+        self.expect_keyword(Keyword::Each)?;
+        self.expect_keyword(Keyword::Row)?;
+        self.expect_keyword(Keyword::Begin)?;
+
+        // 解析觸發器主體，直到遇到 END
+        let body = self.parse_trigger_body()?;
+        self.expect_keyword(Keyword::End)?;
+
+        Ok(Statement::CreateTrigger {
+            trigger_name,
+            timing,
+            event,
+            table_name,
+            body,
+        })
+    }
+
+    // 中文註解：解析觸發器主體內的語句列表（直到 END 為止）
+    fn parse_trigger_body(&mut self) -> Result<Vec<Statement>> {
+        let mut body = Vec::new();
+        while !matches!(
+            self.peek(),
+            Some(Token::Keyword(Keyword::End)) | None
+        ) {
+            let stmt = self.parse_trigger_body_statement()?;
+            body.push(stmt);
+        }
+        Ok(body)
+    }
+
+    // 中文註解：在觸發器主體中，SET NEW.col = val 需要特殊處理，其餘沿用一般語法
+    fn parse_trigger_body_statement(&mut self) -> Result<Statement> {
+        match self.peek() {
+            Some(Token::Keyword(Keyword::Set)) => {
+                // 若 SET 後面是識別符（而非 TRANSACTION），則是 SET NEW.col = val
+                let next_is_ident = matches!(
+                    self.tokens.get(self.pos + 1),
+                    Some(Token::Ident(_))
+                );
+                if next_is_ident {
+                    self.parse_trigger_set_new()
+                } else {
+                    self.parse_set_statement()
+                }
+            }
+            _ => self.parse_inner(),
+        }
+    }
+
+    // 中文註解：解析 SET NEW.column = value（觸發器內修改即將寫入的欄位值）
+    fn parse_trigger_set_new(&mut self) -> Result<Statement> {
+        self.expect_keyword(Keyword::Set)?;
+        let new_kw = self.expect_ident()?;
+        if new_kw.to_uppercase() != "NEW" {
+            return Err(FerrisDbError::InvalidCommand(format!(
+                "expected NEW in trigger SET statement, got '{}'",
+                new_kw
+            )));
+        }
+        self.expect_token(Token::Dot)?;
+        let column = self.expect_ident()?;
+        self.expect_token(Token::Eq)?;
+        let value = self.parse_value()?;
+        Ok(Statement::TriggerSetNew { column, value })
+    }
+
+    // 中文註解：解析 GRANT privilege_list ON table TO user
+    fn parse_grant(&mut self) -> Result<Statement> {
+        self.expect_keyword(Keyword::Grant)?;
+        let privileges = self.parse_privilege_list()?;
+        self.expect_keyword(Keyword::On)?;
+        let table_name = self.expect_ident()?;
+        self.expect_keyword(Keyword::To)?;
+        let user = self.expect_ident()?;
+        Ok(Statement::Grant {
+            privileges,
+            table_name,
+            user,
+        })
+    }
+
+    // 中文註解：解析 REVOKE privilege_list ON table FROM user
+    fn parse_revoke(&mut self) -> Result<Statement> {
+        self.expect_keyword(Keyword::Revoke)?;
+        let privileges = self.parse_privilege_list()?;
+        self.expect_keyword(Keyword::On)?;
+        let table_name = self.expect_ident()?;
+        self.expect_keyword(Keyword::From)?;
+        let user = self.expect_ident()?;
+        Ok(Statement::Revoke {
+            privileges,
+            table_name,
+            user,
+        })
+    }
+
+    // 中文註解：解析特權列表，支援 ALL PRIVILEGES、ALL 以及逗號分隔的 SELECT/INSERT/UPDATE/DELETE
+    fn parse_privilege_list(&mut self) -> Result<Vec<Privilege>> {
+        // ALL PRIVILEGES 或 ALL
+        if matches!(self.peek(), Some(Token::Keyword(Keyword::All))) {
+            self.bump();
+            // 可選的 PRIVILEGES 關鍵字
+            if matches!(self.peek(), Some(Token::Keyword(Keyword::Privileges))) {
+                self.bump();
+            }
+            return Ok(vec![Privilege::All]);
+        }
+
+        let mut privileges = Vec::new();
+        loop {
+            let priv_item = match self.bump() {
+                Some(Token::Keyword(Keyword::Select)) => Privilege::Select,
+                Some(Token::Keyword(Keyword::Insert)) => Privilege::Insert,
+                Some(Token::Keyword(Keyword::Update)) => Privilege::Update,
+                Some(Token::Keyword(Keyword::Delete)) => Privilege::Delete,
+                other => {
+                    return Err(FerrisDbError::InvalidCommand(format!(
+                        "expected privilege (SELECT/INSERT/UPDATE/DELETE/ALL), got {:?}",
+                        other
+                    )));
+                }
+            };
+            privileges.push(priv_item);
+            if matches!(self.peek(), Some(Token::Comma)) {
+                self.bump();
+                continue;
+            }
+            break;
+        }
+        Ok(privileges)
+    }
+
     fn parse_drop_statement(&mut self) -> Result<Statement> {
         self.expect_keyword(Keyword::Drop)?;
         match self.peek() {
@@ -183,8 +364,14 @@ impl Parser {
                     if_exists,
                 })
             }
+            // 中文註解：DROP TRIGGER 移除觸發器
+            Some(Token::Keyword(Keyword::Trigger)) => {
+                self.expect_keyword(Keyword::Trigger)?;
+                let trigger_name = self.expect_ident()?;
+                Ok(Statement::DropTrigger { trigger_name })
+            }
             other => Err(FerrisDbError::InvalidCommand(format!(
-                "expected VIEW, INDEX or TABLE after DROP, got {:?}",
+                "expected VIEW, INDEX, TABLE or TRIGGER after DROP, got {:?}",
                 other
             ))),
         }
@@ -1308,6 +1495,19 @@ fn keyword_to_sql(keyword: &Keyword) -> &'static str {
         Keyword::True => "TRUE",
         Keyword::False => "FALSE",
         Keyword::All => "ALL",
+        // 中文註解：Trigger 關鍵字轉回 SQL 字串
+        Keyword::Trigger => "TRIGGER",
+        Keyword::Before => "BEFORE",
+        Keyword::After => "AFTER",
+        Keyword::For => "FOR",
+        Keyword::Each => "EACH",
+        Keyword::Row => "ROW",
+        Keyword::Begin => "BEGIN",
+        // 中文註解：GRANT/REVOKE 關鍵字轉回 SQL 字串
+        Keyword::Grant => "GRANT",
+        Keyword::Revoke => "REVOKE",
+        Keyword::Privileges => "PRIVILEGES",
+        Keyword::To => "TO",
     }
 }
 
@@ -1326,7 +1526,13 @@ fn max_placeholder_in_statement(statement: &Statement) -> usize {
         | Statement::Insert { .. }
         | Statement::Deallocate { .. }
         | Statement::Execute { .. }
-        | Statement::SetIsolationLevel { .. } => 0,
+        | Statement::SetIsolationLevel { .. }
+        // 中文註解：觸發器與權限語句不含 placeholder
+        | Statement::CreateTrigger { .. }
+        | Statement::DropTrigger { .. }
+        | Statement::TriggerSetNew { .. }
+        | Statement::Grant { .. }
+        | Statement::Revoke { .. } => 0,
         Statement::Prepare { body, .. } => max_placeholder_in_statement(body),
         Statement::Select {
             ctes,

@@ -1187,6 +1187,31 @@ impl SqlApiResponse {
             ExecuteResult::Error { message } => {
                 Self::error(message, elapsed_ms, executed_count, statement_results)
             }
+            // 中文註解：觸發器與權限操作結果
+            ExecuteResult::TriggerCreated { trigger_name }
+            | ExecuteResult::TriggerDropped { trigger_name } => Self {
+                success: true,
+                kind: "trigger".to_string(),
+                columns: Vec::new(),
+                rows: Vec::new(),
+                row_count: 0,
+                elapsed_ms,
+                executed_count,
+                message: trigger_name,
+                statement_results,
+            },
+            ExecuteResult::Granted { user, table_name }
+            | ExecuteResult::Revoked { user, table_name } => Self {
+                success: true,
+                kind: "privilege".to_string(),
+                columns: Vec::new(),
+                rows: Vec::new(),
+                row_count: 0,
+                elapsed_ms,
+                executed_count,
+                message: format!("{} on {}", user, table_name),
+                statement_results,
+            },
         }
     }
 
@@ -1376,6 +1401,29 @@ impl SqlStatementResult {
                 row_count: 0,
                 elapsed_ms,
                 message,
+            },
+            // 中文註解：觸發器與權限操作結果
+            ExecuteResult::TriggerCreated { trigger_name }
+            | ExecuteResult::TriggerDropped { trigger_name } => Self {
+                sql,
+                success: true,
+                kind: "trigger".to_string(),
+                columns: Vec::new(),
+                rows: Vec::new(),
+                row_count: 0,
+                elapsed_ms,
+                message: trigger_name,
+            },
+            ExecuteResult::Granted { user, table_name }
+            | ExecuteResult::Revoked { user, table_name } => Self {
+                sql,
+                success: true,
+                kind: "privilege".to_string(),
+                columns: Vec::new(),
+                rows: Vec::new(),
+                row_count: 0,
+                elapsed_ms,
+                message: format!("{} on {}", user, table_name),
             },
         }
     }

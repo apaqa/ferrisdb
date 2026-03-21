@@ -112,6 +112,19 @@ pub enum Keyword {
     Null,
     True,
     False,
+    // 中文註解：以下是 Trigger 機制所需的關鍵字
+    Trigger,
+    Before,
+    After,
+    For,
+    Each,
+    Row,
+    Begin,
+    // 中文註解：以下是 GRANT/REVOKE 權限控制所需的關鍵字
+    Grant,
+    Revoke,
+    Privileges,
+    To,
 }
 
 pub struct Lexer<'a> {
@@ -420,6 +433,19 @@ fn keyword_from_ident(ident: &str) -> Option<Keyword> {
         "NULL" => Some(Keyword::Null),
         "TRUE" => Some(Keyword::True),
         "FALSE" => Some(Keyword::False),
+        // 中文註解：Trigger 相關關鍵字對應
+        "TRIGGER" => Some(Keyword::Trigger),
+        "BEFORE" => Some(Keyword::Before),
+        "AFTER" => Some(Keyword::After),
+        "FOR" => Some(Keyword::For),
+        "EACH" => Some(Keyword::Each),
+        "ROW" => Some(Keyword::Row),
+        "BEGIN" => Some(Keyword::Begin),
+        // 中文註解：GRANT/REVOKE 相關關鍵字對應
+        "GRANT" => Some(Keyword::Grant),
+        "REVOKE" => Some(Keyword::Revoke),
+        "PRIVILEGES" => Some(Keyword::Privileges),
+        "TO" => Some(Keyword::To),
         _ => None,
     }
 }

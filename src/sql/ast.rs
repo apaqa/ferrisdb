@@ -105,6 +105,35 @@ pub enum Statement {
         right: Box<Statement>,
         all: bool,
     },
+    // 中文註解：CREATE TRIGGER 定義觸發器，含 BEFORE/AFTER、INSERT/UPDATE/DELETE 以及 BEGIN...END 主體
+    CreateTrigger {
+        trigger_name: String,
+        timing: TriggerTiming,
+        event: TriggerEvent,
+        table_name: String,
+        body: Vec<Statement>,
+    },
+    // 中文註解：DROP TRIGGER 移除已存在的觸發器
+    DropTrigger {
+        trigger_name: String,
+    },
+    // 中文註解：觸發器主體內使用 SET NEW.col = val 修改即將寫入的欄位值
+    TriggerSetNew {
+        column: String,
+        value: Value,
+    },
+    // 中文註解：GRANT 賦予特定使用者對某張表的操作權限
+    Grant {
+        privileges: Vec<Privilege>,
+        table_name: String,
+        user: String,
+    },
+    // 中文註解：REVOKE 撤銷特定使用者對某張表的操作權限
+    Revoke {
+        privileges: Vec<Privilege>,
+        table_name: String,
+        user: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -291,4 +320,29 @@ pub enum Operator {
 pub struct Assignment {
     pub column: String,
     pub value: Value,
+}
+
+// 中文註解：TriggerTiming 決定觸發器在 DML 操作前或後執行
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TriggerTiming {
+    Before,
+    After,
+}
+
+// 中文註解：TriggerEvent 決定觸發器對哪種 DML 操作反應
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TriggerEvent {
+    Insert,
+    Update,
+    Delete,
+}
+
+// 中文註解：Privilege 代表資料庫操作權限類型
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Privilege {
+    Select,
+    Insert,
+    Update,
+    Delete,
+    All,
 }

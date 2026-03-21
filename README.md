@@ -32,6 +32,12 @@ FerrisDB is a database engine implemented from scratch in Rust, featuring LSM-Tr
 - DROP TABLE / DROP TABLE IF EXISTS
 - CREATE TABLE IF NOT EXISTS
 - WHERE IN (subquery)
+- SQL Triggers (`CREATE TRIGGER ... BEFORE/AFTER INSERT/UPDATE/DELETE ON table FOR EACH ROW BEGIN ... END`)
+- BEFORE trigger modifies row values via `SET NEW.col = value`
+- AFTER trigger executes arbitrary SQL after DML (e.g., writing audit logs)
+- `DROP TRIGGER`
+- GRANT/REVOKE access control (`GRANT SELECT, INSERT ON table TO user`, `REVOKE ALL ON table FROM user`)
+- Per-session user context with privilege enforcement for SELECT/INSERT/UPDATE/DELETE
 - TCP server with multi-threaded connections
 - HTTP Admin API (`/health`, `/stats`, `/sstables`, `/compact`, `/flush`, `/api/sql/prepare`, `/api/sql/execute`, `/api/sql/deallocate`)
 - Interactive REPL with KV and SQL modes
@@ -40,7 +46,7 @@ FerrisDB is a database engine implemented from scratch in Rust, featuring LSM-Tr
 - Built-in benchmark framework
 - Background compaction worker
 - Failure injection and stress tests
-- 172+ automated tests
+- 179+ automated tests
 
 ## Architecture
 

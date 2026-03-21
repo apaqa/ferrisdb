@@ -34,7 +34,8 @@ use crate::transaction::mvcc::{MvccEngine, PreparedStatement, Transaction};
 use super::ast::{
     AggregateFunc, Assignment, CTE, ColumnDef, DataType, Expr, GroupByClause, InsertSource,
     IsolationLevel, JoinClause, JoinType, Operator, OrderByClause, OrderDirection,
-    SelectColumns, SelectItem, Statement, Value, WhereExpr, WindowFunc,
+    Privilege, SelectColumns, SelectItem, Statement, TriggerEvent, TriggerTiming, Value,
+    WhereExpr, WindowFunc,
 };
 use super::catalog::{Catalog, TableSchema, ViewDefinition};
 use super::index::IndexManager;
@@ -96,7 +97,41 @@ pub enum ExecuteResult {
     Error {
         message: String,
     },
+    // 中文註解：觸發器建立成功
+    TriggerCreated {
+        trigger_name: String,
+    },
+    // 中文註解：觸發器刪除成功
+    TriggerDropped {
+        trigger_name: String,
+    },
+    // 中文註解：GRANT 權限授予成功
+    Granted {
+        user: String,
+        table_name: String,
+    },
+    // 中文註解：REVOKE 權限撤銷成功
+    Revoked {
+        user: String,
+        table_name: String,
+    },
 }
+
+// 中文註解：觸發器定義，存入 KV store 的 "__meta:trigger:{name}" 鍵
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct TriggerDefinition {
+    trigger_name: String,
+    timing: TriggerTiming,
+    event: TriggerEvent,
+    table_name: String,
+    // 中文註解：觸發器主體的 Statement 列表，BEFORE INSERT 可含 TriggerSetNew
+    body: Vec<Statement>,
+}
+
+// 中文註解：觸發器 metadata 的 KV key 前綴
+const TRIGGER_META_PREFIX: &str = "__meta:trigger:";
+// 中文註解：權限 metadata 的 KV key 前綴
+const PRIVILEGE_META_PREFIX: &str = "__meta:privilege:";
 
 #[derive(Debug)]
 pub struct SqlExecutor {
@@ -106,6 +141,8 @@ pub struct SqlExecutor {
     statistics: StatisticsManager,
     optimizer: Optimizer,
     plan_cache: Mutex<PlanCache>,
+    // 中文註解：目前 session 的使用者名稱；None 表示管理員模式（不做權限檢查）
+    current_user: Mutex<Option<String>>,
 }
 
 impl SqlExecutor {
@@ -121,7 +158,13 @@ impl SqlExecutor {
             statistics,
             optimizer,
             plan_cache: Mutex::new(PlanCache::new(100)),
+            current_user: Mutex::new(None),
         }
+    }
+
+    // 中文註解：設定目前 session 的使用者，None 代表管理員（不做權限檢查）
+    pub fn set_current_user(&self, user: Option<String>) {
+        *self.current_user.lock().expect("current_user lock") = user;
     }
 
     pub fn plan_cache_stats(&self) -> PlanCacheStats {
@@ -132,6 +175,17 @@ impl SqlExecutor {
     }
 
     pub fn execute(&self, stmt: Statement) -> Result<ExecuteResult> {
+        // 中文註解：若已設定使用者，先檢查該語句的資料操作權限（DDL 不受限）
+        if let Some(ref user) = *self.current_user.lock().expect("current_user lock") {
+            if let Some(err_msg) = self.check_privilege_for_stmt(&stmt, user)? {
+                return Ok(ExecuteResult::Error { message: err_msg });
+            }
+        }
+        self.execute_unchecked(stmt)
+    }
+
+    // 中文註解：execute_unchecked 直接執行語句，不做權限檢查（供觸發器主體等內部呼叫）
+    fn execute_unchecked(&self, stmt: Statement) -> Result<ExecuteResult> {
         match stmt {
             Statement::Explain { statement } => self.execute_explain(*statement),
             Statement::Prepare { name, params, body } => self.execute_prepare(name, params, *body),
@@ -218,6 +272,76 @@ impl SqlExecutor {
                 where_clause,
             } => self.execute_delete(table_name, using_table, join_condition, where_clause),
             Statement::Union { left, right, all } => self.execute_union(*left, *right, all),
+            // 中文註解：觸發器相關語句
+            Statement::CreateTrigger {
+                trigger_name,
+                timing,
+                event,
+                table_name,
+                body,
+            } => self.execute_create_trigger(trigger_name, timing, event, table_name, body),
+            Statement::DropTrigger { trigger_name } => self.execute_drop_trigger(trigger_name),
+            Statement::TriggerSetNew { .. } => Ok(ExecuteResult::Error {
+                message: "TriggerSetNew cannot be executed directly outside a trigger body"
+                    .to_string(),
+            }),
+            // 中文註解：GRANT/REVOKE 權限控制語句
+            Statement::Grant {
+                privileges,
+                table_name,
+                user,
+            } => self.execute_grant(privileges, table_name, user),
+            Statement::Revoke {
+                privileges,
+                table_name,
+                user,
+            } => self.execute_revoke(privileges, table_name, user),
+        }
+    }
+
+    // 中文註解：檢查目前使用者對特定語句所需的資料操作權限；回傳 None 代表允許，Some(msg) 代表拒絕
+    fn check_privilege_for_stmt(
+        &self,
+        stmt: &Statement,
+        user: &str,
+    ) -> Result<Option<String>> {
+        let (table, required_priv) = match stmt {
+            Statement::Select { table_name, .. } => (table_name.as_str(), "SELECT"),
+            Statement::Insert { table_name, .. } => (table_name.as_str(), "INSERT"),
+            Statement::Update { table_name, .. } => (table_name.as_str(), "UPDATE"),
+            Statement::Delete { table_name, .. } => (table_name.as_str(), "DELETE"),
+            // 其他語句（DDL、GRANT 等）不做使用者權限檢查
+            _ => return Ok(None),
+        };
+
+        let txn = self.engine.begin_transaction();
+        let key = encode_privilege_key(user, table);
+        let raw = txn.get(&key)?;
+        let privileges: Vec<Privilege> = raw
+            .as_deref()
+            .map(serde_json::from_slice)
+            .transpose()?
+            .unwrap_or_default();
+
+        // 中文註解：擁有 ALL 或對應特定權限即可通過
+        let has_access = privileges.iter().any(|p| {
+            matches!(p, Privilege::All)
+                || match required_priv {
+                    "SELECT" => matches!(p, Privilege::Select),
+                    "INSERT" => matches!(p, Privilege::Insert),
+                    "UPDATE" => matches!(p, Privilege::Update),
+                    "DELETE" => matches!(p, Privilege::Delete),
+                    _ => false,
+                }
+        });
+
+        if has_access {
+            Ok(None)
+        } else {
+            Ok(Some(format!(
+                "permission denied: user '{}' does not have {} privilege on '{}'",
+                user, required_priv, table
+            )))
         }
     }
 
@@ -480,6 +604,150 @@ impl SqlExecutor {
         })
     }
 
+    // 中文註解：建立觸發器，把定義序列化後存入 "__meta:trigger:{name}"
+    fn execute_create_trigger(
+        &self,
+        trigger_name: String,
+        timing: TriggerTiming,
+        event: TriggerEvent,
+        table_name: String,
+        body: Vec<Statement>,
+    ) -> Result<ExecuteResult> {
+        let mut txn = self.engine.begin_transaction();
+        let key = encode_trigger_key(&trigger_name);
+        if txn.get(&key)?.is_some() {
+            return Ok(ExecuteResult::Error {
+                message: format!("trigger '{}' already exists", trigger_name),
+            });
+        }
+
+        let def = TriggerDefinition {
+            trigger_name: trigger_name.clone(),
+            timing,
+            event,
+            table_name,
+            body,
+        };
+        txn.put(key, serde_json::to_vec(&def)?)?;
+        txn.commit()?;
+        Ok(ExecuteResult::TriggerCreated { trigger_name })
+    }
+
+    // 中文註解：刪除觸發器定義
+    fn execute_drop_trigger(&self, trigger_name: String) -> Result<ExecuteResult> {
+        let mut txn = self.engine.begin_transaction();
+        let key = encode_trigger_key(&trigger_name);
+        if txn.get(&key)?.is_none() {
+            return Ok(ExecuteResult::Error {
+                message: format!("trigger '{}' does not exist", trigger_name),
+            });
+        }
+        txn.delete(&key)?;
+        txn.commit()?;
+        Ok(ExecuteResult::TriggerDropped { trigger_name })
+    }
+
+    // 中文註解：查出指定 table + timing + event 的所有觸發器
+    fn get_triggers_for_table(
+        &self,
+        txn: &crate::transaction::mvcc::Transaction,
+        table_name: &str,
+        timing: &TriggerTiming,
+        event: &TriggerEvent,
+    ) -> Result<Vec<TriggerDefinition>> {
+        let start = TRIGGER_META_PREFIX.as_bytes().to_vec();
+        let mut end = TRIGGER_META_PREFIX.as_bytes().to_vec();
+        end.push(0xFF);
+
+        let mut triggers = Vec::new();
+        for (_, value) in txn.scan(&start, &end)? {
+            let def: TriggerDefinition = serde_json::from_slice(&value)?;
+            if def.table_name == table_name && &def.timing == timing && &def.event == event {
+                triggers.push(def);
+            }
+        }
+        Ok(triggers)
+    }
+
+    // 中文註解：執行觸發器主體中的語句（不做使用者權限檢查）
+    fn execute_trigger_body(&self, body: &[Statement]) -> Result<()> {
+        for stmt in body {
+            // TriggerSetNew 在觸發器主體外部執行時直接略過（由呼叫方處理）
+            if matches!(stmt, Statement::TriggerSetNew { .. }) {
+                continue;
+            }
+            let result = self.execute_unchecked(stmt.clone())?;
+            if let ExecuteResult::Error { message } = result {
+                return Err(crate::error::FerrisDbError::InvalidCommand(format!(
+                    "trigger body error: {}",
+                    message
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    // 中文註解：GRANT 把權限列表存入 "__meta:privilege:{user}:{table}"
+    fn execute_grant(
+        &self,
+        privileges: Vec<Privilege>,
+        table_name: String,
+        user: String,
+    ) -> Result<ExecuteResult> {
+        let mut txn = self.engine.begin_transaction();
+        let key = encode_privilege_key(&user, &table_name);
+
+        // 讀取已有權限並合併
+        let mut existing: Vec<Privilege> = txn
+            .get(&key)?
+            .as_deref()
+            .map(serde_json::from_slice)
+            .transpose()?
+            .unwrap_or_default();
+
+        for priv_item in privileges {
+            if !existing.contains(&priv_item) {
+                existing.push(priv_item);
+            }
+        }
+        txn.put(key, serde_json::to_vec(&existing)?)?;
+        txn.commit()?;
+        Ok(ExecuteResult::Granted { user, table_name })
+    }
+
+    // 中文註解：REVOKE 從 KV store 中移除指定使用者對特定表的權限
+    fn execute_revoke(
+        &self,
+        privileges: Vec<Privilege>,
+        table_name: String,
+        user: String,
+    ) -> Result<ExecuteResult> {
+        let mut txn = self.engine.begin_transaction();
+        let key = encode_privilege_key(&user, &table_name);
+
+        let mut existing: Vec<Privilege> = txn
+            .get(&key)?
+            .as_deref()
+            .map(serde_json::from_slice)
+            .transpose()?
+            .unwrap_or_default();
+
+        if privileges.iter().any(|p| matches!(p, Privilege::All)) {
+            // REVOKE ALL 清空所有權限
+            existing.clear();
+        } else {
+            existing.retain(|e| !privileges.contains(e));
+        }
+
+        if existing.is_empty() {
+            txn.delete(&key)?;
+        } else {
+            txn.put(key, serde_json::to_vec(&existing)?)?;
+        }
+        txn.commit()?;
+        Ok(ExecuteResult::Revoked { user, table_name })
+    }
+
     fn execute_analyze_table(&self, table_name: String) -> Result<ExecuteResult> {
         let mut txn = self.engine.begin_transaction();
         let analyzed = self.statistics.analyze_table(&mut txn, &table_name)?;
@@ -618,6 +886,33 @@ impl SqlExecutor {
             }
         };
 
+        // 中文註解：取得 BEFORE INSERT 觸發器，對每一列套用 SET NEW.col = val
+        let before_triggers =
+            self.get_triggers_for_table(&txn, &table_name, &TriggerTiming::Before, &TriggerEvent::Insert)?;
+        let rows = if !before_triggers.is_empty() {
+            rows.into_iter()
+                .map(|mut row_values| {
+                    for trigger in &before_triggers {
+                        for stmt in &trigger.body {
+                            if let Statement::TriggerSetNew { column, value } = stmt {
+                                // 找到欄位位置並覆蓋值
+                                if let Some(idx) =
+                                    schema.columns.iter().position(|c| &c.name == column)
+                                {
+                                    if idx < row_values.len() {
+                                        row_values[idx] = value.clone();
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    row_values
+                })
+                .collect()
+        } else {
+            rows
+        };
+
         let inserted = match self.insert_rows_into_table(&mut txn, &schema, &table_name, rows)? {
             Ok(count) => count,
             Err(message) => return Ok(ExecuteResult::Error { message }),
@@ -625,6 +920,15 @@ impl SqlExecutor {
 
         self.statistics.mark_stale(&mut txn, &table_name)?;
         txn.commit()?;
+
+        // 中文註解：INSERT 提交後執行 AFTER INSERT 觸發器
+        let read_txn = self.engine.begin_transaction();
+        let after_triggers =
+            self.get_triggers_for_table(&read_txn, &table_name, &TriggerTiming::After, &TriggerEvent::Insert)?;
+        for trigger in &after_triggers {
+            self.execute_trigger_body(&trigger.body)?;
+        }
+
         Ok(ExecuteResult::Inserted { count: inserted })
     }
 
@@ -1456,6 +1760,21 @@ impl SqlExecutor {
 
         self.statistics.mark_stale(&mut txn, &table_name)?;
         txn.commit()?;
+
+        // 中文註解：UPDATE 提交後執行 AFTER UPDATE 觸發器
+        if updated > 0 {
+            let read_txn = self.engine.begin_transaction();
+            let after_triggers = self.get_triggers_for_table(
+                &read_txn,
+                &table_name,
+                &TriggerTiming::After,
+                &TriggerEvent::Update,
+            )?;
+            for trigger in &after_triggers {
+                self.execute_trigger_body(&trigger.body)?;
+            }
+        }
+
         Ok(ExecuteResult::Updated { count: updated })
     }
 
@@ -1516,6 +1835,21 @@ impl SqlExecutor {
 
         self.statistics.mark_stale(&mut txn, &table_name)?;
         txn.commit()?;
+
+        // 中文註解：DELETE 提交後執行 AFTER DELETE 觸發器
+        if deleted > 0 {
+            let read_txn = self.engine.begin_transaction();
+            let after_triggers = self.get_triggers_for_table(
+                &read_txn,
+                &table_name,
+                &TriggerTiming::After,
+                &TriggerEvent::Delete,
+            )?;
+            for trigger in &after_triggers {
+                self.execute_trigger_body(&trigger.body)?;
+            }
+        }
+
         Ok(ExecuteResult::Deleted { count: deleted })
     }
 
@@ -1942,6 +2276,19 @@ pub fn format_execute_result(result: &ExecuteResult) -> String {
         ExecuteResult::Updated { count } => format!("Updated {} row(s)", count),
         ExecuteResult::Deleted { count } => format!("Deleted {} row(s)", count),
         ExecuteResult::Error { message } => format!("Error: {}", message),
+        // 中文註解：觸發器與權限操作結果的顯示格式
+        ExecuteResult::TriggerCreated { trigger_name } => {
+            format!("Trigger '{}' created", trigger_name)
+        }
+        ExecuteResult::TriggerDropped { trigger_name } => {
+            format!("Trigger '{}' dropped", trigger_name)
+        }
+        ExecuteResult::Granted { user, table_name } => {
+            format!("Privileges granted to '{}' on '{}'", user, table_name)
+        }
+        ExecuteResult::Revoked { user, table_name } => {
+            format!("Privileges revoked from '{}' on '{}'", user, table_name)
+        }
     }
 }
 
@@ -3442,4 +3789,14 @@ impl ValueLookup for ProjectedRow {
             .find(|(name, _)| name == column)
             .map(|(_, value)| value)
     }
+}
+
+// 中文註解：觸發器 metadata 的 KV key 編碼
+fn encode_trigger_key(trigger_name: &str) -> Vec<u8> {
+    format!("{}{}", TRIGGER_META_PREFIX, trigger_name).into_bytes()
+}
+
+// 中文註解：使用者對特定表的權限 KV key 編碼
+fn encode_privilege_key(user: &str, table_name: &str) -> Vec<u8> {
+    format!("{}{}", PRIVILEGE_META_PREFIX, format!("{}:{}", user, table_name)).into_bytes()
 }
