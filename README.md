@@ -1,134 +1,92 @@
-# FerrisDB — A database engine built from scratch in Rust
+# FerrisDB
 
-FerrisDB is a database engine implemented from scratch in Rust, featuring LSM-Tree storage, configurable WAL durability, MVCC concurrency control, and a small SQL layer.
+**A database engine built from scratch in Rust.**
 
-## Features
+FerrisDB is a learning-oriented but feature-rich database project that combines an LSM-tree storage engine, WAL-based durability, MVCC concurrency control, a SQL layer, and network-facing admin/server interfaces in a single Rust codebase.
 
-- LSM-Tree storage engine (MemTable + SSTable + Compaction)
-- Write-Ahead Log with CRC32 checksum, crash recovery, and runtime mode switching
-- Bloom Filter for read optimization
-- MVCC with `READ COMMITTED`, `REPEATABLE READ`, and `SERIALIZABLE`
-- SQL support (`CREATE TABLE`, `INSERT`, `SELECT`, `UPDATE`, `DELETE`)
-- SQL User-Defined Functions (`CREATE FUNCTION`, `DROP FUNCTION`, scalar calls in `SELECT` / `WHERE` / `INSERT VALUES`)
-- SQL Temporary Tables (`CREATE TEMPORARY TABLE`, `DROP TEMPORARY TABLE`) with executor-scoped in-memory storage
-- SQL JSON column type and JSON functions (`JSON`, `JSON_EXTRACT`, `JSON_SET`)
-- SQL Views and Materialized Views (`CREATE VIEW`, `CREATE MATERIALIZED VIEW`, `REFRESH MATERIALIZED VIEW`, `DROP MATERIALIZED VIEW`)
-- SQL Common Table Expressions (`WITH`)
-- SQL WITH RECURSIVE CTE execution with bounded fixpoint evaluation
-- SQL prepared statements (`PREPARE`, `EXECUTE`, `DEALLOCATE`)
-- SQL INNER JOIN with nested loop
-- SQL `UPDATE ... FROM` and `DELETE ... USING`
-- SQL `ANALYZE TABLE` statistics collection
-- SQL aggregate functions: COUNT, SUM, MIN, MAX
-- SQL GROUP BY
-- SQL DISTINCT
-- SQL AS aliases for columns, aggregates, and tables
-- SQL ORDER BY ASC/DESC
-- SQL LIMIT
-- SQL EXPLAIN with query plan and visual tree diagram in FerrisDB Studio
-- SQL `VACUUM` for global or table-scoped cleanup
-- Cost-Based Query Optimizer with scan / join strategy selection
-- Query Plan Cache (LRU)
-- SQL `WHERE` with comparison operators (`=`, `!=`, `<`, `>`, `<=`, `>=`)
-- SQL `BETWEEN`, `LIKE`, `IS NULL`, `IS NOT NULL`
-- SQL NULL-aware behavior for sorting and aggregates
-- SQL UNIQUE constraints (single-column and composite)
-- SQL RANGE table partitioning with partition pruning
-- Secondary / composite indexes with `CREATE INDEX ON table(col1, col2, ...)`
-- Index Scan optimization for equality-prefix queries
-- ALTER TABLE (`ADD COLUMN` / `DROP COLUMN`)
-- DROP TABLE / DROP TABLE IF EXISTS
-- CREATE TABLE IF NOT EXISTS
-- Foreign Key constraints (`FOREIGN KEY ... REFERENCES ...`) with insert/update/delete checks
-- CHECK constraints (`CHECK (...)`) with insert/update validation
-- WHERE IN (subquery)
-- SQL Triggers (`CREATE TRIGGER ... BEFORE/AFTER INSERT/UPDATE/DELETE ON table FOR EACH ROW BEGIN ... END`)
-- BEFORE trigger modifies row values via `SET NEW.col = value`
-- AFTER trigger executes arbitrary SQL after DML (e.g., writing audit logs)
-- `DROP TRIGGER`
-- SQL Stored Procedures (`CREATE PROCEDURE`, `CALL`, `DROP PROCEDURE`) with local variables, `IF/ELSE`, and `WHILE`
-- SQL Cursor support (`DECLARE CURSOR`, `OPEN`, `FETCH NEXT`, `CLOSE`)
-- GRANT/REVOKE access control (`GRANT SELECT, INSERT ON table TO user`, `REVOKE ALL ON table FROM user`)
-- Per-session user context with privilege enforcement for SELECT/INSERT/UPDATE/DELETE
-- TCP server with multi-threaded connections
-- HTTP Admin API (`/health`, `/stats`, `/sstables`, `/compact`, `/flush`, `/api/sql/prepare`, `/api/sql/execute`, `/api/sql/deallocate`) with `plan_tree` JSON for EXPLAIN
-- HTTP SQL connection pooling with configurable `max_connections`
-- Interactive REPL with KV and SQL modes
-- MANIFEST metadata management
-- Configurable via `ferrisdb.toml`
-- Built-in benchmark framework
-- Property-based testing for KV / SQL invariants
-- Background compaction worker
-- Failure injection and stress tests
-- 240 automated tests across 46 test files
+![Tests](https://img.shields.io/badge/tests-240%20passing-brightgreen)
+![Language](https://img.shields.io/badge/language-Rust-orange)
 
 ## Architecture
 
-FerrisDB is structured as a layered database engine. Both the KV interface and the SQL interface eventually flow into the same MVCC and storage stack.
-
 ```text
-Client (REPL / TCP)
-  |
-  v
-SQL Layer (Lexer -> Parser -> Executor)
-  |
-  v
-MVCC (Transaction, Snapshot Isolation)
-  |
-  v
-LSM Engine
-  |-- MemTable (BTreeMap, in-memory)
-  |-- WAL (Write-Ahead Log)
-  |-- SSTable (sorted on-disk files)
-  |    \-- Bloom Filter
-  |-- Compaction
-  \-- MANIFEST (metadata)
-  |
-  v
-Disk
+                         +---------------------------+
+                         |   Client / Applications   |
+                         | REPL | HTTP API | TCP API |
+                         +-------------+-------------+
+                                       |
+                                       v
+                         +---------------------------+
+                         |        SQL Engine         |
+                         | Lexer -> Parser -> AST    |
+                         | Executor -> Result sets   |
+                         +-------------+-------------+
+                                       |
+                                       v
+                         +---------------------------+
+                         |     Query Optimizer       |
+                         | Plan cache | EXPLAIN      |
+                         | SeqScan / IndexScan / Join|
+                         +-------------+-------------+
+                                       |
+                                       v
+                         +---------------------------+
+                         |            MVCC           |
+                         | Transactions | Snapshots  |
+                         | Versioned keys | Isolation|
+                         +-------------+-------------+
+                                       |
+                                       v
+                         +---------------------------+
+                         |         LSM-Tree          |
+                         | MemTable | Compaction     |
+                         | MANIFEST | Bloom Filter   |
+                         +------+--------------+-----+
+                                |              |
+                                v              v
+                      +----------------+  +----------------+
+                      |      WAL       |  |    SSTables    |
+                      | CRC32 + replay |  | sorted files   |
+                      +----------------+  +----------------+
+                                \              /
+                                 \            /
+                                  v          v
+                                   +--------+
+                                   |  Disk  |
+                                   +--------+
 ```
+
+## Features
+
+### Storage and durability
+
+FerrisDB uses an LSM-tree storage engine with an in-memory MemTable, immutable SSTables, Bloom filters for negative lookup acceleration, compaction, and MANIFEST-based metadata recovery. Durability comes from a Write-Ahead Log with CRC32 checksums, crash recovery, configurable WAL behavior, and maintenance commands such as `VACUUM`.
+
+### Transactions and concurrency
+
+The engine supports MVCC with timestamped versions, snapshot reads, and multiple isolation levels including `READ COMMITTED`, `REPEATABLE READ`, and `SERIALIZABLE`. Readers do not block writers, and the HTTP SQL path includes a simulated connection pool built with `Arc<Mutex<_>>` and `Condvar`.
+
+### SQL layer
+
+The SQL stack includes a handwritten lexer, parser, AST, and executor. Supported functionality includes `CREATE TABLE`, `INSERT`, `SELECT`, `UPDATE`, `DELETE`, `ALTER TABLE`, `DROP TABLE`, `CREATE INDEX`, `DROP INDEX`, `EXPLAIN`, `VACUUM`, temporary tables, views, materialized views, prepared statements, triggers, stored procedures, cursors, UDFs, JSON functions, recursive CTEs, partitioning, constraints, and subqueries.
+
+### Query processing
+
+FerrisDB supports filters, projections, `INNER JOIN`, `LEFT JOIN`, `GROUP BY`, aggregates (`COUNT`, `SUM`, `MIN`, `MAX`), `ORDER BY`, `LIMIT`, `DISTINCT`, `HAVING`, `BETWEEN`, `LIKE`, `IS NULL`, `IN (subquery)`, and equality-driven index scans. It also includes a small cost-based optimizer, LRU plan cache, and `EXPLAIN` output for plan inspection.
+
+### Interfaces and tooling
+
+The project exposes an interactive REPL with KV and SQL modes, a multi-threaded TCP server, an HTTP admin API, benchmark examples, a SQL demo script, and FerrisDB Studio-oriented HTTP endpoints. Configuration is loaded from `ferrisdb.toml`, and the project includes extensive integration, stress, failure-injection, and property-based tests.
 
 ## Quick Start
 
-Run the interactive REPL:
+### Run the REPL
 
 ```bash
 cargo run
 ```
 
-Run the TCP server:
-
-```bash
-cargo run -- --server
-```
-
-Run the test suite:
-
-```bash
-cargo test
-```
-
-Run the benchmark example:
-
-```bash
-cargo run --release --example bench
-```
-
-## REPL Examples
-
-### KV Mode
-
-```text
-ferrisdb> set user:1 Alice
-OK
-ferrisdb> get user:1
-Alice
-ferrisdb> list
-user:1 -> Alice
-(1 entries)
-```
-
-### SQL Mode
+Example session:
 
 ```text
 ferrisdb> sql
@@ -137,130 +95,140 @@ ferrisdb> CREATE TABLE users (id INT, name TEXT, active BOOL);
 Table 'users' created
 ferrisdb> INSERT INTO users VALUES (1, 'Alice', true), (2, 'Bob', false);
 Inserted 2 row(s)
-ferrisdb> SELECT * FROM users;
+ferrisdb> SELECT * FROM users ORDER BY id ASC;
 id | name  | active
 ---+-------+-------
 1  | Alice | true
 2  | Bob   | false
-(2 rows)
 ```
 
-## Benchmark Results
+### Run the TCP server
 
-Representative benchmark results from the current implementation:
+```bash
+cargo run -- --server
+```
 
-### KV
+### Run the HTTP admin API
 
-- Sequential write: 2,100 ops/sec
-- Random read: 312 ops/sec
-- Mixed workload: 419 ops/sec
-- Scan: 63 ops/sec
-- Restart recovery: 11 ops/sec
-- Compaction: 5.87 ops/sec
+```bash
+cargo run -- --http-port 8080
+curl http://127.0.0.1:8080/health
+curl http://127.0.0.1:8080/stats
+curl -X POST http://127.0.0.1:8080/compact
+```
 
-### SQL
+### FerrisDB Studio
 
-- INSERT: 188 ops/sec
-- SELECT *: 52 ops/sec
-- SELECT WHERE: 46 ops/sec
-- UPDATE: 39 ops/sec
-- DELETE: 38 ops/sec
+Add a screenshot or product UI image here when you have one:
 
-## Technical Highlights
+```text
+[ Studio screenshot placeholder ]
+```
 
-### LSM-Tree Storage
+## SQL Feature Matrix
 
-FerrisDB uses an LSM-style write path: updates land in a MemTable first and are later flushed into sorted SSTables on disk. This makes writes simple and fast while keeping the on-disk layout compact and sequential.
+| Feature | Example | Status |
+| --- | --- | --- |
+| Create / insert / select | `CREATE TABLE users (...); INSERT INTO users VALUES (...); SELECT * FROM users;` | Implemented |
+| Update / delete | `UPDATE users SET name = 'Bob' WHERE id = 1;` | Implemented |
+| Filtering | `SELECT * FROM users WHERE age >= 18;` | Implemented |
+| Ordering / limit | `SELECT * FROM users ORDER BY age DESC LIMIT 5;` | Implemented |
+| Aggregates | `SELECT COUNT(*), SUM(salary) FROM employees;` | Implemented |
+| Group by / having | `SELECT dept, COUNT(*) FROM employees GROUP BY dept HAVING COUNT(*) > 1;` | Implemented |
+| Inner join | `SELECT * FROM t1 INNER JOIN t2 ON t1.id = t2.user_id;` | Implemented |
+| Left join | `SELECT * FROM users LEFT JOIN teams ON ...;` | Implemented |
+| Subquery | `SELECT * FROM users WHERE id IN (SELECT user_id FROM orders);` | Implemented |
+| Recursive CTE | `WITH RECURSIVE seq AS (...) SELECT * FROM seq;` | Implemented |
+| Explain | `EXPLAIN SELECT * FROM users WHERE id = 1;` | Implemented |
+| Vacuum | `VACUUM;` / `VACUUM users;` | Implemented |
+| Secondary index | `CREATE INDEX ON users(email);` | Implemented |
+| Temporary tables | `CREATE TEMPORARY TABLE temp_ids (...);` | Implemented |
+| Views / materialized views | `CREATE VIEW active_users AS ...;` | Implemented |
+| JSON functions | `SELECT JSON_EXTRACT(profile, '$.city') FROM users;` | Implemented |
+| Procedures / triggers / cursors | `CREATE PROCEDURE ...`, `CREATE TRIGGER ...`, `DECLARE CURSOR ...` | Implemented |
+| Constraints | `UNIQUE`, `CHECK`, `FOREIGN KEY` | Implemented |
+| Partitioning | `PARTITION BY RANGE (...)` | Implemented |
 
-### WAL + Recovery
+## Storage Engine
 
-Every write can be appended to a Write-Ahead Log before it reaches the MemTable. FerrisDB now supports three WAL modes: `wal` (default batched durability), `sync` (fsync every write), and `wal_disabled` (fastest but crash-unsafe). The WAL format includes CRC32 checksums so corruption can be detected instead of silently accepted.
+FerrisDB writes first to a MemTable and a WAL, then flushes sorted data into SSTables on disk. Reads check the MemTable first, then consult SSTables from newest to oldest, using Bloom filters and indexes to avoid unnecessary work. Compaction merges SSTables, drops obsolete versions and tombstones, and keeps read amplification under control.
 
-### MVCC and Isolation Levels
+On restart, the engine uses WAL replay, MANIFEST records, and SSTable metadata to rebuild state safely. MVCC is layered on top by storing versioned keys with timestamps so multiple readers and writers can coexist without coarse-grained locking.
 
-The MVCC layer assigns timestamps to versions and supports `READ COMMITTED`, `REPEATABLE READ`, and `SERIALIZABLE`. Readers do not block writers, and `REPEATABLE READ` / `SERIALIZABLE` transactions see a stable snapshot while `READ COMMITTED` refreshes visibility per statement.
+## Testing
 
-### SSTables + Bloom Filters
+FerrisDB currently includes **240 automated tests across 46 test files**.
 
-SSTables are immutable sorted files with an in-memory index and Bloom filter. The Bloom filter makes negative lookups much cheaper by avoiding unnecessary disk reads for tables that definitely do not contain the key.
+Run everything with:
 
-### MANIFEST Metadata
+```bash
+cargo test
+```
 
-Instead of reconstructing state purely by scanning the data directory, FerrisDB records SSTable metadata in a MANIFEST log. This makes restarts more reliable and is a stepping stone toward more realistic storage-engine metadata management.
+The suite includes unit tests, integration tests, HTTP/TCP end-to-end tests, failure-injection scenarios, randomized stress tests, and property-based tests powered by `proptest`.
 
-### Maintenance Operations
+Property-based testing currently covers:
 
-FerrisDB now includes a SQL-level `VACUUM` command that can trigger storage cleanup and remove stale secondary-index metadata left behind by deletes and updates. This keeps the demo engine more realistic by exposing a maintenance workflow similar to what production databases provide.
+- KV invariants such as put/get round-trips and operation sequences against a reference map model.
+- SQL invariants such as insert/count consistency and insert/delete behavior against a reference model.
+- Reproducible randomized inputs to catch edge cases that are easy to miss in example-driven tests.
 
-### Connection Pooling
+## Configuration
 
-The HTTP SQL path uses a small connection-pool simulation built with `Arc<Mutex<_>>` and `Condvar`. That keeps concurrent SQL requests bounded, makes queueing behavior explicit, and gives the project a clean place to demonstrate server-side coordination primitives in Rust.
+FerrisDB loads configuration from `ferrisdb.toml` when present. Example:
 
-### Failure Injection
-
-The project includes failure-injection tests for truncated WALs, corrupted SSTables, damaged MANIFEST files, interrupted compaction, and randomized stress/reopen sequences. This is especially valuable for database code, where correctness under failure matters more than happy-path functionality.
+```toml
+data_dir = "./ferrisdb-data"
+memtable_size_threshold = 4096
+compaction_threshold = 4
+server_host = "127.0.0.1"
+server_port = 6379
+max_connections = 4
+wal_mode = "wal"
+```
 
 ## Project Structure
 
 ```text
 src/
-  bench.rs              # Shared benchmark helpers
-  config.rs             # TOML-based configuration loading and CLI overrides
-  error.rs              # Shared error type
-  main.rs               # Startup entry point for REPL / server
+  bench.rs                 Shared benchmark helpers and reporting
+  config.rs                TOML configuration loading and CLI overrides
+  error.rs                 Shared error type used across the project
+  lib.rs                   Library module exports
+  main.rs                  Entry point for REPL, TCP server, and HTTP API
   cli/
-    repl.rs             # Interactive REPL for KV and SQL
+    repl.rs                Interactive KV/SQL shell
   server/
-    tcp.rs              # Multi-threaded TCP server
+    tcp.rs                 Line-based TCP server
+    http.rs                HTTP admin and SQL API built on std::net
+    connection_pool.rs     Connection pool simulation for HTTP SQL sessions
   sql/
-    ast.rs              # SQL AST definitions
-    lexer.rs            # SQL tokenizer
-    parser.rs           # SQL parser
-    catalog.rs          # Table schema metadata
-    index.rs            # Secondary index metadata and lookup
-    row.rs              # Row encoding and storage mapping
-    executor.rs         # SQL execution engine
+    ast.rs                 SQL AST definitions
+    lexer.rs               Handwritten SQL tokenizer
+    parser.rs              Recursive-descent SQL parser
+    executor.rs            SQL execution engine and result formatting
+    catalog.rs             Table schema metadata and catalog operations
+    row.rs                 Row encoding and JSON serialization helpers
+    index.rs               Secondary index storage and lookup logic
   transaction/
-    keyutil.rs          # MVCC key encoding helpers
-    mvcc.rs             # MVCC engine and transactions
+    mvcc.rs                MVCC engine, transactions, and isolation logic
+    keyutil.rs             Versioned key encoding helpers
   storage/
-    memory.rs           # MemTable
-    wal.rs              # Write-Ahead Log
-    manifest.rs         # MANIFEST metadata log
-    bloom.rs            # Bloom filter implementation
-    compaction.rs       # SSTable compaction
-    lsm.rs              # LSM engine orchestration
+    memory.rs              In-memory MemTable implementation
+    wal.rs                 Write-Ahead Log with recovery
+    manifest.rs            MANIFEST metadata log and replay
+    bloom.rs               Bloom filter implementation
+    compaction.rs          SSTable merge/compaction logic
+    lsm.rs                 LSM engine orchestration and persistence flow
     sstable/
-      format.rs         # SSTable file format
-      writer.rs         # SSTable writer
-      reader.rs         # SSTable reader
+      format.rs            SSTable binary format definitions
+      writer.rs            SSTable writer
+      reader.rs            SSTable reader and index lookup
 tests/
-  *_test.rs             # Unit, integration, recovery, and stress tests
+  *_test.rs                Unit, integration, stress, recovery, and property tests
 examples/
-  client.rs             # TCP client example
-  bench.rs              # KV benchmark
-  bench_sql.rs          # SQL benchmark
-  sql_demo.rs           # End-to-end SQL feature demo
+  client.rs                TCP client example
+  bench.rs                 KV benchmark runner
+  bench_sql.rs             SQL benchmark runner
+  sql_demo.rs              End-to-end SQL feature demonstration
 ```
-
-## What I Learned
-
-- How LSM-Tree storage engines combine MemTables, SSTables, compaction, and metadata tracking.
-- Why WAL durability and recovery logic are central to correctness, not just performance.
-- How MVCC and snapshot isolation can be built with versioned keys and timestamp ordering.
-- How a small SQL layer maps onto a lower-level KV engine.
-- Why failure handling, corruption detection, and restart behavior are essential parts of database design.
-- How to structure a non-trivial Rust codebase with layered modules, tests, and recoverability concerns.
-
-## Roadmap
-
-- More advanced SQL planning and cost-based optimization
-- Multi-column and range indexes
-- JOIN algorithm improvements (hash join / merge join)
-- Query optimizer basics
-- Richer HTTP / admin APIs
-- Replication and distributed coordination experiments
-- Background compaction scheduling
-- More robust on-disk checksums and validation
-- Range tombstones and better delete handling
-- Better benchmark dashboards and profiling
