@@ -197,6 +197,20 @@ fn test_parse_analyze_table() {
 }
 
 #[test]
+fn test_parse_vacuum() {
+    assert_eq!(
+        parse_sql("VACUUM;"),
+        Statement::Vacuum { table_name: None }
+    );
+    assert_eq!(
+        parse_sql("VACUUM users;"),
+        Statement::Vacuum {
+            table_name: Some("users".to_string())
+        }
+    );
+}
+
+#[test]
 fn test_parse_insert_single_and_multi_rows() {
     let stmt = parse_sql("INSERT INTO users VALUES (1, 'Alice', true), (2, 'Bob', false);");
     assert_eq!(

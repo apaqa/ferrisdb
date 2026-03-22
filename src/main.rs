@@ -121,7 +121,12 @@ fn run_server_mode(config: &FerrisDbConfig) {
 fn run_http_mode(config: &FerrisDbConfig, port: u16) {
     let engine = build_engine(config);
     println!("FerrisDB Studio available at http://127.0.0.1:{}/", port);
-    if let Err(err) = http::run_http_at(&config.server_host, port, engine) {
+    if let Err(err) = http::run_http_at_with_pool(
+        &config.server_host,
+        port,
+        engine,
+        config.max_connections,
+    ) {
         eprintln!("Fatal HTTP server error: {}", err);
         std::process::exit(1);
     }

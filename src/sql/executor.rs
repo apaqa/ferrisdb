@@ -29,6 +29,8 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use crate::error::Result;
+use crate::storage::lsm::TOMBSTONE;
+use crate::transaction::keyutil::decode_key;
 use crate::transaction::mvcc::{MvccEngine, PreparedStatement, Transaction};
 
 use super::ast::{
@@ -38,7 +40,9 @@ use super::ast::{
     Statement, TriggerEvent, TriggerTiming, Value, WhereExpr, WindowFunc,
 };
 use super::catalog::{Catalog, MaterializedViewDefinition, TableSchema, ViewDefinition};
-use super::index::IndexManager;
+use super::index::{
+    decode_index_pk, encode_index_entry_key, encode_index_entry_prefix, IndexManager,
+};
 use super::optimizer::{Optimizer, Plan, QueryPlanNode};
 use super::parser::Parser;
 use super::plan_cache::{PlanCache, PlanCacheStats};
@@ -66,6 +70,11 @@ pub enum ExecuteResult {
     },
     Analyzed {
         table_name: String,
+    },
+    Vacuumed {
+        table_name: Option<String>,
+        tombstones_removed: usize,
+        reclaimed_bytes: usize,
     },
     Created {
         table_name: String,
@@ -367,6 +376,7 @@ impl SqlExecutor {
             Statement::Deallocate { name } => self.execute_deallocate(name),
             Statement::SetIsolationLevel { level } => self.execute_set_isolation_level(level),
             Statement::AnalyzeTable { table_name } => self.execute_analyze_table(table_name),
+            Statement::Vacuum { table_name } => self.execute_vacuum(table_name),
             Statement::CreateProcedure { name, params, body } => {
                 self.execute_create_procedure(name, params, body)
             }
@@ -1798,6 +1808,31 @@ impl SqlExecutor {
         self.invalidate_plan_cache(&table_name);
         self.engine.invalidate_prepared_statement_plans();
         Ok(ExecuteResult::Analyzed { table_name })
+    }
+
+    // 中文註解：VACUUM 會整理底層資料檔並修掉 stale index metadata。
+    // 目前 table-specific VACUUM 只做該表 metadata cleanup；
+    // 全域 VACUUM 另外再觸發一次整體 LSM compaction。
+    fn execute_vacuum(&self, table_name: Option<String>) -> Result<ExecuteResult> {
+        let before_disk = self.engine.inner.disk_usage_bytes().unwrap_or(0);
+        let tombstones_removed = self.count_row_tombstones(table_name.as_deref())?;
+
+        if table_name.is_none() {
+            self.engine.compact()?;
+        }
+
+        let mut txn = self.engine.begin_transaction();
+        let metadata_removed = self.cleanup_stale_index_metadata(&mut txn, table_name.as_deref())?;
+        txn.commit()?;
+
+        let after_disk = self.engine.inner.disk_usage_bytes().unwrap_or(before_disk);
+        Ok(ExecuteResult::Vacuumed {
+            table_name,
+            tombstones_removed,
+            reclaimed_bytes: before_disk
+                .saturating_sub(after_disk)
+                .saturating_add(metadata_removed as u64) as usize,
+        })
     }
 
     fn invalidate_plan_cache(&self, table_name: &str) {
@@ -3595,6 +3630,81 @@ impl SqlExecutor {
         Ok(None)
     }
 
+    fn count_row_tombstones(&self, table_name: Option<&str>) -> Result<usize> {
+        let mut total = 0usize;
+        for (key, value) in self.engine.inner.raw_list_all()? {
+            if value != TOMBSTONE {
+                continue;
+            }
+            let (user_key, _) = decode_key(&key);
+            let key_str = match std::str::from_utf8(user_key) {
+                Ok(key) => key,
+                Err(_) => continue,
+            };
+            if !key_str.starts_with("__row:") {
+                continue;
+            }
+            if let Some(table_name) = table_name {
+                let prefix = format!("__row:{}:", table_name);
+                if !key_str.starts_with(&prefix) {
+                    continue;
+                }
+            }
+            total += 1;
+        }
+        Ok(total)
+    }
+
+    fn cleanup_stale_index_metadata(
+        &self,
+        txn: &mut Transaction,
+        table_name: Option<&str>,
+    ) -> Result<usize> {
+        let target_tables = if let Some(table_name) = table_name {
+            let Some(schema) = self.catalog.get_table(txn, table_name)? else {
+                return Ok(0);
+            };
+            vec![schema]
+        } else {
+            self.catalog.list_tables(txn)?
+        };
+
+        let mut reclaimed_bytes = 0usize;
+        for schema in target_tables {
+            for index_columns in self.index_manager.list_indexes(txn, &schema.table_name)? {
+                let start = encode_index_entry_prefix(&schema.table_name, &index_columns);
+                let mut end = start.clone();
+                end.push(0xFF);
+                for (key, _) in txn.scan(&start, &end)? {
+                    let Some(pk) = decode_index_pk(&key) else {
+                        txn.delete(&key)?;
+                        reclaimed_bytes += key.len();
+                        continue;
+                    };
+                    let Some((_row_key, row)) = self.load_row_by_pk(txn, &schema, &pk)? else {
+                        txn.delete(&key)?;
+                        reclaimed_bytes += key.len();
+                        continue;
+                    };
+                    let expected = encode_index_entry_key(
+                        &schema.table_name,
+                        &index_columns,
+                        &index_columns
+                            .iter()
+                            .map(|column| row.get(column).cloned().unwrap_or(Value::Null))
+                            .collect::<Vec<_>>(),
+                        &pk,
+                    );
+                    if expected != key {
+                        txn.delete(&key)?;
+                        reclaimed_bytes += key.len();
+                    }
+                }
+            }
+        }
+        Ok(reclaimed_bytes)
+    }
+
     fn validate_json_columns(&self, schema: &TableSchema, row: &Row) -> Option<String> {
         for column in &schema.columns {
             if !matches!(column.data_type, DataType::Json) {
@@ -4283,6 +4393,20 @@ pub fn format_execute_result(result: &ExecuteResult) -> String {
             format!("Transaction isolation level set to {}", isolation_level_name(level))
         }
         ExecuteResult::Analyzed { table_name } => format!("Table '{}' analyzed", table_name),
+        ExecuteResult::Vacuumed {
+            table_name,
+            tombstones_removed,
+            reclaimed_bytes,
+        } => match table_name {
+            Some(table_name) => format!(
+                "Vacuumed table '{}' (removed {} tombstone(s), reclaimed {} bytes)",
+                table_name, tombstones_removed, reclaimed_bytes
+            ),
+            None => format!(
+                "Vacuumed database (removed {} tombstone(s), reclaimed {} bytes)",
+                tombstones_removed, reclaimed_bytes
+            ),
+        },
         ExecuteResult::Created { table_name } => format!("Table '{}' created", table_name),
         ExecuteResult::Altered { table_name } => format!("Table '{}' altered", table_name),
         ExecuteResult::Dropped { table_name } => format!("Table '{}' dropped", table_name),

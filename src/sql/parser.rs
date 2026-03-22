@@ -57,6 +57,7 @@ impl Parser {
         let stmt = match self.peek() {
             Some(Token::Keyword(Keyword::Explain)) => self.parse_explain()?,
             Some(Token::Keyword(Keyword::Analyze)) => self.parse_analyze()?,
+            Some(Token::Keyword(Keyword::Vacuum)) => self.parse_vacuum()?,
             Some(Token::Keyword(Keyword::Prepare)) => self.parse_prepare()?,
             Some(Token::Keyword(Keyword::Execute)) => self.parse_execute()?,
             Some(Token::Keyword(Keyword::Deallocate)) => self.parse_deallocate()?,
@@ -116,6 +117,16 @@ impl Parser {
                 other
             ))),
         }
+    }
+
+    fn parse_vacuum(&mut self) -> Result<Statement> {
+        self.expect_keyword(Keyword::Vacuum)?;
+        let table_name = if matches!(self.peek(), Some(Token::Ident(_)) | Some(Token::Keyword(_))) {
+            Some(self.expect_ident()?)
+        } else {
+            None
+        };
+        Ok(Statement::Vacuum { table_name })
     }
 
     fn parse_create_materialized_view_after_create(&mut self) -> Result<Statement> {
@@ -2016,6 +2027,7 @@ fn keyword_to_sql(keyword: &Keyword) -> &'static str {
     match keyword {
         Keyword::Explain => "EXPLAIN",
         Keyword::Analyze => "ANALYZE",
+        Keyword::Vacuum => "VACUUM",
         Keyword::Prepare => "PREPARE",
         Keyword::Execute => "EXECUTE",
         Keyword::Deallocate => "DEALLOCATE",
@@ -2138,6 +2150,7 @@ fn max_placeholder_in_statement(statement: &Statement) -> usize {
     match statement {
         Statement::Explain { statement } => max_placeholder_in_statement(statement),
         Statement::AnalyzeTable { .. }
+        | Statement::Vacuum { .. }
         | Statement::CreateProcedure { .. }
         | Statement::CreateFunction { .. }
         | Statement::CreateTable { .. }

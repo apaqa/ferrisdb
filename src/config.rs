@@ -38,6 +38,10 @@ fn default_server_port() -> u16 {
     6379
 }
 
+fn default_max_connections() -> usize {
+    4
+}
+
 fn default_wal_mode() -> WalMode {
     WalMode::Wal
 }
@@ -58,6 +62,7 @@ pub struct FerrisDbConfig {
     pub compaction_threshold: usize,
     pub server_host: String,
     pub server_port: u16,
+    pub max_connections: usize,
     pub wal_mode: WalMode,
 }
 
@@ -69,6 +74,7 @@ impl Default for FerrisDbConfig {
             compaction_threshold: default_compaction_threshold(),
             server_host: default_server_host(),
             server_port: default_server_port(),
+            max_connections: default_max_connections(),
             wal_mode: default_wal_mode(),
         }
     }

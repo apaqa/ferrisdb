@@ -304,7 +304,7 @@ pub fn encode_value_component(value: &Value) -> String {
     hex_encode(&raw)
 }
 
-fn decode_index_pk(key: &[u8]) -> Option<Value> {
+pub fn decode_index_pk(key: &[u8]) -> Option<Value> {
     let key = std::str::from_utf8(key).ok()?;
     let (_, pk_hex) = key.rsplit_once(':')?;
     let bytes = hex_decode(pk_hex)?;

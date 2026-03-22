@@ -16,6 +16,9 @@ pub enum Statement {
     AnalyzeTable {
         table_name: String,
     },
+    Vacuum {
+        table_name: Option<String>,
+    },
     Prepare {
         name: String,
         params: Vec<String>,

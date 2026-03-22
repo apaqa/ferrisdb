@@ -26,31 +26,60 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 
 use crate::error::{FerrisDbError, Result};
+use crate::server::connection_pool::ConnectionPool;
 use crate::server::static_assets;
 use crate::sql::ast::{DataType, Value as SqlValue};
 use crate::sql::catalog::Catalog;
-use crate::sql::executor::{ExecuteResult, SqlExecutor};
+use crate::sql::executor::ExecuteResult;
 use crate::sql::index::IndexManager;
 use crate::sql::parser::Parser;
 use crate::sql::row::{encode_row_prefix_end, encode_row_prefix_start, Row};
 use crate::transaction::mvcc::MvccEngine;
 
 pub const DEFAULT_HTTP_PORT: u16 = 8080;
+const DEFAULT_HTTP_MAX_CONNECTIONS: usize = 4;
+
+#[derive(Clone)]
+struct HttpServerState {
+    engine: Arc<MvccEngine>,
+    pool: ConnectionPool,
+}
 
 pub fn run_http_at(host: &str, port: u16, engine: Arc<MvccEngine>) -> Result<()> {
+    run_http_at_with_pool(host, port, engine, DEFAULT_HTTP_MAX_CONNECTIONS)
+}
+
+pub fn run_http_at_with_pool(
+    host: &str,
+    port: u16,
+    engine: Arc<MvccEngine>,
+    max_connections: usize,
+) -> Result<()> {
     let addr = format!("{}:{}", host, port);
     let listener = TcpListener::bind(&addr)?;
-    run_on_listener(listener, engine)
+    run_on_listener_with_pool(listener, engine, max_connections)
 }
 
 pub fn run_on_listener(listener: TcpListener, engine: Arc<MvccEngine>) -> Result<()> {
+    run_on_listener_with_pool(listener, engine, DEFAULT_HTTP_MAX_CONNECTIONS)
+}
+
+pub fn run_on_listener_with_pool(
+    listener: TcpListener,
+    engine: Arc<MvccEngine>,
+    max_connections: usize,
+) -> Result<()> {
     let local_addr = listener.local_addr()?;
     println!("FerrisDB HTTP API listening on {}", local_addr);
+    let state = Arc::new(HttpServerState {
+        pool: ConnectionPool::new(Arc::clone(&engine), max_connections),
+        engine,
+    });
 
     for incoming in listener.incoming() {
         match incoming {
             Ok(stream) => {
-                let shared = Arc::clone(&engine);
+                let shared = Arc::clone(&state);
                 thread::spawn(move || {
                     if let Err(err) = handle_client(stream, shared) {
                         eprintln!("HTTP client error: {}", err);
@@ -64,7 +93,7 @@ pub fn run_on_listener(listener: TcpListener, engine: Arc<MvccEngine>) -> Result
     Ok(())
 }
 
-fn handle_client(stream: TcpStream, engine: Arc<MvccEngine>) -> Result<()> {
+fn handle_client(stream: TcpStream, state: Arc<HttpServerState>) -> Result<()> {
     let reader_stream = stream.try_clone()?;
     let mut reader = BufReader::new(reader_stream);
     let mut writer = BufWriter::new(stream);
@@ -80,13 +109,13 @@ fn handle_client(stream: TcpStream, engine: Arc<MvccEngine>) -> Result<()> {
         }
     };
 
-    let response = route_request(&request, &engine);
+    let response = route_request(&request, &state);
     write_http_response(&mut writer, response)?;
     writer.flush()?;
     Ok(())
 }
 
-fn route_request(request: &HttpRequest, engine: &Arc<MvccEngine>) -> HttpResponse {
+fn route_request(request: &HttpRequest, state: &Arc<HttpServerState>) -> HttpResponse {
     if request.method == "OPTIONS" {
         return cors_preflight_response();
     }
@@ -114,63 +143,63 @@ fn route_request(request: &HttpRequest, engine: &Arc<MvccEngine>) -> HttpRespons
         }
         "/stats" => {
             if request.method == "GET" {
-                handle_stats(engine)
+                handle_stats(&state.engine)
             } else {
                 method_not_allowed(&request.method, &request.path)
             }
         }
         "/sstables" => {
             if request.method == "GET" {
-                handle_sstables(engine)
+                handle_sstables(&state.engine)
             } else {
                 method_not_allowed(&request.method, &request.path)
             }
         }
         "/compact" | "/api/admin/compact" => {
             if request.method == "POST" {
-                handle_compact(engine)
+                handle_compact(&state.engine)
             } else {
                 method_not_allowed(&request.method, &request.path)
             }
         }
         "/flush" | "/api/admin/flush" => {
             if request.method == "POST" {
-                handle_flush(engine)
+                handle_flush(&state.engine)
             } else {
                 method_not_allowed(&request.method, &request.path)
             }
         }
         "/api/sql" => {
             if request.method == "POST" {
-                handle_sql_api(request, engine)
+                handle_sql_api(request, &state.pool)
             } else {
                 method_not_allowed(&request.method, &request.path)
             }
         }
         "/api/sql/prepare" => {
             if request.method == "POST" {
-                handle_sql_prepare_api(request, engine)
+                handle_sql_prepare_api(request, &state.pool)
             } else {
                 method_not_allowed(&request.method, &request.path)
             }
         }
         "/api/sql/execute" => {
             if request.method == "POST" {
-                handle_sql_execute_api(request, engine)
+                handle_sql_execute_api(request, &state.pool)
             } else {
                 method_not_allowed(&request.method, &request.path)
             }
         }
         "/api/sql/deallocate" => {
             if request.method == "POST" {
-                handle_sql_deallocate_api(request, engine)
+                handle_sql_deallocate_api(request, &state.pool)
             } else {
                 method_not_allowed(&request.method, &request.path)
             }
         }
         "/api/tables" => {
             if request.method == "GET" {
-                handle_tables_api(engine)
+                handle_tables_api(&state.engine)
             } else {
                 method_not_allowed(&request.method, &request.path)
             }
@@ -178,7 +207,7 @@ fn route_request(request: &HttpRequest, engine: &Arc<MvccEngine>) -> HttpRespons
         _ => {
             if let Some(table_name) = extract_table_name(&request.path, "/schema") {
                 return if request.method == "GET" {
-                    handle_table_schema_api(engine, &table_name)
+                    handle_table_schema_api(&state.engine, &table_name)
                 } else {
                     method_not_allowed(&request.method, &request.path)
                 };
@@ -186,7 +215,7 @@ fn route_request(request: &HttpRequest, engine: &Arc<MvccEngine>) -> HttpRespons
 
             if let Some(table_name) = extract_table_name(&request.path, "/rows") {
                 return if request.method == "GET" {
-                    handle_table_rows_api(request, engine, &table_name)
+                    handle_table_rows_api(request, &state.engine, &table_name)
                 } else {
                     method_not_allowed(&request.method, &request.path)
                 };
@@ -323,7 +352,7 @@ fn handle_homepage(path: &str) -> HttpResponse {
 }
 
 // 中文註解：SQL API 直接接收純文字 SQL，並回傳統一格式的 JSON。
-fn handle_sql_api(request: &HttpRequest, engine: &Arc<MvccEngine>) -> HttpResponse {
+fn handle_sql_api(request: &HttpRequest, pool: &ConnectionPool) -> HttpResponse {
     if let Some(content_type) = request.headers.get("content-type") {
         if !content_type.starts_with("text/plain") {
             let response = SqlApiResponse::error(
@@ -349,25 +378,26 @@ fn handle_sql_api(request: &HttpRequest, engine: &Arc<MvccEngine>) -> HttpRespon
         }
     };
 
-    let response = execute_sql_text(engine, &sql);
+    let response = execute_sql_text(pool, &sql);
     json_response(200, &response)
 }
 
-fn handle_sql_prepare_api(request: &HttpRequest, engine: &Arc<MvccEngine>) -> HttpResponse {
+fn handle_sql_prepare_api(request: &HttpRequest, pool: &ConnectionPool) -> HttpResponse {
     let payload: PrepareApiRequest = match parse_json_request(request) {
         Ok(payload) => payload,
         Err(response) => return response,
     };
     let sql = format!("PREPARE {} AS {}", payload.name, payload.sql.trim());
-    json_response(200, &execute_sql_text(engine, &sql))
+    json_response(200, &execute_sql_text(pool, &sql))
 }
 
-fn handle_sql_execute_api(request: &HttpRequest, engine: &Arc<MvccEngine>) -> HttpResponse {
+fn handle_sql_execute_api(request: &HttpRequest, pool: &ConnectionPool) -> HttpResponse {
     let payload: ExecutePreparedApiRequest = match parse_json_request(request) {
         Ok(payload) => payload,
         Err(response) => return response,
     };
-    let executor = SqlExecutor::new(Arc::clone(engine));
+    let connection = pool.acquire();
+    let executor = connection.executor();
     let args = match payload
         .params
         .into_iter()
@@ -397,12 +427,13 @@ fn handle_sql_execute_api(request: &HttpRequest, engine: &Arc<MvccEngine>) -> Ht
     }
 }
 
-fn handle_sql_deallocate_api(request: &HttpRequest, engine: &Arc<MvccEngine>) -> HttpResponse {
+fn handle_sql_deallocate_api(request: &HttpRequest, pool: &ConnectionPool) -> HttpResponse {
     let payload: DeallocateApiRequest = match parse_json_request(request) {
         Ok(payload) => payload,
         Err(response) => return response,
     };
-    let executor = SqlExecutor::new(Arc::clone(engine));
+    let connection = pool.acquire();
+    let executor = connection.executor();
     match executor.execute(crate::sql::ast::Statement::Deallocate { name: payload.name }) {
         Ok(result) => json_response(
             200,
@@ -627,9 +658,10 @@ fn write_http_response(writer: &mut BufWriter<TcpStream>, response: HttpResponse
 }
 
 // 中文註解：重用 parser 與 executor，把 SQL 純文字轉成 API 回應格式。
-fn execute_sql_text(engine: &Arc<MvccEngine>, sql: &str) -> SqlApiResponse {
+fn execute_sql_text(pool: &ConnectionPool, sql: &str) -> SqlApiResponse {
     let start = Instant::now();
-    let executor = SqlExecutor::new(Arc::clone(engine));
+    let connection = pool.acquire();
+    let executor = connection.executor();
     let statements = match Parser::parse_multiple(sql) {
         Ok(statements) if !statements.is_empty() => statements,
         Ok(_) => {
@@ -1102,6 +1134,31 @@ impl SqlApiResponse {
                 statement_results,
                 plan_tree: None,
             },
+            ExecuteResult::Vacuumed {
+                table_name,
+                tombstones_removed,
+                reclaimed_bytes,
+            } => Self {
+                success: true,
+                kind: "vacuumed".to_string(),
+                columns: Vec::new(),
+                rows: Vec::new(),
+                row_count: tombstones_removed,
+                elapsed_ms,
+                executed_count,
+                message: match table_name {
+                    Some(table_name) => format!(
+                        "Vacuumed table '{}' (removed {} tombstone(s), reclaimed {} bytes)",
+                        table_name, tombstones_removed, reclaimed_bytes
+                    ),
+                    None => format!(
+                        "Vacuumed database (removed {} tombstone(s), reclaimed {} bytes)",
+                        tombstones_removed, reclaimed_bytes
+                    ),
+                },
+                statement_results,
+                plan_tree: None,
+            },
             ExecuteResult::Altered { table_name } => Self {
                 success: true,
                 kind: "updated".to_string(),
@@ -1371,6 +1428,30 @@ impl SqlStatementResult {
                 row_count: 0,
                 elapsed_ms,
                 message: format!("Table '{}' analyzed", table_name),
+                plan_tree: None,
+            },
+            ExecuteResult::Vacuumed {
+                table_name,
+                tombstones_removed,
+                reclaimed_bytes,
+            } => Self {
+                sql,
+                success: true,
+                kind: "vacuumed".to_string(),
+                columns: Vec::new(),
+                rows: Vec::new(),
+                row_count: tombstones_removed,
+                elapsed_ms,
+                message: match table_name {
+                    Some(table_name) => format!(
+                        "Vacuumed table '{}' (removed {} tombstone(s), reclaimed {} bytes)",
+                        table_name, tombstones_removed, reclaimed_bytes
+                    ),
+                    None => format!(
+                        "Vacuumed database (removed {} tombstone(s), reclaimed {} bytes)",
+                        tombstones_removed, reclaimed_bytes
+                    ),
+                },
                 plan_tree: None,
             },
             ExecuteResult::Altered { table_name } => Self {

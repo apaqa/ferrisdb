@@ -39,6 +39,7 @@ pub enum Token {
 pub enum Keyword {
     Explain,
     Analyze,
+    Vacuum,
     Prepare,
     Execute,
     Deallocate,
@@ -390,6 +391,7 @@ fn keyword_from_ident(ident: &str) -> Option<Keyword> {
         "SELECT" => Some(Keyword::Select),
         "EXPLAIN" => Some(Keyword::Explain),
         "ANALYZE" => Some(Keyword::Analyze),
+        "VACUUM" => Some(Keyword::Vacuum),
         "PREPARE" => Some(Keyword::Prepare),
         "EXECUTE" => Some(Keyword::Execute),
         "DEALLOCATE" => Some(Keyword::Deallocate),

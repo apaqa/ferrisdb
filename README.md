@@ -26,6 +26,7 @@ FerrisDB is a database engine implemented from scratch in Rust, featuring LSM-Tr
 - SQL ORDER BY ASC/DESC
 - SQL LIMIT
 - SQL EXPLAIN with query plan and visual tree diagram in FerrisDB Studio
+- SQL `VACUUM` for global or table-scoped cleanup
 - Cost-Based Query Optimizer with scan / join strategy selection
 - Query Plan Cache (LRU)
 - SQL `WHERE` with comparison operators (`=`, `!=`, `<`, `>`, `<=`, `>=`)
@@ -51,6 +52,7 @@ FerrisDB is a database engine implemented from scratch in Rust, featuring LSM-Tr
 - Per-session user context with privilege enforcement for SELECT/INSERT/UPDATE/DELETE
 - TCP server with multi-threaded connections
 - HTTP Admin API (`/health`, `/stats`, `/sstables`, `/compact`, `/flush`, `/api/sql/prepare`, `/api/sql/execute`, `/api/sql/deallocate`) with `plan_tree` JSON for EXPLAIN
+- HTTP SQL connection pooling with configurable `max_connections`
 - Interactive REPL with KV and SQL modes
 - MANIFEST metadata management
 - Configurable via `ferrisdb.toml`
@@ -58,7 +60,7 @@ FerrisDB is a database engine implemented from scratch in Rust, featuring LSM-Tr
 - Property-based testing for KV / SQL invariants
 - Background compaction worker
 - Failure injection and stress tests
-- 233 automated tests across 44 test files
+- 240 automated tests across 46 test files
 
 ## Architecture
 
@@ -185,6 +187,14 @@ SSTables are immutable sorted files with an in-memory index and Bloom filter. Th
 ### MANIFEST Metadata
 
 Instead of reconstructing state purely by scanning the data directory, FerrisDB records SSTable metadata in a MANIFEST log. This makes restarts more reliable and is a stepping stone toward more realistic storage-engine metadata management.
+
+### Maintenance Operations
+
+FerrisDB now includes a SQL-level `VACUUM` command that can trigger storage cleanup and remove stale secondary-index metadata left behind by deletes and updates. This keeps the demo engine more realistic by exposing a maintenance workflow similar to what production databases provide.
+
+### Connection Pooling
+
+The HTTP SQL path uses a small connection-pool simulation built with `Arc<Mutex<_>>` and `Condvar`. That keeps concurrent SQL requests bounded, makes queueing behavior explicit, and gives the project a clean place to demonstrate server-side coordination primitives in Rust.
 
 ### Failure Injection
 

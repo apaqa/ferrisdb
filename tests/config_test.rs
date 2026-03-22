@@ -28,6 +28,7 @@ fn test_default_values_are_correct() {
     assert_eq!(config.compaction_threshold, 4);
     assert_eq!(config.server_host, "127.0.0.1");
     assert_eq!(config.server_port, 6379);
+    assert_eq!(config.max_connections, 4);
     assert_eq!(config.wal_mode, WalMode::Wal);
 }
 
@@ -42,6 +43,7 @@ memtable_size_threshold = 8192
 compaction_threshold = 8
 server_host = "0.0.0.0"
 server_port = 7000
+max_connections = 12
 wal_mode = "wal_disabled"
 "#,
     )
@@ -53,6 +55,7 @@ wal_mode = "wal_disabled"
     assert_eq!(config.compaction_threshold, 8);
     assert_eq!(config.server_host, "0.0.0.0");
     assert_eq!(config.server_port, 7000);
+    assert_eq!(config.max_connections, 12);
     assert_eq!(config.wal_mode, WalMode::WalDisabled);
 
     let _ = fs::remove_file(path);
@@ -75,6 +78,7 @@ server_port = 7777
     assert_eq!(config.memtable_size_threshold, 4096);
     assert_eq!(config.compaction_threshold, 4);
     assert_eq!(config.server_host, "127.0.0.1");
+    assert_eq!(config.max_connections, 4);
     assert_eq!(config.wal_mode, WalMode::Wal);
 
     let _ = fs::remove_file(path);
