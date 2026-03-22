@@ -216,6 +216,7 @@ pub enum Statement {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CTE {
     pub name: String,
+    pub recursive: bool,
     pub query: Box<Statement>,
 }
 

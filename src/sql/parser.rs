@@ -857,11 +857,12 @@ impl Parser {
         }
 
         self.expect_keyword(Keyword::With)?;
-        if matches!(self.peek(), Some(Token::Keyword(Keyword::Recursive))) {
-            return Err(FerrisDbError::InvalidCommand(
-                "WITH RECURSIVE is not supported yet".to_string(),
-            ));
-        }
+        let recursive = if matches!(self.peek(), Some(Token::Keyword(Keyword::Recursive))) {
+            self.bump();
+            true
+        } else {
+            false
+        };
 
         let mut ctes = Vec::new();
         loop {
@@ -873,6 +874,7 @@ impl Parser {
             let query = parser.parse_query_expression()?;
             ctes.push(CTE {
                 name,
+                recursive,
                 query: Box::new(query),
             });
 

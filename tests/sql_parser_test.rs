@@ -251,6 +251,7 @@ fn test_parse_select_with_ctes() {
             ctes: vec![
                 CTE {
                     name: "a".to_string(),
+                    recursive: false,
                     query: Box::new(Statement::Select {
                         ctes: vec![],
                         distinct: false,
@@ -267,6 +268,7 @@ fn test_parse_select_with_ctes() {
                 },
                 CTE {
                     name: "b".to_string(),
+                    recursive: false,
                     query: Box::new(Statement::Select {
                         ctes: vec![],
                         distinct: false,

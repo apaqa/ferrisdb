@@ -2408,14 +2408,19 @@ impl SqlExecutor {
         limit: Option<usize>,
         optimized_plan: Option<&QueryPlanNode>,
     ) -> Result<ExecuteResult> {
-        let Some(right_schema) = self.catalog.get_table(txn, &join.right_table)? else {
+        let Some((right_schema, right_rows)) = self.resolve_relation_rows(txn, &join.right_table)? else {
             return Ok(ExecuteResult::Error {
                 message: format!("table '{}' does not exist", join.right_table),
             });
         };
 
         let left_rows = self.scan_rows(txn, left_schema)?;
-        let right_rows = self.scan_rows(txn, &right_schema)?;
+        let right_rows_for_hash = right_rows
+            .iter()
+            .cloned()
+            .enumerate()
+            .map(|(idx, row)| (idx.to_string().into_bytes(), row))
+            .collect::<Vec<_>>();
         let resolved_where = self.resolve_where_expr(where_clause.as_ref())?;
         let projection = match self.resolve_join_projection(left_schema, &right_schema, &columns) {
             Ok(columns) => columns,
@@ -2429,7 +2434,7 @@ impl SqlExecutor {
                 left_schema,
                 &left_rows,
                 &right_schema,
-                &right_rows,
+                &right_rows_for_hash,
                 &join,
             ) {
                 Ok(rows) => rows,
@@ -2451,7 +2456,7 @@ impl SqlExecutor {
             };
 
             let mut found_match = false;
-            for (_, right_row) in &right_rows {
+            for right_row in &right_rows {
                 let Some(right_value) =
                     resolve_join_value(right_row, &right_schema.table_name, &join.right_column)
                 else {
@@ -2726,13 +2731,11 @@ impl SqlExecutor {
         order_by: Option<OrderByClause>,
         limit: Option<usize>,
     ) -> Result<ExecuteResult> {
-        let Some(right_schema) = self.catalog.get_table(txn, &join.right_table)? else {
+        let Some((right_schema, right_rows)) = self.resolve_relation_rows(txn, &join.right_table)? else {
             return Ok(ExecuteResult::Error {
                 message: format!("table '{}' does not exist", join.right_table),
             });
         };
-
-        let right_rows = self.scan_rows(txn, &right_schema)?;
         let resolved_where = self.resolve_where_expr(where_clause.as_ref())?;
         let projection = match self.resolve_join_projection(left_schema, &right_schema, &columns) {
             Ok(columns) => columns,
@@ -2750,7 +2753,7 @@ impl SqlExecutor {
             };
 
             let mut found_match = false;
-            for (_, right_row) in &right_rows {
+            for right_row in &right_rows {
                 let Some(right_value) =
                     resolve_join_value(right_row, &right_schema.table_name, &join.right_column)
                 else {
@@ -3075,19 +3078,124 @@ impl SqlExecutor {
     fn materialize_ctes(&self, ctes: &[CTE]) -> Result<BTreeMap<String, MaterializedRelation>> {
         let mut scope = BTreeMap::new();
         for cte in ctes {
-            let result = self.execute((*cte.query).clone())?;
-            let ExecuteResult::Selected { columns, rows } = result else {
-                continue;
-            };
-            scope.insert(
-                cte.name.clone(),
+            let relation = if cte.recursive {
+                self.materialize_recursive_cte(cte)?
+            } else {
+                let result = self.execute((*cte.query).clone())?;
+                let ExecuteResult::Selected { columns, rows } = result else {
+                    continue;
+                };
                 MaterializedRelation {
                     schema: materialized_schema(&cte.name, &columns, &rows),
                     rows: materialized_rows(&columns, rows),
-                },
-            );
+                }
+            };
+            scope.insert(cte.name.clone(), relation);
         }
         Ok(scope)
+    }
+
+    fn materialize_recursive_cte(&self, cte: &CTE) -> Result<MaterializedRelation> {
+        let Statement::Union { left, right, all } = &*cte.query else {
+            return Err(crate::error::FerrisDbError::InvalidCommand(
+                "WITH RECURSIVE requires `base_query UNION ALL recursive_query`".to_string(),
+            ));
+        };
+        if !all {
+            return Err(crate::error::FerrisDbError::InvalidCommand(
+                "WITH RECURSIVE requires UNION ALL".to_string(),
+            ));
+        }
+
+        let base_result = self.execute((**left).clone())?;
+        let ExecuteResult::Selected {
+            columns,
+            rows: base_rows,
+        } = base_result
+        else {
+            return Err(crate::error::FerrisDbError::InvalidCommand(
+                "recursive CTE base query must return rows".to_string(),
+            ));
+        };
+
+        let mut seen = HashSet::new();
+        let mut accumulated = Vec::new();
+        let mut frontier = Vec::new();
+        for row in base_rows {
+            if seen.insert(row_signature(&row)) {
+                frontier.push(row.clone());
+                accumulated.push(row);
+            }
+        }
+
+        let schema = materialized_schema(&cte.name, &columns, &accumulated);
+        let mut depth = 0_usize;
+        while !frontier.is_empty() {
+            depth += 1;
+            if depth > 100 {
+                return Err(crate::error::FerrisDbError::InvalidCommand(format!(
+                    "recursive CTE '{}' exceeded max recursion depth 100",
+                    cte.name
+                )));
+            }
+
+            let frontier_relation = TempTable {
+                schema: materialized_schema(&cte.name, &columns, &frontier),
+                rows: materialized_rows(&columns, frontier.clone())
+                    .into_iter()
+                    .enumerate()
+                    .map(|(idx, row)| (format!("{}-{}", depth, idx), row))
+                    .collect(),
+            };
+            let recursive_result =
+                self.with_temp_table(frontier_relation, || self.execute((**right).clone()))?;
+            let ExecuteResult::Selected {
+                columns: recursive_columns,
+                rows: recursive_rows,
+            } = recursive_result
+            else {
+                return Err(crate::error::FerrisDbError::InvalidCommand(
+                    "recursive CTE recursive query must return rows".to_string(),
+                ));
+            };
+            if recursive_columns.len() != columns.len() {
+                return Err(crate::error::FerrisDbError::InvalidCommand(format!(
+                    "recursive CTE '{}' expected {} columns, got {}",
+                    cte.name,
+                    columns.len(),
+                    recursive_columns.len()
+                )));
+            }
+
+            let mut next_frontier = Vec::new();
+            for row in recursive_rows {
+                if seen.insert(row_signature(&row)) {
+                    next_frontier.push(row.clone());
+                    accumulated.push(row);
+                }
+            }
+            frontier = next_frontier;
+        }
+
+        Ok(MaterializedRelation {
+            schema,
+            rows: materialized_rows(&columns, accumulated),
+        })
+    }
+
+    fn with_temp_table<T, F>(&self, table: TempTable, action: F) -> Result<T>
+    where
+        F: FnOnce() -> Result<T>,
+    {
+        let table_name = table.schema.table_name.clone();
+        let previous = self.remove_temp_table(&table_name);
+        self.insert_temp_table(table);
+        let result = action();
+        self.remove_temp_table(&table_name);
+        if let Some(previous) = previous {
+            self.insert_temp_table(previous);
+        }
+        result
     }
 
     fn resolve_target_rows_via_join(
@@ -3114,6 +3222,29 @@ impl SqlExecutor {
             }
         }
         Ok(matched)
+    }
+
+    fn resolve_relation_rows(
+        &self,
+        txn: &Transaction,
+        table_name: &str,
+    ) -> Result<Option<(TableSchema, Vec<Row>)>> {
+        if let Some(temp_table) = self.get_temp_table(table_name) {
+            return Ok(Some((
+                temp_table.schema,
+                temp_table.rows.into_values().collect(),
+            )));
+        }
+
+        let Some(schema) = self.catalog.get_table(txn, table_name)? else {
+            return Ok(None);
+        };
+        let rows = self
+            .scan_rows(txn, &schema)?
+            .into_iter()
+            .map(|(_, row)| row)
+            .collect();
+        Ok(Some((schema, rows)))
     }
 
     fn resolve_projection(
@@ -4281,9 +4412,13 @@ fn normalize_column_reference(
 fn dedup_selected_rows(rows: &mut Vec<Vec<Value>>) {
     let mut seen = BTreeMap::<String, ()>::new();
     rows.retain(|row| {
-        let key = format!("{:?}", row);
+        let key = row_signature(row);
         seen.insert(key, ()).is_none()
     });
+}
+
+fn row_signature(row: &[Value]) -> String {
+    serde_json::to_string(row).unwrap_or_else(|_| format!("{:?}", row))
 }
 
 fn tables_in_statement(statement: &Statement) -> Vec<String> {
@@ -4424,6 +4559,7 @@ fn substitute_statement_placeholders(
                 .map(|cte| {
                     Ok(CTE {
                         name: cte.name.clone(),
+                        recursive: cte.recursive,
                         query: Box::new(substitute_statement_placeholders(&cte.query, params)?),
                     })
                 })
@@ -4550,6 +4686,7 @@ fn bind_statement_variables(
                 .map(|cte| {
                     Ok(CTE {
                         name: cte.name.clone(),
+                        recursive: cte.recursive,
                         query: Box::new(bind_statement_variables(&cte.query, variables)?),
                     })
                 })

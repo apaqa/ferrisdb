@@ -14,6 +14,7 @@ FerrisDB is a database engine implemented from scratch in Rust, featuring LSM-Tr
 - SQL JSON column type and JSON functions (`JSON`, `JSON_EXTRACT`, `JSON_SET`)
 - SQL Views and Materialized Views (`CREATE VIEW`, `CREATE MATERIALIZED VIEW`, `REFRESH MATERIALIZED VIEW`, `DROP MATERIALIZED VIEW`)
 - SQL Common Table Expressions (`WITH`)
+- SQL WITH RECURSIVE CTE execution with bounded fixpoint evaluation
 - SQL prepared statements (`PREPARE`, `EXECUTE`, `DEALLOCATE`)
 - SQL INNER JOIN with nested loop
 - SQL `UPDATE ... FROM` and `DELETE ... USING`
@@ -52,9 +53,10 @@ FerrisDB is a database engine implemented from scratch in Rust, featuring LSM-Tr
 - MANIFEST metadata management
 - Configurable via `ferrisdb.toml`
 - Built-in benchmark framework
+- Property-based testing for KV / SQL invariants
 - Background compaction worker
 - Failure injection and stress tests
-- 217 automated tests across 39 test files
+- 225 automated tests across 42 test files
 
 ## Architecture
 
