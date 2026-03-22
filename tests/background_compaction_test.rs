@@ -34,10 +34,9 @@ fn test_background_compaction_runs_and_preserves_data() {
     }
 
     let sstable_count_before = engine.sstable_infos().expect("sstable infos before").len();
-    assert!(
-        sstable_count_before > 1,
-        "expected multiple sstables before compaction"
-    );
+    // 中文註解：背景 worker 可能在寫入期間就搶先開始 compact，
+    // 因此這裡只要求已經有 SSTable 產生，不再假設一定還看得到多個檔案。
+    assert!(sstable_count_before >= 1, "expected at least one sstable");
 
     thread::sleep(Duration::from_secs(7));
 

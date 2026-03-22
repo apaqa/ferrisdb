@@ -5,8 +5,8 @@ use crate::error::{FerrisDbError, Result};
 
 use super::ast::{
     AggregateFunc, Assignment, CTE, CheckConstraint, ColumnDef, DataType, Expr, ForeignKey,
-    GroupByClause, InsertSource, IsolationLevel, JoinClause, JoinType, Operator,
-    OrderByClause, OrderDirection, ProcedureParam, Privilege, SelectColumns, SelectItem,
+    GroupByClause, InsertSource, IsolationLevel, JoinClause, JoinType, Operator, OrderByClause,
+    OrderDirection, PartitionDef, ProcedureParam, Privilege, SelectColumns, SelectItem,
     Statement, TriggerEvent, TriggerTiming, Value, WhereExpr, WindowFunc,
 };
 use super::lexer::{Keyword, Token};
@@ -244,14 +244,22 @@ impl Parser {
         let mut columns = Vec::new();
         let mut foreign_keys = Vec::new();
         let mut check_constraints = Vec::new();
+        let mut unique_constraints = Vec::new();
         loop {
             if matches!(self.peek(), Some(Token::Keyword(Keyword::Foreign))) {
                 foreign_keys.push(self.parse_foreign_key_clause()?);
             } else if matches!(self.peek(), Some(Token::Keyword(Keyword::Check))) {
                 check_constraints.push(self.parse_check_constraint_clause()?);
+            } else if matches!(self.peek(), Some(Token::Keyword(Keyword::Unique))) {
+                unique_constraints.push(self.parse_unique_constraint_clause()?);
             } else {
                 let name = self.expect_ident()?;
                 let data_type = self.parse_data_type()?;
+                let column_unique = matches!(self.peek(), Some(Token::Keyword(Keyword::Unique)));
+                if column_unique {
+                    self.bump();
+                    unique_constraints.push(vec![name.clone()]);
+                }
                 columns.push(ColumnDef { name, data_type });
             }
 
@@ -263,6 +271,7 @@ impl Parser {
         }
 
         self.expect_token(Token::RParen)?;
+        let (partition_by, partitions) = self.parse_optional_partition_clause()?;
         Ok(Statement::CreateTable {
             table_name,
             temporary,
@@ -270,6 +279,9 @@ impl Parser {
             columns,
             foreign_keys,
             check_constraints,
+            unique_constraints,
+            partition_by,
+            partitions,
         })
     }
 
@@ -298,6 +310,69 @@ impl Parser {
         let expr = self.parse_where_expr()?;
         self.expect_token(Token::RParen)?;
         Ok(CheckConstraint { expr })
+    }
+
+    fn parse_unique_constraint_clause(&mut self) -> Result<Vec<String>> {
+        self.expect_keyword(Keyword::Unique)?;
+        self.expect_token(Token::LParen)?;
+        let columns = self.parse_identifier_list()?;
+        self.expect_token(Token::RParen)?;
+        Ok(columns)
+    }
+
+    // 中文註解：RANGE 分區語法會在 CREATE TABLE 欄位列表之後出現，這裡把分區鍵與每個分區邊界解析成 AST。
+    fn parse_optional_partition_clause(&mut self) -> Result<(Option<String>, Vec<PartitionDef>)> {
+        if !matches!(self.peek(), Some(Token::Keyword(Keyword::Partition))) {
+            return Ok((None, Vec::new()));
+        }
+
+        self.expect_keyword(Keyword::Partition)?;
+        self.expect_keyword(Keyword::By)?;
+        self.expect_keyword(Keyword::Range)?;
+        self.expect_token(Token::LParen)?;
+        let partition_by = self.expect_ident()?;
+        self.expect_token(Token::RParen)?;
+        self.expect_token(Token::LParen)?;
+
+        let mut partitions = Vec::new();
+        loop {
+            self.expect_keyword(Keyword::Partition)?;
+            let name = self.expect_ident()?;
+            self.expect_keyword(Keyword::Values)?;
+            self.expect_keyword(Keyword::Less)?;
+            self.expect_keyword(Keyword::Than)?;
+            let (less_than, is_maxvalue) = if matches!(self.peek(), Some(Token::Keyword(Keyword::Maxvalue))) {
+                self.bump();
+                (None, true)
+            } else {
+                self.expect_token(Token::LParen)?;
+                let value = match self.bump() {
+                    Some(Token::IntLit(value)) => value,
+                    other => {
+                        return Err(FerrisDbError::InvalidCommand(format!(
+                            "expected integer in partition bound, got {:?}",
+                            other
+                        )));
+                    }
+                };
+                self.expect_token(Token::RParen)?;
+                (Some(value), false)
+            };
+            partitions.push(PartitionDef {
+                name,
+                less_than,
+                is_maxvalue,
+            });
+
+            if matches!(self.peek(), Some(Token::Comma)) {
+                self.bump();
+                continue;
+            }
+            break;
+        }
+
+        self.expect_token(Token::RParen)?;
+        Ok((Some(partition_by), partitions))
     }
 
     fn parse_create_index_after_create(&mut self) -> Result<Statement> {
@@ -1987,6 +2062,7 @@ fn keyword_to_sql(keyword: &Keyword) -> &'static str {
         Keyword::Temporary => "TEMPORARY",
         Keyword::Add => "ADD",
         Keyword::Column => "COLUMN",
+        Keyword::Unique => "UNIQUE",
         Keyword::Drop => "DROP",
         Keyword::If => "IF",
         Keyword::While => "WHILE",
@@ -2009,6 +2085,10 @@ fn keyword_to_sql(keyword: &Keyword) -> &'static str {
         Keyword::Using => "USING",
         Keyword::Over => "OVER",
         Keyword::Partition => "PARTITION",
+        Keyword::Range => "RANGE",
+        Keyword::Less => "LESS",
+        Keyword::Than => "THAN",
+        Keyword::Maxvalue => "MAXVALUE",
         Keyword::RowNumber => "ROW_NUMBER",
         Keyword::Rank => "RANK",
         Keyword::Join => "JOIN",

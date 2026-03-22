@@ -8,7 +8,8 @@
 use ferrisdb::sql::ast::{
     AggregateFunc, Assignment, CTE, CheckConstraint, ColumnDef, DataType, Expr, ForeignKey,
     GroupByClause, InsertSource, IsolationLevel, JoinClause, JoinType, Operator, OrderByClause,
-    OrderDirection, ProcedureParam, SelectColumns, SelectItem, Statement, Value, WhereExpr,
+    OrderDirection, PartitionDef, ProcedureParam, SelectColumns, SelectItem, Statement, Value,
+    WhereExpr,
 };
 use ferrisdb::sql::lexer::{Keyword, Lexer, Token};
 use ferrisdb::sql::parser::Parser;
@@ -61,6 +62,96 @@ fn test_parse_create_table() {
             ],
             foreign_keys: vec![],
             check_constraints: vec![],
+            unique_constraints: vec![],
+            partition_by: None,
+            partitions: vec![],
+        }
+    );
+}
+
+#[test]
+fn test_parse_create_table_with_unique_constraints() {
+    let stmt = parse_sql(
+        "CREATE TABLE users (id INT, email TEXT UNIQUE, tenant_id INT, UNIQUE (tenant_id, email));",
+    );
+    assert_eq!(
+        stmt,
+        Statement::CreateTable {
+            table_name: "users".to_string(),
+            temporary: false,
+            if_not_exists: false,
+            columns: vec![
+                ColumnDef {
+                    name: "id".to_string(),
+                    data_type: DataType::Int,
+                },
+                ColumnDef {
+                    name: "email".to_string(),
+                    data_type: DataType::Text,
+                },
+                ColumnDef {
+                    name: "tenant_id".to_string(),
+                    data_type: DataType::Int,
+                },
+            ],
+            foreign_keys: vec![],
+            check_constraints: vec![],
+            unique_constraints: vec![
+                vec!["email".to_string()],
+                vec!["tenant_id".to_string(), "email".to_string()],
+            ],
+            partition_by: None,
+            partitions: vec![],
+        }
+    );
+}
+
+#[test]
+fn test_parse_create_table_with_range_partitions() {
+    let stmt = parse_sql(
+        "CREATE TABLE logs (id INT, created_date INT, message TEXT) PARTITION BY RANGE (created_date) (PARTITION p1 VALUES LESS THAN (100), PARTITION p2 VALUES LESS THAN (200), PARTITION p3 VALUES LESS THAN MAXVALUE);",
+    );
+    assert_eq!(
+        stmt,
+        Statement::CreateTable {
+            table_name: "logs".to_string(),
+            temporary: false,
+            if_not_exists: false,
+            columns: vec![
+                ColumnDef {
+                    name: "id".to_string(),
+                    data_type: DataType::Int,
+                },
+                ColumnDef {
+                    name: "created_date".to_string(),
+                    data_type: DataType::Int,
+                },
+                ColumnDef {
+                    name: "message".to_string(),
+                    data_type: DataType::Text,
+                },
+            ],
+            foreign_keys: vec![],
+            check_constraints: vec![],
+            unique_constraints: vec![],
+            partition_by: Some("created_date".to_string()),
+            partitions: vec![
+                PartitionDef {
+                    name: "p1".to_string(),
+                    less_than: Some(100),
+                    is_maxvalue: false,
+                },
+                PartitionDef {
+                    name: "p2".to_string(),
+                    less_than: Some(200),
+                    is_maxvalue: false,
+                },
+                PartitionDef {
+                    name: "p3".to_string(),
+                    less_than: None,
+                    is_maxvalue: true,
+                },
+            ],
         }
     );
 }
@@ -596,6 +687,9 @@ fn test_parse_create_if_not_exists_alter_drop_table_and_subquery() {
             ],
             foreign_keys: vec![],
             check_constraints: vec![],
+            unique_constraints: vec![],
+            partition_by: None,
+            partitions: vec![],
         }
     );
 
@@ -916,6 +1010,9 @@ fn test_parse_create_table_with_foreign_key() {
                 ref_columns: vec!["id".to_string()],
             }],
             check_constraints: vec![],
+            unique_constraints: vec![],
+            partition_by: None,
+            partitions: vec![],
         }
     );
 }
@@ -950,6 +1047,9 @@ fn test_parse_create_table_with_json_and_check() {
                     value: Value::Int(0),
                 },
             }],
+            unique_constraints: vec![],
+            partition_by: None,
+            partitions: vec![],
         }
     );
 }
@@ -1315,6 +1415,9 @@ fn test_parse_create_and_drop_temporary_table() {
             ],
             foreign_keys: vec![],
             check_constraints: vec![],
+            unique_constraints: vec![],
+            partition_by: None,
+            partitions: vec![],
         }
     );
 

@@ -57,11 +57,38 @@ impl Row {
 }
 
 pub fn encode_row_key(table_name: &str, pk_value: &Value) -> Vec<u8> {
+    encode_partitioned_row_key(table_name, None, pk_value)
+}
+
+// 中文註解：分區表會把 partition name 夾在 table 與 primary key 之間，讓掃描時能直接按分區前綴裁剪。
+pub fn encode_partitioned_row_key(
+    table_name: &str,
+    partition_name: Option<&str>,
+    pk_value: &Value,
+) -> Vec<u8> {
+    match partition_name {
+        Some(partition_name) => format!(
+            "{}{}:{}:{}",
+            ROW_KEY_PREFIX,
+            table_name,
+            partition_name,
+            primary_key_to_string(pk_value)
+        )
+        .into_bytes(),
+        None => format!(
+            "{}{}:{}",
+            ROW_KEY_PREFIX,
+            table_name,
+            primary_key_to_string(pk_value)
+        )
+        .into_bytes(),
+    }
+}
+
+pub fn encode_row_partition_prefix_start(table_name: &str, partition_name: &str) -> Vec<u8> {
     format!(
-        "{}{}:{}",
-        ROW_KEY_PREFIX,
-        table_name,
-        primary_key_to_string(pk_value)
+        "{}{}:{}:",
+        ROW_KEY_PREFIX, table_name, partition_name
     )
     .into_bytes()
 }
@@ -69,7 +96,12 @@ pub fn encode_row_key(table_name: &str, pk_value: &Value) -> Vec<u8> {
 pub fn decode_row_key(key: &[u8]) -> Option<(String, String)> {
     let key = std::str::from_utf8(key).ok()?;
     let rest = key.strip_prefix(ROW_KEY_PREFIX)?;
-    let (table_name, pk_value) = rest.split_once(':')?;
+    let mut parts = rest.split(':').collect::<Vec<_>>();
+    if parts.len() < 2 {
+        return None;
+    }
+    let table_name = parts.remove(0);
+    let pk_value = parts.pop()?;
     Some((table_name.to_string(), pk_value.to_string()))
 }
 
@@ -79,6 +111,12 @@ pub fn encode_row_prefix_start(table_name: &str) -> Vec<u8> {
 
 pub fn encode_row_prefix_end(table_name: &str) -> Vec<u8> {
     let mut end = encode_row_prefix_start(table_name);
+    end.push(0xFF);
+    end
+}
+
+pub fn encode_row_partition_prefix_end(table_name: &str, partition_name: &str) -> Vec<u8> {
+    let mut end = encode_row_partition_prefix_start(table_name, partition_name);
     end.push(0xFF);
     end
 }

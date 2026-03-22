@@ -33,7 +33,7 @@ use crate::transaction::mvcc::{MvccEngine, PreparedStatement, Transaction};
 
 use super::ast::{
     AggregateFunc, Assignment, CTE, CheckConstraint, ColumnDef, DataType, Expr, ForeignKey,
-    GroupByClause, InsertSource, IsolationLevel, JoinClause, JoinType, Operator,
+    GroupByClause, InsertSource, IsolationLevel, JoinClause, JoinType, Operator, PartitionDef,
     OrderByClause, OrderDirection, ProcedureParam, Privilege, SelectColumns, SelectItem,
     Statement, TriggerEvent, TriggerTiming, Value, WhereExpr, WindowFunc,
 };
@@ -43,7 +43,8 @@ use super::optimizer::{Optimizer, Plan, QueryPlanNode};
 use super::parser::Parser;
 use super::plan_cache::{PlanCache, PlanCacheStats};
 use super::row::{
-    decode_row_key, encode_row_key, encode_row_prefix_end, encode_row_prefix_start, Row,
+    decode_row_key, encode_partitioned_row_key, encode_row_key, encode_row_partition_prefix_end,
+    encode_row_partition_prefix_start, encode_row_prefix_end, encode_row_prefix_start, Row,
 };
 use super::statistics::StatisticsManager;
 
@@ -392,6 +393,9 @@ impl SqlExecutor {
                 columns,
                 foreign_keys,
                 check_constraints,
+                unique_constraints,
+                partition_by,
+                partitions,
             } => self.execute_create_table(
                 table_name,
                 temporary,
@@ -399,6 +403,9 @@ impl SqlExecutor {
                 columns,
                 foreign_keys,
                 check_constraints,
+                unique_constraints,
+                partition_by,
+                partitions,
             ),
             Statement::AlterTableAdd { table_name, column } => {
                 self.execute_alter_table_add(table_name, column)
@@ -591,6 +598,9 @@ impl SqlExecutor {
         columns: Vec<super::ast::ColumnDef>,
         foreign_keys: Vec<ForeignKey>,
         check_constraints: Vec<CheckConstraint>,
+        unique_constraints: Vec<Vec<String>>,
+        partition_by: Option<String>,
+        partitions: Vec<PartitionDef>,
     ) -> Result<ExecuteResult> {
         if columns.is_empty() {
             return Ok(ExecuteResult::Error {
@@ -603,8 +613,17 @@ impl SqlExecutor {
             columns,
             foreign_keys,
             check_constraints,
+            unique_constraints,
+            partition_by,
+            partitions,
         };
         if let Some(message) = self.validate_check_constraints_on_create(&schema) {
+            return Ok(ExecuteResult::Error { message });
+        }
+        if let Some(message) = self.validate_unique_constraints_on_create(&schema) {
+            return Ok(ExecuteResult::Error { message });
+        }
+        if let Some(message) = self.validate_partitions_on_create(&schema) {
             return Ok(ExecuteResult::Error { message });
         }
 
@@ -772,6 +791,14 @@ impl SqlExecutor {
                 message: format!("unknown column '{}'", column_name),
             });
         }
+        if schema.partition_by.as_deref() == Some(&column_name) {
+            return Ok(ExecuteResult::Error {
+                message: format!(
+                    "dropping partition column '{}' is not supported",
+                    column_name
+                ),
+            });
+        }
 
         let rows = self.scan_rows(&txn, &schema)?;
         for (row_key, mut row) in rows {
@@ -787,6 +814,9 @@ impl SqlExecutor {
         }
 
         schema.columns.retain(|column| column.name != column_name);
+        schema
+            .unique_constraints
+            .retain(|columns| !columns.iter().any(|column| column == &column_name));
         txn.put(
             crate::sql::catalog::encode_schema_key(&table_name),
             serde_json::to_vec(&schema)?,
@@ -2076,6 +2106,9 @@ impl SqlExecutor {
                 columns: Vec::new(),
                 foreign_keys: Vec::new(),
                 check_constraints: Vec::new(),
+                unique_constraints: Vec::new(),
+                partition_by: None,
+                partitions: Vec::new(),
             };
             return self.execute_select_from_materialized_rows(
                 &txn,
@@ -2915,13 +2948,21 @@ impl SqlExecutor {
                 return Ok(ExecuteResult::Error { message });
             }
 
-            let new_row_key = encode_row_key(&table_name, &new_pk_value);
-            if new_row_key != row_key && txn.get(&new_row_key)?.is_some() {
+            let new_row_key = match self.encode_table_row_key(&schema, &row, &new_pk_value) {
+                Ok(row_key) => row_key,
+                Err(message) => return Ok(ExecuteResult::Error { message }),
+            };
+            if new_row_key != row_key
+                && self.load_row_by_pk(&txn, &schema, &new_pk_value)?.is_some()
+            {
                 return Ok(ExecuteResult::Error {
                     message: format!("duplicate primary key '{}' for table '{}'", render_value(&new_pk_value), table_name),
                 });
             }
             if let Some(message) = self.check_foreign_keys_for_row(&txn, &schema, &row)? {
+                return Ok(ExecuteResult::Error { message });
+            }
+            if let Some(message) = self.check_unique_constraints_for_row(&txn, &schema, &row, Some(row_key.as_slice()))? {
                 return Ok(ExecuteResult::Error { message });
             }
 
@@ -3388,6 +3429,172 @@ impl SqlExecutor {
         None
     }
 
+    // 中文註解：建立表時先檢查 UNIQUE 約束引用的欄位是否存在，避免 schema 一開始就不合法。
+    fn validate_unique_constraints_on_create(&self, schema: &TableSchema) -> Option<String> {
+        for columns in &schema.unique_constraints {
+            if columns.is_empty() {
+                return Some("UNIQUE constraint must include at least one column".to_string());
+            }
+            for column in columns {
+                if !schema.columns.iter().any(|item| item.name == *column) {
+                    return Some(format!("unknown column '{}' in UNIQUE constraint", column));
+                }
+            }
+        }
+        None
+    }
+
+    // 中文註解：RANGE 分區目前只支援 INT 欄位，且邊界必須遞增，最後可用 MAXVALUE 吃掉剩餘範圍。
+    fn validate_partitions_on_create(&self, schema: &TableSchema) -> Option<String> {
+        let Some(partition_by) = schema.partition_by.as_ref() else {
+            if !schema.partitions.is_empty() {
+                return Some("partition definitions require PARTITION BY RANGE".to_string());
+            }
+            return None;
+        };
+        if schema.partitions.is_empty() {
+            return Some("PARTITION BY RANGE requires at least one PARTITION".to_string());
+        }
+        let Some(column) = schema.columns.iter().find(|column| &column.name == partition_by) else {
+            return Some(format!("unknown partition column '{}'", partition_by));
+        };
+        if !matches!(column.data_type, DataType::Int) {
+            return Some(format!(
+                "RANGE partition column '{}' must have INT type",
+                partition_by
+            ));
+        }
+
+        let mut seen_max = false;
+        let mut last_bound: Option<i64> = None;
+        for partition in &schema.partitions {
+            if partition.is_maxvalue {
+                if seen_max {
+                    return Some("MAXVALUE partition can only appear once".to_string());
+                }
+                seen_max = true;
+                continue;
+            }
+
+            let Some(bound) = partition.less_than else {
+                return Some(format!(
+                    "partition '{}' must specify LESS THAN value or MAXVALUE",
+                    partition.name
+                ));
+            };
+            if let Some(previous) = last_bound {
+                if bound <= previous {
+                    return Some("partition bounds must be strictly increasing".to_string());
+                }
+            }
+            if seen_max {
+                return Some("MAXVALUE partition must be the last partition".to_string());
+            }
+            last_bound = Some(bound);
+        }
+        None
+    }
+
+    fn determine_partition_name(
+        &self,
+        schema: &TableSchema,
+        row: &Row,
+    ) -> std::result::Result<Option<String>, String> {
+        let Some(partition_by) = schema.partition_by.as_ref() else {
+            return Ok(None);
+        };
+        let value = row.get(partition_by).unwrap_or(&Value::Null);
+        let Value::Int(value) = value else {
+            return Err(format!(
+                "partition column '{}' requires INT value",
+                partition_by
+            ));
+        };
+
+        for partition in &schema.partitions {
+            if partition.is_maxvalue {
+                return Ok(Some(partition.name.clone()));
+            }
+            if partition.less_than.is_some_and(|bound| *value < bound) {
+                return Ok(Some(partition.name.clone()));
+            }
+        }
+
+        Err(format!(
+            "no partition found for value {} on column '{}'",
+            value, partition_by
+        ))
+    }
+
+    fn encode_table_row_key(
+        &self,
+        schema: &TableSchema,
+        row: &Row,
+        pk_value: &Value,
+    ) -> std::result::Result<Vec<u8>, String> {
+        let partition = self.determine_partition_name(schema, row)?;
+        Ok(encode_partitioned_row_key(
+            &schema.table_name,
+            partition.as_deref(),
+            pk_value,
+        ))
+    }
+
+    fn load_row_by_pk(
+        &self,
+        txn: &Transaction,
+        schema: &TableSchema,
+        pk: &Value,
+    ) -> Result<Option<(Vec<u8>, Row)>> {
+        if schema.partition_by.is_none() {
+            let row_key = encode_row_key(&schema.table_name, pk);
+            if let Some(raw) = txn.get(&row_key)? {
+                let row: Row = serde_json::from_slice(&raw)?;
+                return Ok(Some((row_key, row)));
+            }
+            return Ok(None);
+        }
+
+        for (row_key, row) in self.scan_rows(txn, schema)? {
+            if row.get(&schema.columns[0].name) == Some(pk) {
+                return Ok(Some((row_key, row)));
+            }
+        }
+        Ok(None)
+    }
+
+    fn check_unique_constraints_for_row(
+        &self,
+        txn: &Transaction,
+        schema: &TableSchema,
+        row: &Row,
+        ignore_row_key: Option<&[u8]>,
+    ) -> Result<Option<String>> {
+        for unique_columns in &schema.unique_constraints {
+            let candidate_values = unique_columns
+                .iter()
+                .map(|column| row.get(column).cloned().unwrap_or(Value::Null))
+                .collect::<Vec<_>>();
+            for (existing_key, existing_row) in self.scan_rows(txn, schema)? {
+                if ignore_row_key.is_some_and(|ignore| ignore == existing_key.as_slice()) {
+                    continue;
+                }
+                let existing_values = unique_columns
+                    .iter()
+                    .map(|column| existing_row.get(column).cloned().unwrap_or(Value::Null))
+                    .collect::<Vec<_>>();
+                if existing_values == candidate_values {
+                    return Ok(Some(format!(
+                        "unique constraint violation on table '{}' for ({})",
+                        schema.table_name,
+                        unique_columns.join(", ")
+                    )));
+                }
+            }
+        }
+        Ok(None)
+    }
+
     fn validate_json_columns(&self, schema: &TableSchema, row: &Row) -> Option<String> {
         for column in &schema.columns {
             if !matches!(column.data_type, DataType::Json) {
@@ -3559,6 +3766,9 @@ impl SqlExecutor {
             columns: materialized_schema(view_name, columns, &rows).columns,
             foreign_keys: Vec::new(),
             check_constraints: Vec::new(),
+            unique_constraints: Vec::new(),
+            partition_by: None,
+            partitions: Vec::new(),
         };
         for (row_key, _) in self.scan_rows(txn, &schema)? {
             txn.delete(&row_key)?;
@@ -3747,16 +3957,27 @@ impl SqlExecutor {
             if let Some(message) = self.validate_json_columns(schema, &row) {
                 return Ok(Err(message));
             }
+            if self.load_row_by_pk(txn, schema, &pk_value)?.is_some() {
+                return Ok(Err(format!(
+                    "duplicate primary key '{}' for table '{}'",
+                    render_value(&pk_value),
+                    table_name
+                )));
+            }
             if let Some(message) = self.check_foreign_keys_for_row(txn, schema, &row)? {
                 return Ok(Err(message));
             }
             if let Some(message) = self.check_check_constraints(schema, &row) {
                 return Ok(Err(message));
             }
-            txn.put(
-                encode_row_key(table_name, &pk_value),
-                serde_json::to_vec(&row)?,
-            )?;
+            if let Some(message) = self.check_unique_constraints_for_row(txn, schema, &row, None)? {
+                return Ok(Err(message));
+            }
+            let row_key = match self.encode_table_row_key(schema, &row, &pk_value) {
+                Ok(row_key) => row_key,
+                Err(message) => return Ok(Err(message)),
+            };
+            txn.put(row_key, serde_json::to_vec(&row)?)?;
             for indexed_columns in self.index_manager.list_indexes(txn, table_name)? {
                 self.index_manager
                     .insert_index_entry(txn, table_name, &indexed_columns, &row, &pk_value)?;
@@ -3768,22 +3989,86 @@ impl SqlExecutor {
     }
 
     fn scan_rows(&self, txn: &Transaction, schema: &TableSchema) -> Result<Vec<(Vec<u8>, Row)>> {
-        let start = encode_row_prefix_start(&schema.table_name);
-        let end = encode_row_prefix_end(&schema.table_name);
+        self.scan_rows_in_partitions(txn, schema, None)
+    }
 
+    // 中文註解：分區表在掃描時可以只讀被 WHERE 命中的 partitions；非分區表則退化成整張表前綴掃描。
+    fn scan_rows_in_partitions(
+        &self,
+        txn: &Transaction,
+        schema: &TableSchema,
+        partitions: Option<&[String]>,
+    ) -> Result<Vec<(Vec<u8>, Row)>> {
         let mut rows = Vec::new();
-        for (key, value) in txn.scan(&start, &end)? {
-            let Some((table_name, _pk)) = decode_row_key(&key) else {
-                continue;
-            };
-            if table_name != schema.table_name {
-                continue;
+        if schema.partition_by.is_none() || schema.partitions.is_empty() {
+            let start = encode_row_prefix_start(&schema.table_name);
+            let end = encode_row_prefix_end(&schema.table_name);
+            for (key, value) in txn.scan(&start, &end)? {
+                let Some((table_name, _pk)) = decode_row_key(&key) else {
+                    continue;
+                };
+                if table_name != schema.table_name {
+                    continue;
+                }
+                rows.push((key, serde_json::from_slice(&value)?));
             }
+            return Ok(rows);
+        }
 
-            let row: Row = serde_json::from_slice(&value)?;
-            rows.push((key, row));
+        let scan_partitions = partitions
+            .map(|items| items.to_vec())
+            .unwrap_or_else(|| schema.partitions.iter().map(|partition| partition.name.clone()).collect());
+        for partition_name in scan_partitions {
+            let start = encode_row_partition_prefix_start(&schema.table_name, &partition_name);
+            let end = encode_row_partition_prefix_end(&schema.table_name, &partition_name);
+            for (key, value) in txn.scan(&start, &end)? {
+                let Some((table_name, _pk)) = decode_row_key(&key) else {
+                    continue;
+                };
+                if table_name != schema.table_name {
+                    continue;
+                }
+                rows.push((key, serde_json::from_slice(&value)?));
+            }
         }
         Ok(rows)
+    }
+
+    fn prune_partitions(&self, schema: &TableSchema, where_clause: Option<&WhereExpr>) -> Option<Vec<String>> {
+        let partition_column = schema.partition_by.as_ref()?;
+        if schema.partitions.is_empty() {
+            return None;
+        }
+
+        let predicate = partition_predicate_from_where(where_clause?, partition_column)?;
+        let partitions = schema
+            .partitions
+            .iter()
+            .enumerate()
+            .filter_map(|(index, partition)| {
+                let lower = if index == 0 {
+                    None
+                } else {
+                    schema.partitions[index - 1].less_than
+                };
+                let upper = if partition.is_maxvalue {
+                    None
+                } else {
+                    partition.less_than
+                };
+                if predicate_intersects_partition(&predicate, lower, upper) {
+                    Some(partition.name.clone())
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+
+        if partitions.is_empty() {
+            Some(Vec::new())
+        } else {
+            Some(partitions)
+        }
     }
 
     // 中文註解：SELECT 會優先嘗試使用 indexable 的等值條件縮小候選列，再用完整條件做二次過濾。
@@ -3809,9 +4094,7 @@ impl SqlExecutor {
                 .lookup_prefix(txn, &schema.table_name, &scan_columns, &prefix_values)?;
             let mut rows = Vec::new();
             for pk in pks {
-                let row_key = encode_row_key(&schema.table_name, &pk);
-                if let Some(raw) = txn.get(&row_key)? {
-                    let row: Row = serde_json::from_slice(&raw)?;
+                if let Some((row_key, row)) = self.load_row_by_pk(txn, schema, &pk)? {
                     if eval_where_expr(&row, resolved_where.as_ref()) {
                         rows.push((row_key, row));
                     }
@@ -3820,7 +4103,8 @@ impl SqlExecutor {
             return Ok(rows);
         }
 
-        let mut rows = self.scan_rows(txn, schema)?;
+        let candidate_partitions = self.prune_partitions(schema, where_clause);
+        let mut rows = self.scan_rows_in_partitions(txn, schema, candidate_partitions.as_deref())?;
         rows.retain(|(_, row)| eval_where_expr(row, resolved_where.as_ref()));
         Ok(rows)
     }
@@ -5172,6 +5456,9 @@ fn materialized_schema(table_name: &str, columns: &[String], rows: &[Vec<Value>]
             .collect(),
         foreign_keys: Vec::new(),
         check_constraints: Vec::new(),
+        unique_constraints: Vec::new(),
+        partition_by: None,
+        partitions: Vec::new(),
     }
 }
 
@@ -6183,6 +6470,102 @@ fn compare_sort_order(left: &Value, right: &Value) -> std::cmp::Ordering {
         (_, Value::Null) => std::cmp::Ordering::Less,
         _ => compare_order(left, right).unwrap_or(std::cmp::Ordering::Equal),
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PartitionPredicate {
+    min_inclusive: Option<i64>,
+    max_inclusive: Option<i64>,
+}
+
+fn partition_predicate_from_where(
+    where_clause: &WhereExpr,
+    partition_column: &str,
+) -> Option<PartitionPredicate> {
+    match where_clause {
+        WhereExpr::Comparison {
+            column,
+            operator,
+            value: Value::Int(value),
+        } if column == partition_column => match operator {
+            Operator::Eq => Some(PartitionPredicate {
+                min_inclusive: Some(*value),
+                max_inclusive: Some(*value),
+            }),
+            Operator::Lt => Some(PartitionPredicate {
+                min_inclusive: None,
+                max_inclusive: Some(value.saturating_sub(1)),
+            }),
+            Operator::Le => Some(PartitionPredicate {
+                min_inclusive: None,
+                max_inclusive: Some(*value),
+            }),
+            Operator::Gt => Some(PartitionPredicate {
+                min_inclusive: Some(value.saturating_add(1)),
+                max_inclusive: None,
+            }),
+            Operator::Ge => Some(PartitionPredicate {
+                min_inclusive: Some(*value),
+                max_inclusive: None,
+            }),
+            Operator::Ne => None,
+        },
+        WhereExpr::Between {
+            column,
+            low: Value::Int(low),
+            high: Value::Int(high),
+        } if column == partition_column => Some(PartitionPredicate {
+            min_inclusive: Some(*low),
+            max_inclusive: Some(*high),
+        }),
+        WhereExpr::And(left, right) => {
+            let left = partition_predicate_from_where(left, partition_column)?;
+            let right = partition_predicate_from_where(right, partition_column)?;
+            Some(PartitionPredicate {
+                min_inclusive: match (left.min_inclusive, right.min_inclusive) {
+                    (Some(a), Some(b)) => Some(a.max(b)),
+                    (Some(a), None) => Some(a),
+                    (None, Some(b)) => Some(b),
+                    (None, None) => None,
+                },
+                max_inclusive: match (left.max_inclusive, right.max_inclusive) {
+                    (Some(a), Some(b)) => Some(a.min(b)),
+                    (Some(a), None) => Some(a),
+                    (None, Some(b)) => Some(b),
+                    (None, None) => None,
+                },
+            })
+        }
+        WhereExpr::Or(left, right) => {
+            let left = partition_predicate_from_where(left, partition_column)?;
+            let right = partition_predicate_from_where(right, partition_column)?;
+            Some(PartitionPredicate {
+                min_inclusive: match (left.min_inclusive, right.min_inclusive) {
+                    (Some(a), Some(b)) => Some(a.min(b)),
+                    _ => None,
+                },
+                max_inclusive: match (left.max_inclusive, right.max_inclusive) {
+                    (Some(a), Some(b)) => Some(a.max(b)),
+                    _ => None,
+                },
+            })
+        }
+        _ => None,
+    }
+}
+
+fn predicate_intersects_partition(
+    predicate: &PartitionPredicate,
+    partition_lower_inclusive: Option<i64>,
+    partition_upper_exclusive: Option<i64>,
+) -> bool {
+    let range_min = partition_lower_inclusive.unwrap_or(i64::MIN);
+    let range_max = partition_upper_exclusive
+        .map(|value| value.saturating_sub(1))
+        .unwrap_or(i64::MAX);
+    let predicate_min = predicate.min_inclusive.unwrap_or(i64::MIN);
+    let predicate_max = predicate.max_inclusive.unwrap_or(i64::MAX);
+    predicate_min <= range_max && predicate_max >= range_min
 }
 
 fn evaluate_min_max(

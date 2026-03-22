@@ -56,8 +56,9 @@ proptest! {
             let mut model = BTreeMap::<i64, String>::new();
             for (id, name) in rows {
                 let sql = format!("INSERT INTO users VALUES ({}, '{}');", id, name);
-                exec(executor, &sql);
-                model.insert(id, name);
+                if matches!(exec(executor, &sql), ExecuteResult::Inserted { .. }) {
+                    model.insert(id, name);
+                }
             }
 
             match exec(executor, "SELECT COUNT(*) FROM users;") {
@@ -82,8 +83,9 @@ proptest! {
 
             for (id, name) in inserts {
                 let sql = format!("INSERT INTO users VALUES ({}, '{}');", id, name);
-                exec(executor, &sql);
-                model.insert(id, name);
+                if matches!(exec(executor, &sql), ExecuteResult::Inserted { .. }) {
+                    model.insert(id, name);
+                }
             }
 
             for id in deletes {

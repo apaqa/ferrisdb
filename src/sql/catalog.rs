@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 use crate::error::Result;
 use crate::transaction::mvcc::{MvccEngine, Transaction};
 
-use super::ast::{CheckConstraint, ColumnDef, ForeignKey};
+use super::ast::{CheckConstraint, ColumnDef, ForeignKey, PartitionDef};
 
 pub const TABLE_META_PREFIX: &str = "__meta:table:";
 pub const VIEW_META_PREFIX: &str = "__meta:view:";
@@ -35,6 +35,14 @@ pub struct TableSchema {
     pub foreign_keys: Vec<ForeignKey>,
     // 中文註解：check_constraints 會在 INSERT / UPDATE 時驗證資料列是否符合條件。
     pub check_constraints: Vec<CheckConstraint>,
+    // 中文註解：UNIQUE 約束記錄成欄位名稱集合，供 INSERT / UPDATE 前檢查重複值。
+    #[serde(default)]
+    pub unique_constraints: Vec<Vec<String>>,
+    // 中文註解：partition_by 保存 RANGE 分區鍵欄位，None 代表普通表。
+    pub partition_by: Option<String>,
+    // 中文註解：partitions 定義各 RANGE 分區的名稱與邊界。
+    #[serde(default)]
+    pub partitions: Vec<PartitionDef>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

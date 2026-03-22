@@ -31,6 +31,8 @@ FerrisDB is a database engine implemented from scratch in Rust, featuring LSM-Tr
 - SQL `WHERE` with comparison operators (`=`, `!=`, `<`, `>`, `<=`, `>=`)
 - SQL `BETWEEN`, `LIKE`, `IS NULL`, `IS NOT NULL`
 - SQL NULL-aware behavior for sorting and aggregates
+- SQL UNIQUE constraints (single-column and composite)
+- SQL RANGE table partitioning with partition pruning
 - Secondary / composite indexes with `CREATE INDEX ON table(col1, col2, ...)`
 - Index Scan optimization for equality-prefix queries
 - ALTER TABLE (`ADD COLUMN` / `DROP COLUMN`)
@@ -56,7 +58,7 @@ FerrisDB is a database engine implemented from scratch in Rust, featuring LSM-Tr
 - Property-based testing for KV / SQL invariants
 - Background compaction worker
 - Failure injection and stress tests
-- 225 automated tests across 42 test files
+- 233 automated tests across 44 test files
 
 ## Architecture
 

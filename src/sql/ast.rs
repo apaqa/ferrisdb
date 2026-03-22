@@ -66,6 +66,12 @@ pub enum Statement {
         columns: Vec<ColumnDef>,
         foreign_keys: Vec<ForeignKey>,
         check_constraints: Vec<CheckConstraint>,
+        // 中文註解：UNIQUE 約束用欄位名稱陣列表示，單欄 UNIQUE 會是只有一個欄位的陣列。
+        unique_constraints: Vec<Vec<String>>,
+        // 中文註解：partition_by 保存 RANGE 分區鍵，None 代表這不是分區表。
+        partition_by: Option<String>,
+        // 中文註解：partitions 依序描述每個 RANGE 分區的邊界。
+        partitions: Vec<PartitionDef>,
     },
     AlterTableAdd {
         table_name: String,
@@ -224,6 +230,13 @@ pub struct CTE {
 pub struct ColumnDef {
     pub name: String,
     pub data_type: DataType,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PartitionDef {
+    pub name: String,
+    pub less_than: Option<i64>,
+    pub is_maxvalue: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
